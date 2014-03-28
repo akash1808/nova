@@ -41,7 +41,7 @@ _ = pluginlib._
 
 
 host_data_pattern = re.compile(r"\s*(\S+) \([^\)]+\) *: ?(.*)")
-config_file_path = "/usr/etc/xenhost.conf"
+config_file_path = "/etc/xen/xenhost.conf"
 DEFAULT_TRIES = 23
 DEFAULT_SLEEP = 10
 

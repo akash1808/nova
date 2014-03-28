@@ -77,8 +77,6 @@ def main():
                                    daemon=CONF.daemon,
                                    record=CONF.record,
                                    web=CONF.web,
-                                   file_only=True,
-                                   no_parent=True,
                                    target_host='ignore',
                                    target_port='ignore',
                                    wrap_mode='exit',

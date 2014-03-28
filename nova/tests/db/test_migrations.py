@@ -2657,6 +2657,7 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
             self.assertFalse('locked_by' in rows[0])
 
     def _pre_upgrade_206(self, engine):
+        self.skipTest('Skipped due to #1209345')
         instances = db_utils.get_table(engine, 'instances')
         shadow_instances = db_utils.get_table(engine, 'shadow_instances')
 
@@ -2676,6 +2677,7 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
         return data
 
     def _check_206(self, engine, data):
+        self.skipTest('Skipped due to #1209345')
         self.assertColumnExists(engine, 'instances', 'cleaned')
         self.assertColumnExists(engine, 'shadow_instances', 'cleaned')
         self.assertIndexMembers(engine, 'instances',
@@ -2701,6 +2703,7 @@ class TestNovaMigrations(BaseMigrationTestCase, CommonTestsMixIn):
             self.assertEqual(1, id_2['cleaned'])
 
     def _post_downgrade_206(self, engine):
+        self.skipTest('Skipped due to #1209345')
         self.assertColumnNotExists(engine, 'instances', 'cleaned')
         self.assertColumnNotExists(engine, 'shadow_instances', 'cleaned')
 

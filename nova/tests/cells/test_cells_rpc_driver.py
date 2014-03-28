@@ -227,6 +227,7 @@ class ParseTransportURLTestCase(test.NoDBTestCase):
         self.assertRaises(ValueError, rpc_driver.parse_transport_url, url)
 
     def test_query_string(self):
+        self.skipTest("Skipped by ubuntu patch")
         url = "rabbit://u:p@h:10/virtual?ssl=1"
         self.assertRaises(ValueError, rpc_driver.parse_transport_url, url)
 

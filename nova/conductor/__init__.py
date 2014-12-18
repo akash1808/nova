@@ -33,3 +33,13 @@ def ComputeTaskAPI(*args, **kwargs):
     else:
         api = conductor_api.ComputeTaskAPI
     return api(*args, **kwargs)
+
+bypass_scheduler_opt = oslo.config.cfg.BoolOpt('bypass_scheduler',
+        default='False',
+        help=('whether to use the nova scheduler to make instance '
+              'placement decisions or bypass it and place requests '
+              'directly on to the message queue for a random node '
+              'to fulfill. Use the scheduler by default'))
+
+CONF = oslo.config.cfg.CONF
+CONF.register_opt(bypass_scheduler_opt)

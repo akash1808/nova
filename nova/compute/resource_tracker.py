@@ -375,6 +375,10 @@ class ResourceTracker(object):
         metrics = self._get_host_metrics(context, self.nodename)
         resources['metrics'] = jsonutils.dumps(metrics)
         self._sync_compute_node(context, resources)
+        self.resource = resources
+
+    def get_resource(self):
+        return self.resource
 
     def _sync_compute_node(self, context, resources):
         """Create or update the compute node DB record."""

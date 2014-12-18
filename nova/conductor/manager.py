@@ -46,6 +46,7 @@ from nova.openstack.common import log as logging
 from nova import quota
 from nova.scheduler import client as scheduler_client
 from nova.scheduler import utils as scheduler_utils
+from oslo.config import cfg
 
 LOG = logging.getLogger(__name__)
 
@@ -617,64 +618,99 @@ class ComputeTaskManager(base.Base):
             security_groups, block_device_mapping=None, legacy_bdm=True):
         # TODO(ndipanov): Remove block_device_mapping and legacy_bdm in version
         #                 2.0 of the RPC API.
-        request_spec = scheduler_utils.build_request_spec(context, image,
-                                                          instances)
-        scheduler_utils.setup_instance_group(context, request_spec,
+        CONF = cfg.CONF
+        if not CONF.bypass_scheduler:
+            request_spec = scheduler_utils.build_request_spec(context, image,
+                                                              instances)
+            scheduler_utils.setup_instance_group(context, request_spec,
                                              filter_properties)
         # TODO(danms): Remove this in version 2.0 of the RPC API
-        if (requested_networks and
-                not isinstance(requested_networks,
-                               objects.NetworkRequestList)):
-            requested_networks = objects.NetworkRequestList(
-                objects=[objects.NetworkRequest.from_tuple(t)
-                         for t in requested_networks])
-        # TODO(melwitt): Remove this in version 2.0 of the RPC API
-        flavor = filter_properties.get('instance_type')
-        if flavor and not isinstance(flavor, objects.Flavor):
-            # Code downstream may expect extra_specs to be populated since it
-            # is receiving an object, so lookup the flavor to ensure this.
-            flavor = objects.Flavor.get_by_id(context, flavor['id'])
-            filter_properties = dict(filter_properties, instance_type=flavor)
+            if (requested_networks and
+                    not isinstance(requested_networks,
+                                   objects.NetworkRequestList)):
+                requested_networks = objects.NetworkRequestList(
+                    objects=[objects.NetworkRequest.from_tuple(t)
+                             for t in requested_networks])
 
-        try:
-            # check retry policy. Rather ugly use of instances[0]...
-            # but if we've exceeded max retries... then we really only
-            # have a single instance.
-            scheduler_utils.populate_retry(filter_properties,
-                instances[0].uuid)
-            hosts = self.scheduler_client.select_destinations(context,
-                    request_spec, filter_properties)
-        except Exception as exc:
-            updates = {'vm_state': vm_states.ERROR, 'task_state': None}
-            self._set_vm_state_and_notify(context, 'build_instances', updates,
-                                          exc, request_spec)
-            return
-
-        for (instance, host) in itertools.izip(instances, hosts):
             try:
-                instance.refresh()
-            except (exception.InstanceNotFound,
-                    exception.InstanceInfoCacheNotFound):
-                LOG.debug('Instance deleted during build', instance=instance)
-                continue
-            local_filter_props = copy.deepcopy(filter_properties)
-            scheduler_utils.populate_filter_properties(local_filter_props,
-                host)
-            # The block_device_mapping passed from the api doesn't contain
-            # instance specific information
-            bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
-                    context, instance.uuid)
+                # check retry policy. Rather ugly use of instances[0]...
+                # but if we've exceeded max retries... then we really only
+                # have a single instance.
+                scheduler_utils.populate_retry(filter_properties,
+                    instances[0].uuid)
+                hosts = self.scheduler_client.select_destinations(context,
+                        request_spec, filter_properties)
+            except Exception as exc:
+                updates = {'vm_state': vm_states.ERROR, 'task_state': None}
+                self._set_vm_state_and_notify(context, 'build_instances',
+                                              updates, exc, request_spec)
+                return
 
-            self.compute_rpcapi.build_and_run_instance(context,
-                    instance=instance, host=host['host'], image=image,
-                    request_spec=request_spec,
-                    filter_properties=local_filter_props,
-                    admin_password=admin_password,
-                    injected_files=injected_files,
-                    requested_networks=requested_networks,
-                    security_groups=security_groups,
-                    block_device_mapping=bdms, node=host['nodename'],
-                    limits=host['limits'])
+            for (instance, host) in itertools.izip(instances, hosts):
+                try:
+                    instance.refresh()
+                except (exception.InstanceNotFound,
+                        exception.InstanceInfoCacheNotFound):
+                    LOG.debug('Instance deleted during build',
+                               instance=instance)
+                    continue
+                local_filter_props = copy.deepcopy(filter_properties)
+                scheduler_utils.populate_filter_properties(local_filter_props,
+                    host)
+
+                # The block_device_mapping passed from the api doesn't contain
+                # instance specific information
+                bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                        context, instance.uuid)
+
+                self.compute_rpcapi.build_and_run_instance(context,
+                        instance=instance, host=host['host'], image=image,
+                        request_spec=request_spec,
+                        filter_properties=local_filter_props,
+                        admin_password=admin_password,
+                        injected_files=injected_files,
+                        requested_networks=requested_networks,
+                        security_groups=security_groups,
+                        block_device_mapping=bdms, node=host['nodename'],
+                        limits=host['limits'])
+        else:
+            max_attempts = CONF.scheduler_max_attempts
+            if max_attempts < 1:
+                raise exception.NovaException(_("Invalid value for "
+                   "max_attempts', must be >= 1"))
+
+            retry = filter_properties.setdefault(
+                'retry', {
+                    'num_attempts': 0,
+                    'hosts': []  # list of compute hosts tried
+            })
+            retry['num_attempts'] += 1
+            if retry['num_attempts'] > max_attempts:
+                raise exception.NovaException(_("Exceeded max attempts"))
+
+            for instance in instances:
+                try:
+                    instance.refresh()
+                except (exception.InstanceNotFound,
+                        exception.InstanceInfoCacheNotFound):
+                    LOG.debug('Instance deleted during build',
+                               instance=instance)
+                    continue
+                local_filter_props = copy.deepcopy(filter_properties)
+                # The block_device_mapping passed from the api doesn't contain
+                # instance specific information
+                bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                        context, instance.uuid)
+                self.compute_rpcapi.build_and_run_instance(context,
+                        instance=instance, host=None, image=image,
+                        request_spec=None,
+                        filter_properties=local_filter_props,
+                        admin_password=admin_password,
+                        injected_files=injected_files,
+                        requested_networks=requested_networks,
+                        security_groups=security_groups,
+                        block_device_mapping=bdms, node=None,
+                        limits=None)
 
     def _delete_image(self, context, image_id):
         return self.image_api.delete(context, image_id)

@@ -47,6 +47,7 @@ from oslo.utils import strutils
 from oslo.utils import timeutils
 import six
 
+from nova import baserpc
 from nova import block_device
 from nova.cells import rpcapi as cells_rpcapi
 from nova.cloudpipe import pipelib
@@ -74,6 +75,7 @@ from nova import network
 from nova.network import model as network_model
 from nova.network.security_group import openstack_driver
 from nova import objects
+from nova.objects import flavor as flavor_obj
 from nova.objects import base as obj_base
 from nova.objects import instance as instance_obj
 from nova.objects import quotas as quotas_obj
@@ -225,6 +227,7 @@ CONF.register_opts(timeout_opts)
 CONF.register_opts(running_deleted_opts)
 CONF.register_opts(instance_cleaning_opts)
 CONF.import_opt('allow_resize_to_same_host', 'nova.compute.api')
+CONF.import_opt('bypass_scheduler', 'nova.conductor')
 CONF.import_opt('console_topic', 'nova.console.rpcapi')
 CONF.import_opt('host', 'nova.netconf')
 CONF.import_opt('my_ip', 'nova.netconf')
@@ -618,6 +621,8 @@ class ComputeManager(manager.Manager):
         self.instance_events = InstanceEvents()
         self._sync_power_pool = eventlet.GreenPool()
         self._syncs_in_progress = {}
+        self.rpcserver_flavor = {}
+        self.rpcserver_flavor_status = {}
 
         super(ComputeManager, self).__init__(service_name="compute",
                                              *args, **kwargs)
@@ -829,6 +834,10 @@ class ComputeManager(manager.Manager):
             else:
                 self.consoleauth_rpcapi.delete_tokens_for_instance(context,
                         instance.uuid)
+        # I guess this is the place where subscription needs to refreshed.
+        # Also need to validate if scalable scheduler is True
+        if CONF.bypass_scheduler:
+            self._subscribe_to_instance_type_topics()
 
     def _init_instance(self, context, instance):
         '''Initialize this instance during service init.'''
@@ -1186,6 +1195,148 @@ class ComputeManager(manager.Manager):
             return self.driver.get_info(instance).state
         except exception.NotFound:
             return power_state.NOSTATE
+
+    def post_start_hook(self):
+        """Perform additional operations after the compute service is
+        up and running
+        """
+        # Make compute listen on additional topics based on instance types if
+        # it should pick up create instance requests directly placed on a
+        # queue
+        if CONF.bypass_scheduler:
+            # RAM allocation Ratio
+            ram_allocation_ratio_opt = cfg.FloatOpt('ram_allocation_ratio',
+                default=1.5,
+                help='Virtual ram to physical ram allocation ratio which '
+                     'affects all ram filters. This configuration specifies '
+                     'a global ratio for RamFilter. For AggregateRamFilter, '
+                     'it will fall back to this configuration value if no '
+                     'per-aggregate setting found.')
+            CONF.register_opt(ram_allocation_ratio_opt)
+
+            # CPU allocation ratio
+            cpu_allocation_ratio_opt = cfg.FloatOpt('cpu_allocation_ratio',
+                default=16.0,
+                help='Virtual CPU to physical CPU allocation ratio which '
+                     'affects all CPU filters. This configuration specifies '
+                     'a global ratio for CoreFilter. For AggregateCoreFilter, '
+                     'it will fall back to this configuration value if no '
+                     'per-aggregate setting found.')
+            CONF.register_opt(cpu_allocation_ratio_opt)
+
+            # Disk allocation ratio
+            disk_allocation_ratio_opt = cfg.FloatOpt("disk_allocation_ratio",
+                default=1.0,
+                help="Virtual disk to physical disk allocation ratio")
+            CONF.register_opt(disk_allocation_ratio_opt)
+            self._subscribe_to_instance_type_topics()
+        else:
+            pass
+
+    def _subscribe_unsubscribe_topic(self, host_state, instance_type):
+        """Validates host resources against instance type and returns
+        True to subscribe to the flavor type and False to unsubscribe
+        to the flavor type. Makes use of similar code from schedular
+        filter - Ram, Cores and Disk
+        """
+
+        # Check if sufficient RAM is available.
+        ram_allocation_ratio = CONF.ram_allocation_ratio
+        requested_ram = instance_type.memory_mb
+        free_ram_mb = host_state['free_ram_mb']
+        total_usable_ram_mb = host_state['memory_mb']
+        memory_mb_limit = total_usable_ram_mb * ram_allocation_ratio
+        used_ram_mb = total_usable_ram_mb - free_ram_mb
+        usable_ram = memory_mb_limit - used_ram_mb
+        if not usable_ram >= requested_ram:
+            LOG.info(_LI("Cannot subscribe to the type(%s) as the host is "
+                "not capable of allocating requested memory"),
+                instance_type.name)
+            return False
+
+        # Check if sufficient Cores are there
+        cpu_allocation_ratio = CONF.cpu_allocation_ratio
+        instance_vcpus = instance_type.vcpus
+        vcpus_total = host_state['vcpus'] * cpu_allocation_ratio
+        free_vcpus = vcpus_total - host_state['vcpus_used']
+        if free_vcpus < instance_vcpus:
+            LOG.info(_LI("Cannot subscribe to the type(%s) as the host is "
+                "not capable of allocating requested vcpus"),
+                instance_type.name)
+            return False
+
+        # Check if sufficient disk space is there
+        disk_allocation_ratio = CONF.disk_allocation_ratio
+        requested_disk = (1024 * (instance_type.root_gb +
+                                 instance_type.ephemeral_gb) +
+                         instance_type.swap)
+        free_gb = host_state['free_disk_gb']
+        least_gb = host_state.get('disk_available_least')
+        if least_gb is not None:
+            if least_gb > free_gb:
+                # can occur when an instance in database is not on host
+                LOG.warning(_LW("Host has more disk space than database "
+                           "expected (%(physical)sgb > %(database)sgb)") %
+                         {'physical': least_gb, 'database': free_gb})
+            free_gb = min(least_gb, free_gb)
+        free_disk_mb = free_gb * 1024
+        total_usable_disk_mb = host_state['local_gb'] * 1024
+        disk_mb_limit = total_usable_disk_mb * disk_allocation_ratio
+        used_disk_mb = total_usable_disk_mb - free_disk_mb
+        usable_disk_mb = disk_mb_limit - used_disk_mb
+        if not usable_disk_mb >= requested_disk:
+            LOG.info(_LI("Cannot subscribe to the type(%s) as the host is "
+                "not capable of allocating requested disk space"),
+                instance_type.name)
+            return False
+        return True
+
+    def _subscribe_to_instance_type_topics(self):
+        endpoints = [self, baserpc.BaseRPCAPI(self.service_name,
+                                              self.backdoor_port)]
+        endpoints.extend(self.additional_endpoints)
+        serializer = obj_base.NovaObjectSerializer()
+        context = nova.context.get_admin_context()
+        self.update_available_resource(context)
+        nodenames = set(self.driver.get_available_nodes())
+        for nodename in nodenames:
+            rt = self._get_resource_tracker(nodename)
+            host_state = rt.get_resource()
+
+        LOG.info(_LI('available resource = %s'), host_state)
+        instance_types = flavor_obj.FlavorList.get_all(context)
+        for instance_type in instance_types:
+            instance_type_topic = instance_type.name.replace('.', '-')
+            if not (instance_type_topic in self.rpcserver_flavor.keys()):
+                target = messaging.Target(topic=instance_type_topic,
+                                          server=self.host)
+                self.rpcserver_flavor[instance_type_topic] = rpc.get_server(
+                                                 target, endpoints, serializer)
+                self.rpcserver_flavor_status[instance_type_topic] = 0
+            if (self._subscribe_unsubscribe_topic(host_state, instance_type)):
+                if (self.rpcserver_flavor_status[instance_type_topic] == 0):
+                    LOG.info(_LI("Subscribing to flavor %s")
+                             % instance_type_topic)
+                    # Stop method does not clear the objects, hence wait needs
+                    # to be called after stop ideally. Wait method is the one
+                    # which clears the objects. In our case we have called wait
+                    # before stop because, the thread we are trying to kill in
+                    # wait method is the one which is calling the wait method
+                    # (something like self kill).
+                    self.rpcserver_flavor[instance_type_topic].wait()
+                    self.rpcserver_flavor[instance_type_topic].start()
+                    self.rpcserver_flavor_status[instance_type_topic] = 1
+                else:
+                    LOG.info(_LI("Retaining Subscription to flavor %s")
+                             % instance_type_topic)
+            else:
+                LOG.info(_LI("Un-Subscribing to flavor %s")
+                                        % instance_type_topic)
+                if (self.rpcserver_flavor_status[instance_type_topic] == 1):
+                    self.rpcserver_flavor[instance_type_topic].stop()
+                    self.rpcserver_flavor_status[instance_type_topic] = 0
+
+        self.update_available_resource(context)
 
     def get_console_topic(self, context):
         """Retrieves the console host for a project on this host.
@@ -2137,6 +2288,12 @@ class ComputeManager(manager.Manager):
                 # NOTE(russellb) It's important that this validation be done
                 # *after* the resource tracker instance claim, as that is where
                 # the host is set on the instance.
+
+                # Assuming this is where instance is launched successfully.
+                # So we can resubscribe if required
+                if CONF.bypass_scheduler:
+                    self._subscribe_to_instance_type_topics()
+
                 self._validate_instance_group_policy(context, instance,
                         filter_properties)
                 with self._build_resources(context, instance,

@@ -118,11 +118,11 @@ class _TestInstanceGroupObjects(object):
         self.assertEqual(result['members'], members)
 
     def test_create(self):
-        group1 = instance_group.InstanceGroup()
+        group1 = instance_group.InstanceGroup(context=self.context)
         group1.uuid = 'fake-uuid'
         group1.name = 'fake-name'
         fake_notifier.NOTIFICATIONS = []
-        group1.create(self.context)
+        group1.create()
         self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
         msg = fake_notifier.NOTIFICATIONS[0]
         self.assertEqual(group1.name, msg.payload['name'])
@@ -139,37 +139,37 @@ class _TestInstanceGroupObjects(object):
         self.assertEqual(group1.name, result.name)
 
     def test_create_with_policies(self):
-        group1 = instance_group.InstanceGroup()
+        group1 = instance_group.InstanceGroup(context=self.context)
         group1.policies = ['policy1', 'policy2']
-        group1.create(self.context)
+        group1.create()
         group2 = instance_group.InstanceGroup.get_by_uuid(self.context,
                                                           group1.uuid)
         self.assertEqual(group1.id, group2.id)
         self.assertEqual(group1.policies, group2.policies)
 
     def test_create_with_members(self):
-        group1 = instance_group.InstanceGroup()
+        group1 = instance_group.InstanceGroup(context=self.context)
         group1.members = ['instance1', 'instance2']
-        group1.create(self.context)
+        group1.create()
         group2 = instance_group.InstanceGroup.get_by_uuid(self.context,
                                                           group1.uuid)
         self.assertEqual(group1.id, group2.id)
         self.assertEqual(group1.members, group2.members)
 
     def test_recreate_fails(self):
-        group = instance_group.InstanceGroup()
-        group.create(self.context)
+        group = instance_group.InstanceGroup(context=self.context)
+        group.create()
         self.assertRaises(exception.ObjectActionError, group.create,
                           self.context)
 
     def test_destroy(self):
         values = self._get_default_values()
         result = self._create_instance_group(self.context, values)
-        group = instance_group.InstanceGroup()
+        group = instance_group.InstanceGroup(context=self.context)
         group.id = result.id
         group.uuid = result.uuid
         fake_notifier.NOTIFICATIONS = []
-        group.destroy(self.context)
+        group.destroy()
         self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
         msg = fake_notifier.NOTIFICATIONS[0]
         self.assertEqual('servergroup.delete', msg.event_type)
@@ -272,11 +272,11 @@ class _TestInstanceGroupObjects(object):
 
         group = instance_group.InstanceGroup.get_by_uuid(self.context,
                 group.uuid)
-        hosts = group.get_hosts(self.context)
+        hosts = group.get_hosts()
         self.assertEqual(2, len(hosts))
         self.assertIn('hostA', hosts)
         self.assertIn('hostB', hosts)
-        hosts = group.get_hosts(self.context, exclude=[instance1.uuid])
+        hosts = group.get_hosts(exclude=[instance1.uuid])
         self.assertEqual(1, len(hosts))
         self.assertIn('hostB', hosts)
 
@@ -298,14 +298,15 @@ class _TestInstanceGroupObjects(object):
 
         group = instance_group.InstanceGroup.get_by_uuid(self.context,
                 group.uuid)
-        hosts = group.get_hosts(self.context)
+        hosts = group.get_hosts()
         self.assertEqual(1, len(hosts))
         self.assertIn('hostB', hosts)
 
     def test_obj_make_compatible(self):
-        group = instance_group.InstanceGroup(uuid='fake-uuid',
+        group = instance_group.InstanceGroup(context=self.context,
+                                             uuid='fake-uuid',
                                              name='fake-name')
-        group.create(self.context)
+        group.create()
         group_primitive = group.obj_to_primitive()
         group.obj_make_compatible(group_primitive, '1.6')
         self.assertEqual({}, group_primitive['metadetails'])
@@ -332,9 +333,9 @@ class _TestInstanceGroupObjects(object):
 
         group = instance_group.InstanceGroup.get_by_uuid(self.context,
                 group.uuid)
-        count_user1 = group.count_members_by_user(self.context, 'user1')
-        count_user2 = group.count_members_by_user(self.context, 'user2')
-        count_user3 = group.count_members_by_user(self.context, 'user3')
+        count_user1 = group.count_members_by_user('user1')
+        count_user2 = group.count_members_by_user('user2')
+        count_user3 = group.count_members_by_user('user3')
         self.assertEqual(1, count_user1)
         self.assertEqual(2, count_user2)
         self.assertEqual(0, count_user3)

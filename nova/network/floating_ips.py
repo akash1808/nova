@@ -15,11 +15,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo import messaging
-from oslo.utils import excutils
-from oslo.utils import importutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import uuidutils
 import six
 
 from nova import context
@@ -28,8 +30,6 @@ from nova import exception
 from nova.i18n import _LE, _LI, _LW
 from nova.network import rpcapi as network_rpcapi
 from nova import objects
-from nova.openstack.common import log as logging
-from nova.openstack.common import uuidutils
 from nova import quota
 from nova import rpc
 from nova import servicegroup
@@ -368,7 +368,7 @@ class FloatingIP(object):
         """Performs db and driver calls to associate floating ip & fixed ip."""
         interface = CONF.public_interface or interface
 
-        @utils.synchronized(unicode(floating_address))
+        @utils.synchronized(six.text_type(floating_address))
         def do_associate():
             # associate floating ip
             floating = objects.FloatingIP.associate(context, floating_address,
@@ -436,8 +436,8 @@ class FloatingIP(object):
         if network.multi_host:
             instance = objects.Instance.get_by_uuid(
                 context, fixed_ip.instance_uuid)
-            service = objects.Service.get_by_host_and_topic(
-                context.elevated(), instance.host, CONF.network_topic)
+            service = objects.Service.get_by_host_and_binary(
+                context.elevated(), instance.host, 'nova-network')
             if service and self.servicegroup_api.service_is_up(service):
                 host = instance.host
             else:
@@ -464,7 +464,7 @@ class FloatingIP(object):
         """Performs db and driver calls to disassociate floating ip."""
         interface = CONF.public_interface or interface
 
-        @utils.synchronized(unicode(address))
+        @utils.synchronized(six.text_type(address))
         def do_disassociate():
             # NOTE(vish): Note that we are disassociating in the db before we
             #             actually remove the ip address on the host. We are
@@ -494,7 +494,7 @@ class FloatingIP(object):
         """Returns a floating IP as a dict."""
         # NOTE(vish): This is no longer used but can't be removed until
         #             we major version the network_rpcapi.
-        return dict(objects.FloatingIP.get_by_id(context, id).iteritems())
+        return dict(objects.FloatingIP.get_by_id(context, id))
 
     def get_floating_pools(self, context):
         """Returns list of floating pools."""

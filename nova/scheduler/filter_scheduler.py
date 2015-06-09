@@ -21,11 +21,12 @@ Weighing Functions.
 
 import random
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from six.moves import range
 
 from nova import exception
 from nova.i18n import _
-from nova.openstack.common import log as logging
 from nova import rpc
 from nova.scheduler import driver
 from nova.scheduler import scheduler_options
@@ -68,6 +69,14 @@ class FilterScheduler(driver.Scheduler):
 
         # Couldn't fulfill the request_spec
         if len(selected_hosts) < num_instances:
+            # NOTE(Rui Chen): If multiple creates failed, set the updated time
+            # of selected HostState to None so that these HostStates are
+            # refreshed according to database in next schedule, and release
+            # the resource consumed by instance in the process of selecting
+            # host.
+            for host in selected_hosts:
+                host.obj.updated = None
+
             # Log the details but don't put those into the reason since
             # we don't want to give away too much information about our
             # actual environment.
@@ -107,7 +116,6 @@ class FilterScheduler(driver.Scheduler):
         elevated = context.elevated()
         instance_properties = request_spec['instance_properties']
         instance_type = request_spec.get("instance_type", None)
-        instance_uuids = request_spec.get("instance_uuids", None)
 
         update_group_hosts = filter_properties.get('group_updated', False)
 
@@ -132,11 +140,8 @@ class FilterScheduler(driver.Scheduler):
         hosts = self._get_all_host_states(elevated)
 
         selected_hosts = []
-        if instance_uuids:
-            num_instances = len(instance_uuids)
-        else:
-            num_instances = request_spec.get('num_instances', 1)
-        for num in xrange(num_instances):
+        num_instances = request_spec.get('num_instances', 1)
+        for num in range(num_instances):
             # Filter local hosts based on requirements ...
             hosts = self.host_manager.get_filtered_hosts(hosts,
                     filter_properties, index=num)
@@ -159,6 +164,7 @@ class FilterScheduler(driver.Scheduler):
 
             chosen_host = random.choice(
                 weighed_hosts[0:scheduler_host_subset_size])
+            LOG.debug("Selected host: %(host)s", {'host': chosen_host})
             selected_hosts.append(chosen_host)
 
             # Now consume the resources so the filter/weights

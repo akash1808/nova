@@ -20,34 +20,33 @@ Allows overriding of flags for use of fakes, and some black magic for
 inline callbacks.
 
 """
-
+import datetime
 import eventlet
 eventlet.monkey_patch(os=False)
 
 import copy
 import inspect
-import logging
+import logging as std_logging
+import mock
 import os
 
 import fixtures
-from oslo.config import cfg
-from oslo.config import fixture as config_fixture
-from oslo.messaging import conffixture as messaging_conffixture
-from oslo.utils import timeutils
 from oslo_concurrency import lockutils
+from oslo_config import cfg
+from oslo_config import fixture as config_fixture
+from oslo_log.fixture import logging_error as log_fixture
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 from oslotest import moxstubout
 import six
 import testtools
 
-from nova.api.openstack import wsgi
 from nova import context
 from nova import db
 from nova.network import manager as network_manager
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.fixture import logging as log_fixture
-from nova.openstack.common import log as nova_logging
-from nova import rpc
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import conf_fixture
 from nova.tests.unit import policy_fixture
@@ -56,9 +55,10 @@ from nova import utils
 
 CONF = cfg.CONF
 CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
-CONF.set_override('use_stderr', False)
 
-nova_logging.setup('nova')
+logging.register_options(CONF)
+CONF.set_override('use_stderr', False)
+logging.setup(CONF, 'nova')
 
 # NOTE(comstud): Make sure we have all of the objects loaded. We do this
 # at module import time, because we may be using mock decorators in our
@@ -102,7 +102,7 @@ class TestingException(Exception):
     pass
 
 
-class NullHandler(logging.Handler):
+class NullHandler(std_logging.Handler):
     """custom default NullHandler to attempt to format the record.
 
     Used in conjunction with
@@ -151,10 +151,27 @@ class skipIf(object):
                             'classes')
 
 
-class skipXmlTest(skipIf):
-    def __init__(self, reason):
-        super(skipXmlTest, self).__init__(wsgi.DISABLE_XML_V2_API,
-                                          reason)
+def _patch_mock_to_raise_for_invalid_assert_calls():
+    def raise_for_invalid_assert_calls(wrapped):
+        def wrapper(_self, name):
+            valid_asserts = [
+                'assert_called_with',
+                'assert_called_once_with',
+                'assert_has_calls',
+                'assert_any_calls']
+
+            if name.startswith('assert') and name not in valid_asserts:
+                raise AttributeError('%s is not a valid mock assert method'
+                                     % name)
+
+            return wrapped(_self, name)
+        return wrapper
+    mock.Mock.__getattr__ = raise_for_invalid_assert_calls(
+        mock.Mock.__getattr__)
+
+# NOTE(gibi): needs to be called only once at import time
+# to patch the mock lib
+_patch_mock_to_raise_for_invalid_assert_calls()
 
 
 class TestCase(testtools.TestCase):
@@ -177,16 +194,11 @@ class TestCase(testtools.TestCase):
 
         self.useFixture(fixtures.NestedTempfile())
         self.useFixture(fixtures.TempHomeDir())
-        self.useFixture(nova_fixtures.TranslationFixture())
         self.useFixture(log_fixture.get_logging_handle_error_fixture())
 
         self.useFixture(nova_fixtures.OutputStreamCapture())
 
         self.useFixture(nova_fixtures.StandardLogging())
-
-        rpc.add_extra_exmods('nova.test')
-        self.addCleanup(rpc.clear_extra_exmods)
-        self.addCleanup(rpc.cleanup)
 
         # NOTE(sdague): because of the way we were using the lock
         # wrapper we eneded up with a lot of tests that started
@@ -207,15 +219,14 @@ class TestCase(testtools.TestCase):
                                 group='oslo_concurrency')
 
         self.useFixture(conf_fixture.ConfFixture(CONF))
-
-        self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
-        self.messaging_conf.transport_driver = 'fake'
-        self.useFixture(self.messaging_conf)
-
-        rpc.init(CONF)
+        self.useFixture(nova_fixtures.RPCFixture('nova.test'))
 
         if self.USES_DB:
             self.useFixture(nova_fixtures.Database())
+
+        # NOTE(blk-u): WarningsFixture must be after the Database fixture
+        # because sqlalchemy-migrate messes with the warnings filters.
+        self.useFixture(nova_fixtures.WarningsFixture())
 
         # NOTE(danms): Make sure to reset us back to non-remote objects
         # for each test to avoid interactions. Also, backup the object
@@ -237,6 +248,8 @@ class TestCase(testtools.TestCase):
         self.useFixture(fixtures.EnvironmentVariable('http_proxy'))
         self.policy = self.useFixture(policy_fixture.PolicyFixture())
 
+        self.useFixture(nova_fixtures.PoisonFunctions())
+
     def _restore_obj_registry(self):
         objects_base.NovaObject._obj_classes = self._base_test_obj_backup
 
@@ -245,12 +258,18 @@ class TestCase(testtools.TestCase):
         # memory around unnecessarily for the duration of the test
         # suite
         for key in [k for k in self.__dict__.keys() if k[0] != '_']:
-            del self.__dict__[key]
+            # NOTE(gmann): Skip attribute 'id' because if tests are being
+            # generated using testscenarios then, 'id' attribute is being
+            # added during cloning the tests. And later that 'id' attribute
+            # is being used by test suite to generate the results for each
+            # newly generated tests by testscenarios.
+            if key != 'id':
+                del self.__dict__[key]
 
     def flags(self, **kw):
         """Override flag variables for a test."""
         group = kw.pop('group', None)
-        for k, v in kw.iteritems():
+        for k, v in six.iteritems(kw):
             CONF.set_override(k, v, group)
 
     def start_service(self, name, host=None, **kwargs):
@@ -258,10 +277,54 @@ class TestCase(testtools.TestCase):
             nova_fixtures.ServiceFixture(name, host, **kwargs))
         return svc.service
 
+    def assertJsonEqual(self, expected, observed):
+        if isinstance(expected, six.string_types):
+            expected = jsonutils.loads(expected)
+        if isinstance(observed, six.string_types):
+            observed = jsonutils.loads(observed)
+
+        def sort(what):
+            return sorted(what,
+                          key=lambda x: str(x) if isinstance(
+                              x, set) or isinstance(x,
+                                                    datetime.datetime) else x)
+
+        def inner(expected, observed):
+            if isinstance(expected, dict) and isinstance(observed, dict):
+                self.assertEqual(len(expected), len(observed))
+                expected_keys = sorted(expected)
+                observed_keys = sorted(expected)
+                self.assertEqual(expected_keys, observed_keys)
+
+                expected_values_iter = iter(sort(expected.values()))
+                observed_values_iter = iter(sort(observed.values()))
+
+                for i in range(len(expected)):
+                    inner(next(expected_values_iter),
+                          next(observed_values_iter))
+            elif (isinstance(expected, (list, tuple, set)) and
+                      isinstance(observed, (list, tuple, set))):
+                self.assertEqual(len(expected), len(observed))
+
+                expected_values_iter = iter(sort(expected))
+                observed_values_iter = iter(sort(observed))
+
+                for i in range(len(expected)):
+                    inner(next(expected_values_iter),
+                          next(observed_values_iter))
+            else:
+                self.assertEqual(expected, observed)
+
+        inner(expected, observed)
+
     def assertPublicAPISignatures(self, baseinst, inst):
         def get_public_apis(inst):
             methods = {}
-            for (name, value) in inspect.getmembers(inst, inspect.ismethod):
+
+            def findmethods(object):
+                return inspect.ismethod(object) or inspect.isfunction(object)
+
+            for (name, value) in inspect.getmembers(inst, findmethods):
                 if name.startswith("_"):
                     continue
                 methods[name] = value

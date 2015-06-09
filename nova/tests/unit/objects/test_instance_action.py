@@ -15,7 +15,8 @@
 import traceback
 
 import mock
-from oslo.utils import timeutils
+from oslo_utils import timeutils
+import six
 
 from nova import db
 from nova.objects import instance_action
@@ -155,7 +156,7 @@ class _TestInstanceActionObject(object):
         mock_finish.return_value = fake_action
         action = instance_action.InstanceAction.action_start(
             self.context, 'fake-uuid', 'fake-action')
-        action.finish(self.context)
+        action.finish()
         mock_start.assert_called_once_with(self.context,
                                            expected_packed_action_start)
         mock_finish.assert_called_once_with(self.context,
@@ -292,13 +293,14 @@ class _TestInstanceActionEventObject(object):
         timeutils.set_time_override(override_time=NOW)
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_finish(
-            self.context, 'fake-uuid', 'fake-event', 'val', unicode('fake-tb'))
+            self.context, 'fake-uuid', 'fake-event', 'val',
+            six.text_type('fake-tb'))
         expected_packed_values['finish_time'] = timeutils.utcnow()
 
         mock_finish.return_value = fake_event
         event = test_class.event_finish_with_failure(
             self.context, 'fake-uuid', 'fake-event', exc_val='val',
-            exc_tb=unicode('fake-tb'), want_result=True)
+            exc_tb=six.text_type('fake-tb'), want_result=True)
         mock_finish.assert_called_once_with(self.context,
                                             expected_packed_values)
         self.compare_obj(event, fake_event)

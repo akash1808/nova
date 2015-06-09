@@ -17,12 +17,24 @@ from nova import exception
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
+from nova import utils
 
 
-class Migration(base.NovaPersistentObject, base.NovaObject):
+def _determine_migration_type(migration):
+    if migration['old_instance_type_id'] != migration['new_instance_type_id']:
+        return 'resize'
+    else:
+        return 'migration'
+
+
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class Migration(base.NovaPersistentObject, base.NovaObject,
+                base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: String attributes updated to support unicode
-    VERSION = '1.1'
+    # Version 1.2: Added migration_type and hidden
+    VERSION = '1.2'
 
     fields = {
         'id': fields.IntegerField(),
@@ -35,15 +47,41 @@ class Migration(base.NovaPersistentObject, base.NovaObject):
         'new_instance_type_id': fields.IntegerField(nullable=True),
         'instance_uuid': fields.StringField(nullable=True),
         'status': fields.StringField(nullable=True),
+        'migration_type': fields.EnumField(['migration', 'resize',
+                                            'live-migration', 'evacuate'],
+                                           nullable=False),
+        'hidden': fields.BooleanField(nullable=False, default=False),
         }
 
     @staticmethod
     def _from_db_object(context, migration, db_migration):
         for key in migration.fields:
-            migration[key] = db_migration[key]
+            value = db_migration[key]
+            if key == 'migration_type' and value is None:
+                value = _determine_migration_type(db_migration)
+            migration[key] = value
+
         migration._context = context
         migration.obj_reset_changes()
         return migration
+
+    def obj_make_compatible(self, primitive, target_version):
+        super(Migration, self).obj_make_compatible(primitive, target_version)
+        target_version = utils.convert_version_to_tuple(target_version)
+        if target_version < (1, 2):
+            if 'migration_type' in primitive:
+                del primitive['migration_type']
+                del primitive['hidden']
+
+    def obj_load_attr(self, attrname):
+        if attrname == 'migration_type':
+            # NOTE(danms): The only reason we'd need to load this is if
+            # some older node sent us one. So, guess the type.
+            self.migration_type = _determine_migration_type(self)
+        elif attrname == 'hidden':
+            self.hidden = False
+        else:
+            super(Migration, self).obj_load_attr(attrname)
 
     @base.remotable_classmethod
     def get_by_id(cls, context, migration_id):
@@ -57,20 +95,20 @@ class Migration(base.NovaPersistentObject, base.NovaObject):
         return cls._from_db_object(context, cls(), db_migration)
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
         updates = self.obj_get_changes()
-        db_migration = db.migration_create(context, updates)
-        self._from_db_object(context, self, db_migration)
+        db_migration = db.migration_create(self._context, updates)
+        self._from_db_object(self._context, self, db_migration)
 
     @base.remotable
-    def save(self, context):
+    def save(self):
         updates = self.obj_get_changes()
         updates.pop('id', None)
-        db_migration = db.migration_update(context, self.id, updates)
-        self._from_db_object(context, self, db_migration)
+        db_migration = db.migration_update(self._context, self.id, updates)
+        self._from_db_object(self._context, self, db_migration)
         self.obj_reset_changes()
 
     @property
@@ -78,11 +116,13 @@ class Migration(base.NovaPersistentObject, base.NovaObject):
         return objects.Instance.get_by_uuid(self._context, self.instance_uuid)
 
 
+@base.NovaObjectRegistry.register
 class MigrationList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     #              Migration <= 1.1
     # Version 1.1: Added use_slave to get_unconfirmed_by_dest_compute
-    VERSION = '1.1'
+    # Version 1.2: Migration version 1.2
+    VERSION = '1.2'
 
     fields = {
         'objects': fields.ListOfObjectsField('Migration'),
@@ -91,6 +131,7 @@ class MigrationList(base.ObjectListBase, base.NovaObject):
         '1.0': '1.1',
         # NOTE(danms): Migration was at 1.1 before we added this
         '1.1': '1.1',
+        '1.2': '1.2',
         }
 
     @base.remotable_classmethod

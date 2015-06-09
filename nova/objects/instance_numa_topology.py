@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from nova import db
 from nova import exception
@@ -21,14 +21,17 @@ from nova.objects import fields as obj_fields
 from nova.virt import hardware
 
 
-class InstanceNUMACell(base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class InstanceNUMACell(base.NovaObject,
+                       base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Add pagesize field
     # Version 1.2: Add cpu_pinning_raw and topology fields
     VERSION = '1.2'
 
     fields = {
-        'id': obj_fields.IntegerField(read_only=True),
+        'id': obj_fields.IntegerField(),
         'cpuset': obj_fields.SetOfIntegersField(),
         'memory': obj_fields.IntegerField(),
         'pagesize': obj_fields.IntegerField(nullable=True),
@@ -45,10 +48,15 @@ class InstanceNUMACell(base.NovaObject):
 
     def __init__(self, **kwargs):
         super(InstanceNUMACell, self).__init__(**kwargs)
+        if 'pagesize' not in kwargs:
+            self.pagesize = None
+            self.obj_reset_changes(['pagesize'])
         if 'cpu_topology' not in kwargs:
             self.cpu_topology = None
+            self.obj_reset_changes(['cpu_topology'])
         if 'cpu_pinning' not in kwargs:
             self.cpu_pinning = None
+            self.obj_reset_changes(['cpu_pinning_raw'])
 
     def __len__(self):
         return len(self.cpuset)
@@ -85,6 +93,10 @@ class InstanceNUMACell(base.NovaObject):
 
         return map(set, zip(*[iter(cpu_list)] * threads))
 
+    @property
+    def cpu_pinning_requested(self):
+        return self.cpu_pinning is not None
+
     def pin(self, vcpu, pcpu):
         if vcpu not in self.cpuset:
             return
@@ -97,7 +109,10 @@ class InstanceNUMACell(base.NovaObject):
             self.pin(vcpu, pcpu)
 
 
-class InstanceNUMATopology(base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class InstanceNUMATopology(base.NovaObject,
+                           base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Takes into account pagesize
     VERSION = '1.1'
@@ -141,15 +156,15 @@ class InstanceNUMATopology(base.NovaObject):
 
     # TODO(ndipanov) Remove this method on the major version bump to 2.0
     @base.remotable
-    def create(self, context):
-        self._save(context)
+    def create(self):
+        self._save()
 
     # NOTE(ndipanov): We can't rename create and want to avoid version bump
     # as this needs to be backported to stable so this is not a @remotable
     # That's OK since we only call it from inside Instance.save() which is.
-    def _save(self, context):
+    def _save(self):
         values = {'numa_topology': self._to_json()}
-        db.instance_extra_update_by_uuid(context, self.instance_uuid,
+        db.instance_extra_update_by_uuid(self._context, self.instance_uuid,
                                          values)
         self.obj_reset_changes()
 
@@ -193,3 +208,7 @@ class InstanceNUMATopology(base.NovaObject):
         return cls(cells=[
             InstanceNUMACell._from_dict(cell_dict)
             for cell_dict in data_dict.get('cells', [])])
+
+    @property
+    def cpu_pinning_requested(self):
+        return all(cell.cpu_pinning_requested for cell in self.cells)

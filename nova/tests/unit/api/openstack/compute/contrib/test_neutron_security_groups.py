@@ -14,22 +14,19 @@
 #    under the License.
 import uuid
 
-from lxml import etree
 import mock
 from neutronclient.common import exceptions as n_exc
 from neutronclient.neutron import v2_0 as neutronv20
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+from oslo_serialization import jsonutils
 import webob
 
 from nova.api.openstack.compute.contrib import security_groups
-from nova.api.openstack import xmlutil
 from nova import compute
 from nova import context
 import nova.db
 from nova import exception
 from nova.network import model
-from nova.network import neutronv2
 from nova.network.neutronv2 import api as neutron_api
 from nova.network.security_group import neutron_driver
 from nova.objects import instance as instance_obj
@@ -42,11 +39,11 @@ class TestNeutronSecurityGroupsTestCase(test.TestCase):
     def setUp(self):
         super(TestNeutronSecurityGroupsTestCase, self).setUp()
         cfg.CONF.set_override('security_group_api', 'neutron')
-        self.original_client = neutronv2.get_client
-        neutronv2.get_client = get_client
+        self.original_client = neutron_api.get_client
+        neutron_api.get_client = get_client
 
     def tearDown(self):
-        neutronv2.get_client = self.original_client
+        neutron_api.get_client = self.original_client
         get_client()._reset()
         super(TestNeutronSecurityGroupsTestCase, self).tearDown()
 
@@ -198,7 +195,7 @@ class TestNeutronSecurityGroupsV21(
 
     def test_associate_non_running_instance(self):
         # Neutron does not care if the instance is running or not. When the
-        # instances is detected by nuetron it will push down the security
+        # instances is detected by neutron it will push down the security
         # group policy to it.
         pass
 
@@ -421,7 +418,7 @@ class TestNeutronSecurityGroupRulesTestCase(TestNeutronSecurityGroupsTestCase):
         neutron._fake_security_groups[id2] = sg_template2
 
     def tearDown(self):
-        neutronv2.get_client = self.original_client
+        neutron_api.get_client = self.original_client
         get_client()._reset()
         super(TestNeutronSecurityGroupsTestCase, self).tearDown()
 
@@ -477,18 +474,6 @@ class TestNeutronSecurityGroupRulesV21(
         _TestNeutronSecurityGroupRulesBase,
         test_security_groups.TestSecurityGroupRulesV21,
         TestNeutronSecurityGroupRulesTestCase):
-    pass
-
-
-class TestNeutronSecurityGroupsXMLDeserializer(
-        test_security_groups.TestSecurityGroupXMLDeserializer,
-        TestNeutronSecurityGroupsTestCase):
-    pass
-
-
-class TestNeutronSecurityGroupsXMLSerializer(
-        test_security_groups.TestSecurityGroupXMLSerializer,
-        TestNeutronSecurityGroupsTestCase):
     pass
 
 
@@ -621,45 +606,6 @@ class TestNeutronSecurityGroupsOutputTest(TestNeutronSecurityGroupsTestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-@test.skipXmlTest("Nova v2 XML support is disabled")
-class TestNeutronSecurityGroupsOutputXMLTest(
-        TestNeutronSecurityGroupsOutputTest):
-
-    content_type = 'application/xml'
-
-    class MinimalCreateServerTemplate(xmlutil.TemplateBuilder):
-        def construct(self):
-            root = xmlutil.TemplateElement('server', selector='server')
-            root.set('name')
-            root.set('id')
-            root.set('imageRef')
-            root.set('flavorRef')
-            elem = xmlutil.SubTemplateElement(root, 'security_groups')
-            sg = xmlutil.SubTemplateElement(elem, 'security_group',
-                                            selector='security_groups')
-            sg.set('name')
-            return xmlutil.MasterTemplate(root, 1,
-                                          nsmap={None: xmlutil.XMLNS_V11})
-
-    def _encode_body(self, body):
-        serializer = self.MinimalCreateServerTemplate()
-        return serializer.serialize(body)
-
-    def _get_server(self, body):
-        return etree.XML(body)
-
-    def _get_servers(self, body):
-        return etree.XML(body).getchildren()
-
-    def _get_groups(self, server):
-        # NOTE(vish): we are adding security groups without an extension
-        #             namespace so we don't break people using the existing
-        #             functionality, but that means we need to use find with
-        #             the existing server namespace.
-        namespace = server.nsmap[None]
-        return server.find('{%s}security_groups' % namespace).getchildren()
 
 
 def get_client(context=None, admin=False):
@@ -891,11 +837,6 @@ class MockClient(object):
             if subnet['network_id'] == network:
                 del self._fake_subnets[subnet['id']]
         del self._fake_networks[network]
-
-    def delete_subnet(self, subnet):
-        subnet = self.show_subnet(subnet).get('subnet')
-        self._check_ports_on_network(subnet['network_id'])
-        del self._fake_subnet[subnet]
 
     def delete_port(self, port):
         self.show_port(port)

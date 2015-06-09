@@ -26,9 +26,8 @@ from nova.i18n import _
 from nova import objects
 
 ALIAS = 'os-flavor-access'
-soft_authorize = extensions.soft_extension_authorizer('compute',
-                                                      'v3:' + ALIAS)
-authorize = extensions.extension_authorizer('compute', 'v3:%s' % ALIAS)
+soft_authorize = extensions.os_compute_soft_authorizer(ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def _marshall_flavor_access(flavor):
@@ -67,15 +66,6 @@ class FlavorAccessController(wsgi.Controller):
 
 class FlavorActionController(wsgi.Controller):
     """The flavor access API controller for the OpenStack API."""
-    def _get_flavor_refs(self, context):
-        """Return a dictionary mapping flavorid to flavor_ref."""
-
-        flavors = objects.FlavorList.get_all(context)
-        rval = {}
-        for flavor in flavors:
-            rval[flavor.flavorid] = flavor
-        return rval
-
     def _extend_flavor(self, flavor_rval, flavor_ref):
         key = "%s:is_public" % (FlavorAccess.alias)
         flavor_rval[key] = flavor_ref['is_public']

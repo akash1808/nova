@@ -4,7 +4,8 @@
             "OS-EXT-STS:task_state": null,
             "OS-EXT-STS:vm_state": "active",
             "OS-EXT-STS:power_state": 1,
-            "OS-EXT-STS:locked_by": null,
+            "accessIPv4": "%(access_ip_v4)s",
+            "accessIPv6": "%(access_ip_v6)s",
             "updated": "%(isotime)s",
             "created": "%(isotime)s",
             "addresses": {
@@ -21,7 +22,7 @@
                 "id": "1",
                 "links": [
                     {
-                        "href": "%(host)s/flavors/1",
+                        "href": "%(host)s/openstack/flavors/1",
                         "rel": "bookmark"
                     }
                 ]
@@ -32,18 +33,18 @@
                 "id": "%(uuid)s",
                 "links": [
                     {
-                        "href": "%(host)s/images/%(uuid)s",
+                        "href": "%(host)s/openstack/images/%(uuid)s",
                         "rel": "bookmark"
                     }
                 ]
             },
             "links": [
                 {
-                    "href": "%(host)s/v3/servers/%(id)s",
+                    "href": "%(host)s/v2/openstack/servers/%(id)s",
                     "rel": "self"
                 },
                 {
-                    "href": "%(host)s/servers/%(id)s",
+                    "href": "%(host)s/openstack/servers/%(id)s",
                     "rel": "bookmark"
                 }
             ],

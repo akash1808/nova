@@ -15,12 +15,12 @@
 
 """Tests for compute resource tracking."""
 
+import copy
 import uuid
 
 import mock
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_serialization import jsonutils
 
 from nova.compute import flavors
 from nova.compute import resource_tracker
@@ -29,15 +29,14 @@ from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
 from nova import db
+from nova import exception
 from nova import objects
 from nova.objects import base as obj_base
 from nova import rpc
 from nova import test
 from nova.tests.unit.compute.monitors import test_monitors
-from nova.tests.unit.objects import test_migration
 from nova.tests.unit.pci import fakes as pci_fakes
 from nova.virt import driver
-from nova.virt import hardware
 
 
 FAKE_VIRT_MEMORY_MB = 5
@@ -46,14 +45,14 @@ FAKE_VIRT_MEMORY_WITH_OVERHEAD = (
         FAKE_VIRT_MEMORY_MB + FAKE_VIRT_MEMORY_OVERHEAD)
 FAKE_VIRT_NUMA_TOPOLOGY = objects.NUMATopology(
         cells=[objects.NUMACell(id=0, cpuset=set([1, 2]), memory=3072,
-                                cpu_usage=0, memory_usage=0),
+                                cpu_usage=0, memory_usage=0, mempages=[],
+                                siblings=[], pinned_cpus=set([])),
                objects.NUMACell(id=1, cpuset=set([3, 4]), memory=3072,
-                                cpu_usage=0, memory_usage=0)])
-FAKE_VIRT_NUMA_TOPOLOGY_OVERHEAD = hardware.VirtNUMALimitTopology(
-        cells=[hardware.VirtNUMATopologyCellLimit(
-                    0, set([1, 2]), 3072, 4, 10240),
-               hardware.VirtNUMATopologyCellLimit(
-                    1, set([3, 4]), 3072, 4, 10240)])
+                                cpu_usage=0, memory_usage=0, mempages=[],
+                                siblings=[], pinned_cpus=set([]))])
+FAKE_VIRT_NUMA_TOPOLOGY_OVERHEAD = objects.NUMATopologyLimits(
+    cpu_allocation_ratio=2, ram_allocation_ratio=2)
+
 ROOT_GB = 5
 EPHEMERAL_GB = 1
 FAKE_VIRT_LOCAL_GB = ROOT_GB + EPHEMERAL_GB
@@ -91,19 +90,77 @@ class FakeVirtDriver(driver.ComputeDriver):
         self.memory_mb_used = 0
         self.local_gb_used = 0
         self.pci_support = pci_support
-        self.pci_devices = [{
-            'label': 'forza-napoli',
-            'dev_type': 'foo',
-            'compute_node_id': 1,
-            'address': '0000:00:00.1',
-            'product_id': 'p1',
-            'vendor_id': 'v1',
-            'status': 'available',
-            'extra_k1': 'v1'}] if self.pci_support else []
-        self.pci_stats = [{
-            'count': 1,
-            'vendor_id': 'v1',
-            'product_id': 'p1'}] if self.pci_support else []
+        self.pci_devices = [
+            {
+                'label': 'label_8086_0443',
+                'dev_type': 'type-VF',
+                'compute_node_id': 1,
+                'address': '0000:00:01.1',
+                'product_id': '0443',
+                'vendor_id': '8086',
+                'status': 'available',
+                'extra_k1': 'v1',
+                'numa_node': 1
+            },
+            {
+                'label': 'label_8086_0443',
+                'dev_type': 'type-VF',
+                'compute_node_id': 1,
+                'address': '0000:00:01.2',
+                'product_id': '0443',
+                'vendor_id': '8086',
+                'status': 'available',
+                'extra_k1': 'v1',
+                'numa_node': 1
+            },
+            {
+                'label': 'label_8086_0443',
+                'dev_type': 'type-PF',
+                'compute_node_id': 1,
+                'address': '0000:00:01.0',
+                'product_id': '0443',
+                'vendor_id': '8086',
+                'status': 'available',
+                'extra_k1': 'v1',
+                'numa_node': 1
+            },
+            {
+                'label': 'label_8086_0123',
+                'dev_type': 'type-PCI',
+                'compute_node_id': 1,
+                'address': '0000:00:01.0',
+                'product_id': '0123',
+                'vendor_id': '8086',
+                'status': 'available',
+                'extra_k1': 'v1',
+                'numa_node': 1
+            },
+            {
+                'label': 'label_8086_7891',
+                'dev_type': 'type-VF',
+                'compute_node_id': 1,
+                'address': '0000:00:01.0',
+                'product_id': '7891',
+                'vendor_id': '8086',
+                'status': 'available',
+                'extra_k1': 'v1',
+                'numa_node': None
+            },
+        ] if self.pci_support else []
+        self.pci_stats = [
+            {
+                'count': 2,
+                'vendor_id': '8086',
+                'product_id': '0443',
+                'numa_node': 1
+            },
+            {
+                'count': 1,
+                'vendor_id': '8086',
+                'product_id': '7891',
+                'numa_node': None
+            },
+        ] if self.pci_support else []
         if stats is not None:
             self.stats = stats
 
@@ -149,6 +206,9 @@ class BaseTestCase(test.TestCase):
 
         self.context = context.get_admin_context()
 
+        self.flags(pci_passthrough_whitelist=[
+            '{"vendor_id": "8086", "product_id": "0443"}',
+            '{"vendor_id": "8086", "product_id": "7891"}'])
         self.flags(use_local=True, group='conductor')
         self.conductor = self.start_service('conductor',
                                             manager=CONF.conductor.manager)
@@ -163,12 +223,13 @@ class BaseTestCase(test.TestCase):
         self.stubs.Set(db, 'instance_extra_get_by_instance_uuid',
                        self._fake_instance_extra_get_by_instance_uuid)
         self.stubs.Set(self.conductor.db,
-                       'instance_update_and_get_original',
-                       self._fake_instance_update_and_get_original)
-        self.stubs.Set(self.conductor.db,
                        'flavor_get', self._fake_flavor_get)
 
         self.host = 'fakehost'
+        self.compute = self._create_compute_node()
+        self.updated = False
+        self.deleted = False
+        self.update_call_count = 0
 
     def _create_compute_node(self, values=None):
         compute = {
@@ -187,10 +248,17 @@ class BaseTestCase(test.TestCase):
             "running_vms": 0,
             "cpu_info": None,
             "numa_topology": None,
-            "stats": {
-                "num_instances": "1",
-            },
+            "stats": '{"num_instances": "1"}',
             "hypervisor_hostname": "fakenode",
+            'hypervisor_version': 1,
+            'hypervisor_type': 'fake-hyp',
+            'disk_available_least': None,
+            'host_ip': None,
+            'metrics': None,
+            'created_at': None,
+            'updated_at': None,
+            'deleted_at': None,
+            'deleted': False,
         }
         if values:
             compute.update(values)
@@ -206,6 +274,13 @@ class BaseTestCase(test.TestCase):
             "binary": "nova-compute",
             "topic": "compute",
             "compute_node": compute,
+            "report_count": 0,
+            'disabled': False,
+            'disabled_reason': None,
+            'created_at': None,
+            'updated_at': None,
+            'deleted_at': None,
+            'deleted': False,
         }
         return service
 
@@ -217,6 +292,8 @@ class BaseTestCase(test.TestCase):
         return sys_meta
 
     def _fake_instance(self, stash=True, flavor=None, **kwargs):
+        # NOTE(danms): Remove this when all the compute_node stuff is
+        # converted to objects
 
         # Default to an instance ready to resize to or from the same
         # instance_type
@@ -304,6 +381,83 @@ class BaseTestCase(test.TestCase):
         self._numa_topologies[instance_uuid] = extra
         return instance
 
+    def _fake_instance_obj(self, stash=True, flavor=None, **kwargs):
+
+        # Default to an instance ready to resize to or from the same
+        # instance_type
+        flavor = flavor or self._fake_flavor_create()
+        if not isinstance(flavor, objects.Flavor):
+            flavor = objects.Flavor(**flavor)
+
+        instance_uuid = str(uuid.uuid1())
+        instance = objects.Instance(context=self.context, uuid=instance_uuid,
+                                    flavor=flavor)
+        instance.update({
+            'vm_state': vm_states.RESIZED,
+            'task_state': None,
+            'ephemeral_key_uuid': None,
+            'os_type': 'Linux',
+            'project_id': '123456',
+            'host': None,
+            'node': None,
+            'instance_type_id': flavor['id'],
+            'memory_mb': flavor['memory_mb'],
+            'vcpus': flavor['vcpus'],
+            'root_gb': flavor['root_gb'],
+            'ephemeral_gb': flavor['ephemeral_gb'],
+            'launched_on': None,
+            'system_metadata': {},
+            'availability_zone': None,
+            'vm_mode': None,
+            'reservation_id': None,
+            'display_name': None,
+            'default_swap_device': None,
+            'power_state': None,
+            'scheduled_at': None,
+            'access_ip_v6': None,
+            'access_ip_v4': None,
+            'key_name': None,
+            'updated_at': None,
+            'cell_name': None,
+            'locked': None,
+            'locked_by': None,
+            'launch_index': None,
+            'architecture': None,
+            'auto_disk_config': None,
+            'terminated_at': None,
+            'ramdisk_id': None,
+            'user_data': None,
+            'cleaned': None,
+            'deleted_at': None,
+            'id': 333,
+            'disable_terminate': None,
+            'hostname': None,
+            'display_description': None,
+            'key_data': None,
+            'deleted': None,
+            'default_ephemeral_device': None,
+            'progress': None,
+            'launched_at': None,
+            'config_drive': None,
+            'kernel_id': None,
+            'user_id': None,
+            'shutdown_terminate': None,
+            'created_at': None,
+            'image_ref': None,
+            'root_device_name': None,
+        })
+
+        if stash:
+            instance.old_flavor = flavor
+            instance.new_flavor = flavor
+
+        instance.numa_topology = kwargs.pop('numa_topology', None)
+
+        instance.update(kwargs)
+
+        self._instances[instance_uuid] = instance
+        return instance
+
     def _fake_flavor_create(self, **kwargs):
         instance_type = {
             'id': 1,
@@ -341,13 +495,12 @@ class BaseTestCase(test.TestCase):
     def _fake_flavor_get(self, ctxt, id_):
         return self._instance_types[id_]
 
-    def _fake_instance_update_and_get_original(self, context, instance_uuid,
-                                               values, columns_to_join=None):
-        instance = self._instances[instance_uuid]
-        instance.update(values)
-        # the test doesn't care what the original instance values are, it's
-        # only used in the subsequent notification:
-        return (instance, instance)
+    def _fake_compute_node_update(self, ctx, compute_node_id, values,
+            prune_stats=False):
+        self.update_call_count += 1
+        self.updated = True
+        self.compute.update(values)
+        return self.compute
 
     def _driver(self):
         return FakeVirtDriver()
@@ -362,6 +515,7 @@ class BaseTestCase(test.TestCase):
         driver = self._driver()
 
         tracker = resource_tracker.ResourceTracker(host, driver, node)
+        tracker.compute_node = self._create_compute_node()
         tracker.ext_resources_handler = \
             resources.ResourceHandler(RESOURCE_NAMES, True)
         return tracker
@@ -387,20 +541,23 @@ class UnsupportedDriverTestCase(BaseTestCase):
 
     def test_disabled_claim(self):
         # basic claim:
-        instance = self._fake_instance()
-        claim = self.tracker.instance_claim(self.context, instance)
+        instance = self._fake_instance_obj()
+        with mock.patch.object(instance, 'save'):
+            claim = self.tracker.instance_claim(self.context, instance)
         self.assertEqual(0, claim.memory_mb)
 
     def test_disabled_instance_claim(self):
         # instance variation:
-        instance = self._fake_instance()
-        claim = self.tracker.instance_claim(self.context, instance)
+        instance = self._fake_instance_obj()
+        with mock.patch.object(instance, 'save'):
+            claim = self.tracker.instance_claim(self.context, instance)
         self.assertEqual(0, claim.memory_mb)
 
-    def test_disabled_instance_context_claim(self):
+    @mock.patch('nova.objects.Instance.save')
+    def test_disabled_instance_context_claim(self, mock_save):
         # instance context manager variation:
-        instance = self._fake_instance()
-        claim = self.tracker.instance_claim(self.context, instance)
+        instance = self._fake_instance_obj()
+        self.tracker.instance_claim(self.context, instance)
         with self.tracker.instance_claim(self.context, instance) as claim:
             self.assertEqual(0, claim.memory_mb)
 
@@ -434,6 +591,8 @@ class MissingServiceTestCase(BaseTestCase):
         self.tracker = self._tracker()
 
     def test_missing_service(self):
+        self.tracker.compute_node = None
+        self.tracker._get_service = mock.Mock(return_value=None)
         self.tracker.update_available_resource(self.context)
         self.assertTrue(self.tracker.disabled)
 
@@ -445,20 +604,27 @@ class MissingComputeNodeTestCase(BaseTestCase):
 
         self.stubs.Set(db, 'service_get_by_compute_host',
                 self._fake_service_get_by_compute_host)
+        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
+                self._fake_compute_node_get_by_host_and_nodename)
         self.stubs.Set(db, 'compute_node_create',
                 self._fake_create_compute_node)
         self.tracker.scheduler_client.update_resource_stats = mock.Mock()
 
     def _fake_create_compute_node(self, context, values):
         self.created = True
-        return self._create_compute_node()
+        return self._create_compute_node(values)
 
     def _fake_service_get_by_compute_host(self, ctx, host):
         # return a service with no joined compute
         service = self._create_service()
         return service
 
+    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host, nodename):
+        # return no compute node
+        raise exception.ComputeHostNotFound(host=host)
+
     def test_create_compute_node(self):
+        self.tracker.compute_node = None
         self.tracker.update_available_resource(self.context)
         self.assertTrue(self.created)
 
@@ -474,15 +640,13 @@ class BaseTrackerTestCase(BaseTestCase):
         # database models and a compatible compute driver:
         super(BaseTrackerTestCase, self).setUp()
 
-        self.updated = False
-        self.deleted = False
-        self.update_call_count = 0
-
         self.tracker = self._tracker()
         self._migrations = {}
 
         self.stubs.Set(db, 'service_get_by_compute_host',
                 self._fake_service_get_by_compute_host)
+        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
+                self._fake_compute_node_get_by_host_and_nodename)
         self.stubs.Set(db, 'compute_node_update',
                 self._fake_compute_node_update)
         self.stubs.Set(db, 'compute_node_delete',
@@ -496,13 +660,18 @@ class BaseTrackerTestCase(BaseTestCase):
         patcher = pci_fakes.fake_pci_whitelist()
         self.addCleanup(patcher.stop)
 
+        self.stubs.Set(self.tracker.scheduler_client, 'update_resource_stats',
+                self._fake_compute_node_update)
         self._init_tracker()
         self.limits = self._limits()
 
     def _fake_service_get_by_compute_host(self, ctx, host):
-        self.compute = self._create_compute_node()
         self.service = self._create_service(host, compute=self.compute)
         return self.service
+
+    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host, nodename):
+        self.compute = self._create_compute_node()
+        return self.compute
 
     def _fake_compute_node_update(self, ctx, compute_node_id, values,
             prune_stats=False):
@@ -551,7 +720,7 @@ class BaseTrackerTestCase(BaseTestCase):
             'memory_mb': memory_mb,
             'disk_gb': disk_gb,
             'vcpu': vcpus,
-            'numa_topology': numa_topology.to_json() if numa_topology else None
+            'numa_topology': numa_topology,
         }
 
     def assertEqualNUMAHostTopology(self, expected, got):
@@ -624,40 +793,31 @@ class TrackerTestCase(BaseTrackerTestCase):
         self.assertFalse(self.tracker.disabled)
         self.assertEqual(0, self.tracker.compute_node['current_workload'])
         self.assertEqual(driver.pci_stats,
-            jsonutils.loads(self.tracker.compute_node['pci_stats']))
+            self.tracker.compute_node['pci_device_pools'])
 
 
 class SchedulerClientTrackerTestCase(BaseTrackerTestCase):
 
     def setUp(self):
         super(SchedulerClientTrackerTestCase, self).setUp()
-        self.tracker.scheduler_client.update_resource_stats = mock.Mock()
-
-    def test_create_resource(self):
-        self.tracker._write_ext_resources = mock.Mock()
-        self.tracker.conductor_api.compute_node_create = mock.Mock(
-            return_value=dict(id=1))
-        values = {'stats': {}, 'foo': 'bar', 'baz_count': 0}
-        self.tracker._create(self.context, values)
-
-        expected = {'stats': '{}', 'foo': 'bar', 'baz_count': 0,
-                    'id': 1}
-        self.tracker.scheduler_client.update_resource_stats.\
-            assert_called_once_with(self.context,
-                                    ("fakehost", "fakenode"),
-                                    expected)
+        self.tracker.scheduler_client.update_resource_stats = mock.Mock(
+                side_effect=self._fake_compute_node_update)
 
     def test_update_resource(self):
-        self.tracker._write_ext_resources = mock.Mock()
-        values = {'stats': {}, 'foo': 'bar', 'baz_count': 0}
-        self.tracker._update(self.context, values)
-
-        expected = {'stats': '{}', 'foo': 'bar', 'baz_count': 0,
-                    'id': 1}
+        # change a compute node value to simulate a change
+        self.tracker.compute_node['local_gb_used'] += 1
+        expected = copy.deepcopy(self.tracker.compute_node)
+        self.tracker._update(self.context)
         self.tracker.scheduler_client.update_resource_stats.\
             assert_called_once_with(self.context,
                                     ("fakehost", "fakenode"),
                                     expected)
+
+    def test_no_update_resource(self):
+        self.tracker._update(self.context)
+        update = self.tracker.scheduler_client.update_resource_stats
+        self.assertFalse(update.called, "update_resource_stats should not be "
+                                        "called when there is no change")
 
 
 class TrackerPciStatsTestCase(BaseTrackerTestCase):
@@ -680,8 +840,12 @@ class TrackerPciStatsTestCase(BaseTrackerTestCase):
         self._assert(FAKE_VIRT_LOCAL_GB, 'free_disk_gb')
         self.assertFalse(self.tracker.disabled)
         self.assertEqual(0, self.tracker.compute_node['current_workload'])
-        self.assertEqual(driver.pci_stats,
-            jsonutils.loads(self.tracker.compute_node['pci_stats']))
+
+        # NOTE(danms): PciDeviceStats only supports iteration, so we have to
+        # listify it before we can examine the contents by index.
+        pools = list(self.tracker.compute_node['pci_device_pools'])
+        self.assertEqual(driver.pci_stats[0]['product_id'],
+                         pools[0]['product_id'])
 
     def _driver(self):
         return FakeVirtDriver(pci_support=True)
@@ -726,7 +890,7 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
             cells=[objects.InstanceNUMACell(
                 id=0, cpuset=set([1]), memory=mem),
                    objects.InstanceNUMACell(
-                id=1, cpuset=set([3]), memory=mem)])
+                       id=1, cpuset=set([3]), memory=mem)])
 
     def _claim_topology(self, mem, cpus=1):
         if self.tracker.driver.numa_topology is None:
@@ -735,10 +899,12 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
         return objects.NUMATopology(
             cells=[objects.NUMACell(
                        id=0, cpuset=set([1, 2]), memory=3072, cpu_usage=cpus,
-                       memory_usage=mem),
+                       memory_usage=mem, mempages=[], siblings=[],
+                       pinned_cpus=set([])),
                    objects.NUMACell(
                        id=1, cpuset=set([3, 4]), memory=3072, cpu_usage=cpus,
-                       memory_usage=mem)])
+                       memory_usage=mem, mempages=[], siblings=[],
+                       pinned_cpus=set([]))])
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
@@ -750,7 +916,7 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
         instance_topology = self._instance_topology(claim_mem / 2)
 
-        instance = self._fake_instance(
+        instance = self._fake_instance_obj(
                 flavor=flavor, task_state=None,
                 numa_topology=instance_topology)
         self.tracker.update_usage(self.context, instance)
@@ -760,8 +926,9 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
         self._assert(0, 'current_workload')
         self._assert(FAKE_VIRT_NUMA_TOPOLOGY, 'numa_topology')
 
-        claim = self.tracker.instance_claim(self.context, instance,
-                self.limits)
+        with mock.patch.object(instance, 'save'):
+            claim = self.tracker.instance_claim(self.context, instance,
+                                                self.limits)
         self.assertNotEqual(0, claim.memory_mb)
         self._assert(claim_mem, 'memory_mb_used')
         self._assert(claim_gb, 'local_gb_used')
@@ -778,57 +945,6 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
-    def test_claim_and_audit(self, mock_get):
-        claim_mem = 3
-        claim_mem_total = 3 + FAKE_VIRT_MEMORY_OVERHEAD
-        claim_disk = 2
-        claim_topology = self._claim_topology(claim_mem_total / 2)
-
-        instance_topology = self._instance_topology(claim_mem_total / 2)
-        instance = self._fake_instance(memory_mb=claim_mem, root_gb=claim_disk,
-                ephemeral_gb=0, numa_topology=instance_topology)
-
-        self.tracker.instance_claim(self.context, instance, self.limits)
-
-        self.assertEqual(FAKE_VIRT_MEMORY_MB, self.compute["memory_mb"])
-        self.assertEqual(claim_mem_total, self.compute["memory_mb_used"])
-        self.assertEqual(FAKE_VIRT_MEMORY_MB - claim_mem_total,
-                         self.compute["free_ram_mb"])
-        self.assertEqualNUMAHostTopology(
-                claim_topology, objects.NUMATopology.obj_from_db_obj(
-                    self.compute['numa_topology']))
-
-        self.assertEqual(FAKE_VIRT_LOCAL_GB, self.compute["local_gb"])
-        self.assertEqual(claim_disk, self.compute["local_gb_used"])
-        self.assertEqual(FAKE_VIRT_LOCAL_GB - claim_disk,
-                         self.compute["free_disk_gb"])
-
-        # 1st pretend that the compute operation finished and claimed the
-        # desired resources from the virt layer
-        driver = self.tracker.driver
-        driver.memory_mb_used = claim_mem
-        driver.local_gb_used = claim_disk
-
-        self.tracker.update_available_resource(self.context)
-
-        # confirm tracker is adding in host_ip
-        self.assertIsNotNone(self.compute.get('host_ip'))
-
-        # confirm that resource usage is derived from instance usages,
-        # not virt layer:
-        self.assertEqual(claim_mem_total, self.compute['memory_mb_used'])
-        self.assertEqual(FAKE_VIRT_MEMORY_MB - claim_mem_total,
-                         self.compute['free_ram_mb'])
-        self.assertEqualNUMAHostTopology(
-                claim_topology, objects.NUMATopology.obj_from_db_obj(
-                    self.compute['numa_topology']))
-
-        self.assertEqual(claim_disk, self.compute['local_gb_used'])
-        self.assertEqual(FAKE_VIRT_LOCAL_GB - claim_disk,
-                         self.compute['free_disk_gb'])
-
-    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
-                return_value=objects.InstancePCIRequests(requests=[]))
     def test_claim_and_abort(self, mock_get):
         claim_mem = 3
         claim_mem_total = 3 + FAKE_VIRT_MEMORY_OVERHEAD
@@ -836,12 +952,13 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
         claim_topology = self._claim_topology(claim_mem_total / 2)
 
         instance_topology = self._instance_topology(claim_mem_total / 2)
-        instance = self._fake_instance(memory_mb=claim_mem,
+        instance = self._fake_instance_obj(memory_mb=claim_mem,
                 root_gb=claim_disk, ephemeral_gb=0,
                 numa_topology=instance_topology)
 
-        claim = self.tracker.instance_claim(self.context, instance,
-                self.limits)
+        with mock.patch.object(instance, 'save'):
+            claim = self.tracker.instance_claim(self.context, instance,
+                                                self.limits)
         self.assertIsNotNone(claim)
 
         self.assertEqual(claim_mem_total, self.compute["memory_mb_used"])
@@ -879,13 +996,14 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
         limits = {'memory_mb': memory_mb + FAKE_VIRT_MEMORY_OVERHEAD,
                   'disk_gb': root_gb * 2,
                   'vcpu': vcpus,
-                  'numa_topology': FAKE_VIRT_NUMA_TOPOLOGY_OVERHEAD.to_json()}
+                  'numa_topology': FAKE_VIRT_NUMA_TOPOLOGY_OVERHEAD}
 
-        instance = self._fake_instance(memory_mb=memory_mb,
+        instance = self._fake_instance_obj(memory_mb=memory_mb,
                 root_gb=root_gb, ephemeral_gb=ephemeral_gb,
                 numa_topology=instance_topology)
 
-        self.tracker.instance_claim(self.context, instance, limits)
+        with mock.patch.object(instance, 'save'):
+            self.tracker.instance_claim(self.context, instance, limits)
         self.assertEqual(memory_mb + FAKE_VIRT_MEMORY_OVERHEAD,
                 self.tracker.compute_node['memory_mb_used'])
         self.assertEqualNUMAHostTopology(
@@ -897,18 +1015,19 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
-    def test_additive_claims(self, mock_get):
+    @mock.patch('nova.objects.Instance.save')
+    def test_additive_claims(self, mock_save, mock_get):
         self.limits['vcpu'] = 2
         claim_topology = self._claim_topology(2, cpus=2)
 
         flavor = self._fake_flavor_create(
                 memory_mb=1, root_gb=1, ephemeral_gb=0)
         instance_topology = self._instance_topology(1)
-        instance = self._fake_instance(
+        instance = self._fake_instance_obj(
                 flavor=flavor, numa_topology=instance_topology)
         with self.tracker.instance_claim(self.context, instance, self.limits):
             pass
-        instance = self._fake_instance(
+        instance = self._fake_instance_obj(
                 flavor=flavor, numa_topology=instance_topology)
         with self.tracker.instance_claim(self.context, instance, self.limits):
             pass
@@ -927,8 +1046,10 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
-    def test_context_claim_with_exception(self, mock_get):
-        instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1)
+    @mock.patch('nova.objects.Instance.save')
+    def test_context_claim_with_exception(self, mock_save, mock_get):
+        instance = self._fake_instance_obj(memory_mb=1, root_gb=1,
+                                           ephemeral_gb=1)
         try:
             with self.tracker.instance_claim(self.context, instance):
                 # <insert exciting things that utilize resources>
@@ -947,13 +1068,15 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
-    def test_instance_context_claim(self, mock_get):
+    @mock.patch('nova.objects.Instance.save')
+    @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+    def test_instance_context_claim(self, mock_get_all, mock_save, mock_get):
         flavor = self._fake_flavor_create(
                 memory_mb=1, root_gb=2, ephemeral_gb=3)
         claim_topology = self._claim_topology(1)
 
         instance_topology = self._instance_topology(1)
-        instance = self._fake_instance(
+        instance = self._fake_instance_obj(
                 flavor=flavor, numa_topology=instance_topology)
         with self.tracker.instance_claim(self.context, instance):
             # <insert exciting things that utilize resources>
@@ -972,6 +1095,7 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
         # after exiting claim context, build is marked as finished.  usage
         # totals should be same:
+        mock_get_all.return_value = [instance]
         self.tracker.update_available_resource(self.context)
         self.assertEqual(flavor['memory_mb'] + FAKE_VIRT_MEMORY_OVERHEAD,
                          self.tracker.compute_node['memory_mb_used'])
@@ -989,9 +1113,10 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
     def test_update_load_stats_for_instance(self, mock_get):
-        instance = self._fake_instance(task_state=task_states.SCHEDULING)
-        with self.tracker.instance_claim(self.context, instance):
-            pass
+        instance = self._fake_instance_obj(task_state=task_states.SCHEDULING)
+        with mock.patch.object(instance, 'save'):
+            with self.tracker.instance_claim(self.context, instance):
+                pass
 
         self.assertEqual(1, self.tracker.compute_node['current_workload'])
 
@@ -1004,12 +1129,13 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
-    def test_cpu_stats(self, mock_get):
+    @mock.patch('nova.objects.Instance.save')
+    def test_cpu_stats(self, mock_save, mock_get):
         limits = {'disk_gb': 100, 'memory_mb': 100}
         self.assertEqual(0, self.tracker.compute_node['vcpus_used'])
 
         vcpus = 1
-        instance = self._fake_instance(vcpus=vcpus)
+        instance = self._fake_instance_obj(vcpus=vcpus)
 
         # should not do anything until a claim is made:
         self.tracker.update_usage(self.context, instance)
@@ -1026,7 +1152,7 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
 
         add_vcpus = 10
         vcpus += add_vcpus
-        instance = self._fake_instance(vcpus=add_vcpus)
+        instance = self._fake_instance_obj(vcpus=add_vcpus)
         with self.tracker.instance_claim(self.context, instance, limits):
             pass
         self.assertEqual(vcpus, self.tracker.compute_node['vcpus_used'])
@@ -1045,45 +1171,54 @@ class InstanceClaimTestCase(BaseTrackerTestCase):
         self.assertEqual(0, self.tracker.compute_node['memory_mb_used'])
         self.assertEqual(0, self.tracker.compute_node['local_gb_used'])
 
+    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    def test_deleted_instances_with_migrations(self, mock_migration_list):
+        migration = objects.Migration(context=self.context,
+                                      instance_uuid='invalid')
+        mock_migration_list.return_value = [migration]
+        self.tracker.update_available_resource(self.context)
+        self.assertEqual(0, self.tracker.compute_node['memory_mb_used'])
+        self.assertEqual(0, self.tracker.compute_node['local_gb_used'])
+        mock_migration_list.assert_called_once_with(self.context,
+                                                    "fakehost",
+                                                    "fakenode")
+
+    @mock.patch('nova.compute.claims.Claim')
+    @mock.patch('nova.objects.Instance.save')
+    def test_claim_saves_numa_topology(self, mock_save, mock_claim):
+        def fake_save():
+            self.assertEqual(set(['numa_topology', 'host', 'node',
+                                  'launched_on']),
+                             inst.obj_what_changed())
+
+        mock_save.side_effect = fake_save
+        inst = objects.Instance(host=None, node=None, memory_mb=1024)
+        inst.obj_reset_changes()
+        numa = objects.InstanceNUMATopology()
+        claim = mock.MagicMock()
+        claim.claimed_numa_topology = numa
+        mock_claim.return_value = claim
+        with mock.patch.object(self.tracker, '_update_usage_from_instance'):
+            self.tracker.instance_claim(self.context, inst)
+        mock_save.assert_called_once_with()
+
+    def test_set_instance_host_and_node(self):
+        inst = objects.Instance()
+        with mock.patch.object(inst, 'save') as mock_save:
+            self.tracker._set_instance_host_and_node(self.context, inst)
+            mock_save.assert_called_once_with()
+        self.assertEqual(self.tracker.host, inst.host)
+        self.assertEqual(self.tracker.nodename, inst.node)
+        self.assertEqual(self.tracker.host, inst.launched_on)
+
 
 class ResizeClaimTestCase(BaseTrackerTestCase):
 
     def setUp(self):
         super(ResizeClaimTestCase, self).setUp()
 
-        def _fake_migration_create(mig_self):
-            self._migrations[mig_self.instance_uuid] = mig_self
-            mig_self.obj_reset_changes()
-
-        self.stubs.Set(objects.Migration, 'create',
-                       _fake_migration_create)
-
         self.instance = self._fake_instance()
         self.instance_type = self._fake_flavor_create()
-
-    def _fake_migration_create(self, values=None):
-        instance_uuid = str(uuid.uuid1())
-        mig_dict = test_migration.fake_db_migration()
-        mig_dict.update({
-            'id': 1,
-            'source_compute': 'host1',
-            'source_node': 'fakenode',
-            'dest_compute': 'host2',
-            'dest_node': 'fakenode',
-            'dest_host': '127.0.0.1',
-            'old_instance_type_id': 1,
-            'new_instance_type_id': 2,
-            'instance_uuid': instance_uuid,
-            'status': 'pre-migrating',
-            'updated_at': timeutils.utcnow()
-            })
-        if values:
-            mig_dict.update(values)
-
-        migration = objects.Migration(context='fake')
-        migration.update(mig_dict)
-        # This hits the stub in setUp()
-        migration.create()
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
@@ -1130,60 +1265,6 @@ class ResizeClaimTestCase(BaseTrackerTestCase):
 
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
-    def test_claim_and_audit(self, mock_get):
-        self.tracker.resize_claim(self.context, self.instance,
-                self.instance_type, self.limits)
-
-        self.tracker.update_available_resource(self.context)
-
-        self._assert(FAKE_VIRT_MEMORY_WITH_OVERHEAD, 'memory_mb_used')
-        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
-        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
-
-    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
-                return_value=objects.InstancePCIRequests(requests=[]))
-    def test_same_host(self, mock_get):
-        self.limits['vcpu'] = 3
-
-        src_dict = {
-            'memory_mb': 1, 'root_gb': 1, 'ephemeral_gb': 0, 'vcpus': 1}
-        dest_dict = dict((k, v + 1) for (k, v) in src_dict.iteritems())
-        src_type = self._fake_flavor_create(
-                id=10, name="srcflavor", **src_dict)
-        dest_type = self._fake_flavor_create(
-                id=11, name="destflavor", **dest_dict)
-
-        # make an instance of src_type:
-        instance = self._fake_instance(flavor=src_type)
-        instance['system_metadata'] = self._fake_instance_system_metadata(
-            dest_type)
-        self.tracker.instance_claim(self.context, instance, self.limits)
-
-        # resize to dest_type:
-        claim = self.tracker.resize_claim(self.context, instance,
-                dest_type, self.limits)
-
-        self._assert(src_dict['memory_mb'] + dest_dict['memory_mb']
-                   + 2 * FAKE_VIRT_MEMORY_OVERHEAD, 'memory_mb_used')
-        self._assert(src_dict['root_gb'] + src_dict['ephemeral_gb']
-                   + dest_dict['root_gb'] + dest_dict['ephemeral_gb'],
-                   'local_gb_used')
-        self._assert(src_dict['vcpus'] + dest_dict['vcpus'], 'vcpus_used')
-
-        self.tracker.update_available_resource(self.context)
-        claim.abort()
-
-        # only the original instance should remain, not the migration:
-        self._assert(src_dict['memory_mb'] + FAKE_VIRT_MEMORY_OVERHEAD,
-                     'memory_mb_used')
-        self._assert(src_dict['root_gb'] + src_dict['ephemeral_gb'],
-                     'local_gb_used')
-        self._assert(src_dict['vcpus'], 'vcpus_used')
-        self.assertEqual(1, len(self.tracker.tracked_instances))
-        self.assertEqual(0, len(self.tracker.tracked_migrations))
-
-    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
-                return_value=objects.InstancePCIRequests(requests=[]))
     def test_revert(self, mock_get):
         self.tracker.resize_claim(self.context, self.instance,
                 self.instance_type, {}, self.limits)
@@ -1194,64 +1275,6 @@ class ResizeClaimTestCase(BaseTrackerTestCase):
         self._assert(0, 'memory_mb_used')
         self._assert(0, 'local_gb_used')
         self._assert(0, 'vcpus_used')
-
-    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
-                return_value=objects.InstancePCIRequests(requests=[]))
-    def test_revert_reserve_source(self, mock_get):
-        # if a revert has started at the API and audit runs on
-        # the source compute before the instance flips back to source,
-        # resources should still be held at the source based on the
-        # migration:
-        dest = "desthost"
-        dest_tracker = self._tracker(host=dest)
-        dest_tracker.update_available_resource(self.context)
-
-        self.instance = self._fake_instance(memory_mb=FAKE_VIRT_MEMORY_MB,
-                root_gb=FAKE_VIRT_LOCAL_GB, ephemeral_gb=0,
-                vcpus=FAKE_VIRT_VCPUS, instance_type_id=1)
-
-        values = {'source_compute': self.host, 'dest_compute': dest,
-                  'old_instance_type_id': 1, 'new_instance_type_id': 1,
-                  'status': 'post-migrating',
-                  'instance_uuid': self.instance['uuid']}
-        self._fake_migration_create(values)
-
-        # attach an instance to the destination host tracker:
-        dest_tracker.instance_claim(self.context, self.instance)
-
-        self._assert(FAKE_VIRT_MEMORY_WITH_OVERHEAD,
-                     'memory_mb_used', tracker=dest_tracker)
-        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used',
-                     tracker=dest_tracker)
-        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used',
-                     tracker=dest_tracker)
-
-        # audit and recheck to confirm migration doesn't get double counted
-        # on dest:
-        dest_tracker.update_available_resource(self.context)
-
-        self._assert(FAKE_VIRT_MEMORY_WITH_OVERHEAD,
-                     'memory_mb_used', tracker=dest_tracker)
-        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used',
-                     tracker=dest_tracker)
-        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used',
-                     tracker=dest_tracker)
-
-        # apply the migration to the source host tracker:
-        self.tracker.update_available_resource(self.context)
-
-        self._assert(FAKE_VIRT_MEMORY_WITH_OVERHEAD, 'memory_mb_used')
-        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
-        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
-
-        # flag the instance and migration as reverting and re-audit:
-        self.instance['vm_state'] = vm_states.RESIZED
-        self.instance['task_state'] = task_states.RESIZE_REVERTING
-        self.tracker.update_available_resource(self.context)
-
-        self._assert(FAKE_VIRT_MEMORY_MB + 1, 'memory_mb_used')
-        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
-        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
 
     def test_resize_filter(self):
         instance = self._fake_instance(vm_state=vm_states.ACTIVE,
@@ -1271,27 +1294,16 @@ class ResizeClaimTestCase(BaseTrackerTestCase):
                 result = self.tracker._instance_in_resize_state(instance)
                 self.assertTrue(result)
 
-    def test_dupe_filter(self):
-        instance = self._fake_instance(host=self.host)
-
-        values = {'source_compute': self.host, 'dest_compute': self.host,
-                  'instance_uuid': instance['uuid'], 'new_instance_type_id': 2}
-        self._fake_flavor_create(id=2)
-        self._fake_migration_create(values)
-        self._fake_migration_create(values)
-
-        self.tracker.update_available_resource(self.context)
-        self.assertEqual(1, len(self.tracker.tracked_migrations))
-
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
                 return_value=objects.InstancePCIRequests(requests=[]))
     def test_set_instance_host_and_node(self, mock_get):
-        instance = self._fake_instance()
+        instance = self._fake_instance_obj()
         self.assertIsNone(instance['host'])
         self.assertIsNone(instance['launched_on'])
         self.assertIsNone(instance['node'])
 
-        claim = self.tracker.instance_claim(self.context, instance)
+        with mock.patch.object(instance, 'save'):
+            claim = self.tracker.instance_claim(self.context, instance)
         self.assertNotEqual(0, claim.memory_mb)
 
         self.assertEqual('fakehost', instance['host'])

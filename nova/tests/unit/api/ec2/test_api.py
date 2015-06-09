@@ -268,7 +268,6 @@ class ApiEc2TestCase(test.TestCase):
         self.mox.StubOutWithMock(self.ec2, 'new_http_connection')
         self.http = FakeHttplibConnection(
                 self.app, '%s:8773' % (self.host), False)
-        # pylint: disable=E1103
         if versionutils.is_compatible('2.14', boto.Version, same_major=False):
             self.ec2.new_http_connection(host or self.host, 8773,
                 is_secure).AndReturn(self.http)
@@ -285,9 +284,9 @@ class ApiEc2TestCase(test.TestCase):
 
         # Any request should be fine
         self.ec2.get_all_instances()
-        self.assertTrue(self.ec2.APIVersion in self.http.getresponsebody(),
-                        'The version in the xmlns of the response does '
-                        'not match the API version given in the request.')
+        self.assertIn(self.ec2.APIVersion, self.http.getresponsebody(),
+                      'The version in the xmlns of the response does '
+                      'not match the API version given in the request.')
 
     def test_describe_instances(self):
         """Test that, after creating a user and a project, the describe
@@ -452,7 +451,7 @@ class ApiEc2TestCase(test.TestCase):
                 self.assertEqual(e.status, 400, 'Expected status to be 400')
                 self.assertIn(message, e.error_message)
             else:
-                raise self.failureException, 'EC2ResponseError not raised'
+                raise self.failureException('EC2ResponseError not raised')
 
         # Invalid CIDR address
         _assert('Invalid CIDR', 'tcp', 80, 81, '0.0.0.0/0444')

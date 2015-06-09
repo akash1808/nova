@@ -16,10 +16,12 @@
 import datetime
 import uuid
 
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_serialization import jsonutils
+from oslo_utils import netutils
+from oslo_utils import timeutils
 import routes
 import six
+from six.moves import range
 import webob
 import webob.dec
 import webob.request
@@ -122,15 +124,15 @@ def wsgi_app_v21(inner_app_v21=None, fake_auth_context=None,
     return mapper
 
 
-def stub_out_key_pair_funcs(stubs, have_key_pair=True):
+def stub_out_key_pair_funcs(stubs, have_key_pair=True, **kwargs):
     def key_pair(context, user_id):
         return [dict(test_keypair.fake_keypair,
-                     name='key', public_key='public_key')]
+                     name='key', public_key='public_key', **kwargs)]
 
     def one_key_pair(context, user_id, name):
         if name == 'key':
             return dict(test_keypair.fake_keypair,
-                        name='key', public_key='public_key')
+                        name='key', public_key='public_key', **kwargs)
         else:
             raise exc.KeypairNotFound(user_id=user_id, name=name)
 
@@ -176,7 +178,7 @@ def stub_out_instance_quota(stubs, allowed, quota, resource='instances'):
 def stub_out_networking(stubs):
     def get_my_ip():
         return '127.0.0.1'
-    stubs.Set(nova.netconf, '_get_my_ip', get_my_ip)
+    stubs.Set(netutils, 'get_my_ipv4', get_my_ip)
 
 
 def stub_out_compute_api_snapshot(stubs):
@@ -217,7 +219,10 @@ def stub_out_nw_api(stubs, cls=None, private=None, publics=None):
     if not publics:
         publics = ['1.2.3.4']
 
-    class Fake:
+    class Fake(object):
+        def __init__(self, skip_policy_check=False):
+            pass
+
         def get_instance_nw_info(*args, **kwargs):
             pass
 
@@ -247,7 +252,7 @@ class FakeToken(object):
     def __init__(self, **kwargs):
         FakeToken.id_count += 1
         self.id = FakeToken.id_count
-        for k, v in kwargs.iteritems():
+        for k, v in six.iteritems(kwargs):
             setattr(self, k, v)
 
 
@@ -263,10 +268,11 @@ class HTTPRequest(os_wsgi.Request):
     def blank(*args, **kwargs):
         kwargs['base_url'] = 'http://localhost/v2'
         use_admin_context = kwargs.pop('use_admin_context', False)
+        version = kwargs.pop('version', os_wsgi.DEFAULT_API_VERSION)
         out = os_wsgi.Request.blank(*args, **kwargs)
         out.environ['nova.context'] = FakeRequestContext('fake_user', 'fake',
                 is_admin=use_admin_context)
-        out.api_version_request = api_version.APIVersionRequest("2.1")
+        out.api_version_request = api_version.APIVersionRequest(version)
         return out
 
 
@@ -276,7 +282,9 @@ class HTTPRequestV3(os_wsgi.Request):
     def blank(*args, **kwargs):
         kwargs['base_url'] = 'http://localhost/v3'
         use_admin_context = kwargs.pop('use_admin_context', False)
+        version = kwargs.pop('version', os_wsgi.DEFAULT_API_VERSION)
         out = os_wsgi.Request.blank(*args, **kwargs)
+        out.api_version_request = api_version.APIVersionRequest(version)
         out.environ['nova.context'] = FakeRequestContext('fake_user', 'fake',
                 is_admin=use_admin_context)
         return out
@@ -289,6 +297,15 @@ class TestRouter(wsgi.Router):
         mapper.resource("test", "tests",
                         controller=os_wsgi.Resource(controller))
         super(TestRouter, self).__init__(mapper)
+
+
+class TestRouterV21(wsgi.Router):
+    def __init__(self, controller, mapper=None):
+        if not mapper:
+            mapper = routes.Mapper()
+        mapper.resource("test", "tests",
+                        controller=os_wsgi.ResourceV21(controller))
+        super(TestRouterV21, self).__init__(mapper)
 
 
 class FakeAuthDatabase(object):
@@ -394,7 +411,7 @@ def fake_instance_get_all_by_filters(num_servers=5, **kwargs):
         if 'sort_dirs' in kwargs:
             kwargs.pop('sort_dirs')
 
-        for i in xrange(num_servers):
+        for i in range(num_servers):
             uuid = get_fake_uuid(i)
             server = stub_instance(id=i + 1, uuid=uuid,
                     **kwargs)
@@ -423,7 +440,9 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
                   launched_at=timeutils.utcnow(),
                   terminated_at=timeutils.utcnow(),
                   availability_zone='', locked_by=None, cleaned=False,
-                  memory_mb=0, vcpus=0, root_gb=0, ephemeral_gb=0):
+                  memory_mb=0, vcpus=0, root_gb=0, ephemeral_gb=0,
+                  instance_type=None, launch_index=0, kernel_id="",
+                  ramdisk_id="", user_data=None):
     if user_id is None:
         user_id = 'fake_user'
     if project_id is None:
@@ -460,6 +479,15 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
 
     info_cache = create_info_cache(nw_cache)
 
+    if instance_type is not None:
+        flavorinfo = jsonutils.dumps({
+            'cur': instance_type.obj_to_primitive(),
+            'old': None,
+            'new': None,
+        })
+    else:
+        flavorinfo = None
+
     instance = {
         "id": int(id),
         "created_at": datetime.datetime(2010, 10, 10, 12, 0, 0),
@@ -469,9 +497,9 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
         "user_id": user_id,
         "project_id": project_id,
         "image_ref": image_ref,
-        "kernel_id": "",
-        "ramdisk_id": "",
-        "launch_index": 0,
+        "kernel_id": kernel_id,
+        "ramdisk_id": ramdisk_id,
+        "launch_index": launch_index,
         "key_name": key_name,
         "key_data": key_data,
         "config_drive": config_drive,
@@ -488,7 +516,7 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
         "node": node,
         "instance_type_id": 1,
         "instance_type": inst_type,
-        "user_data": "",
+        "user_data": user_data,
         "reservation_id": reservation_id,
         "mac_address": "",
         "scheduled_at": timeutils.utcnow(),
@@ -519,6 +547,10 @@ def stub_instance(id, user_id=None, project_id=None, host=None,
         "cell_name": "",
         "architecture": "",
         "os_type": "",
+        "extra": {"numa_topology": None,
+                  "pci_requests": None,
+                  "flavor": flavorinfo,
+              },
         "cleaned": cleaned}
 
     instance.update(info_cache)
@@ -619,7 +651,7 @@ def stub_compute_volume_snapshot_create(self, context, volume_id, create_info):
 
 def stub_snapshot_delete(self, context, snapshot_id):
     if snapshot_id == '-1':
-        raise exc.NotFound
+        raise exc.SnapshotNotFound(snapshot_id=snapshot_id)
 
 
 def stub_compute_volume_snapshot_delete(self, context, volume_id, snapshot_id,
@@ -629,7 +661,7 @@ def stub_compute_volume_snapshot_delete(self, context, volume_id, snapshot_id,
 
 def stub_snapshot_get(self, context, snapshot_id):
     if snapshot_id == '-1':
-        raise exc.NotFound
+        raise exc.SnapshotNotFound(snapshot_id=snapshot_id)
     return stub_snapshot(snapshot_id)
 
 

@@ -27,16 +27,18 @@ import sys
 import eventlet
 import eventlet.wsgi
 import greenlet
-from oslo.config import cfg
-from oslo.utils import excutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_log import loggers
+from oslo_utils import excutils
 from paste import deploy
 import routes.middleware
+import six
 import webob.dec
 import webob.exc
 
 from nova import exception
 from nova.i18n import _, _LE, _LI
-from nova.openstack.common import log as logging
 
 wsgi_opts = [
     cfg.StrOpt('api_paste_config',
@@ -114,7 +116,7 @@ class Server(object):
         self.pool_size = pool_size or self.default_pool_size
         self._pool = eventlet.GreenPool(self.pool_size)
         self._logger = logging.getLogger("nova.%s.wsgi.server" % self.name)
-        self._wsgi_logger = logging.WritableLogger(self._logger)
+        self._wsgi_logger = loggers.WritableLogger(self._logger)
         self._use_ssl = use_ssl
         self._max_url_len = max_url_len
         self.client_socket_timeout = CONF.client_socket_timeout or None
@@ -159,6 +161,18 @@ class Server(object):
         # to keep file descriptor usable.
 
         dup_socket = self._socket.dup()
+        dup_socket.setsockopt(socket.SOL_SOCKET,
+                              socket.SO_REUSEADDR, 1)
+        # sockets can hang around forever without keepalive
+        dup_socket.setsockopt(socket.SOL_SOCKET,
+                              socket.SO_KEEPALIVE, 1)
+
+        # This option isn't available in the OS X version of eventlet
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            dup_socket.setsockopt(socket.IPPROTO_TCP,
+                                  socket.TCP_KEEPIDLE,
+                                  CONF.tcp_keepidle)
+
         if self._use_ssl:
             try:
                 ca_file = CONF.ssl_ca_file
@@ -195,19 +209,6 @@ class Server(object):
 
                 dup_socket = eventlet.wrap_ssl(dup_socket,
                                                **ssl_kwargs)
-
-                dup_socket.setsockopt(socket.SOL_SOCKET,
-                                      socket.SO_REUSEADDR, 1)
-                # sockets can hang around forever without keepalive
-                dup_socket.setsockopt(socket.SOL_SOCKET,
-                                      socket.SO_KEEPALIVE, 1)
-
-                # This option isn't available in the OS X version of eventlet
-                if hasattr(socket, 'TCP_KEEPIDLE'):
-                    dup_socket.setsockopt(socket.IPPROTO_TCP,
-                                    socket.TCP_KEEPIDLE,
-                                    CONF.tcp_keepidle)
-
             except Exception:
                 with excutils.save_and_reraise_exception():
                     LOG.error(_LE("Failed to start %(name)s on %(host)s"
@@ -422,7 +423,7 @@ class Debug(Middleware):
         resp = req.get_response(self.application)
 
         print(('*' * 40) + ' RESPONSE HEADERS')
-        for (key, value) in resp.headers.iteritems():
+        for (key, value) in six.iteritems(resp.headers):
             print(key, '=', value)
         print()
 
@@ -531,6 +532,6 @@ class Loader(object):
             LOG.debug("Loading app %(name)s from %(path)s",
                       {'name': name, 'path': self.config_path})
             return deploy.loadapp("config:%s" % self.config_path, name=name)
-        except LookupError as err:
-            LOG.error(err)
+        except LookupError:
+            LOG.exception(_LE("Couldn't lookup app: %s"), name)
             raise exception.PasteAppNotFound(name=name, path=self.config_path)

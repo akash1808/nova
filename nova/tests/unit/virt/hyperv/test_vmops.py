@@ -16,14 +16,16 @@ import os
 
 from eventlet import timeout as etimeout
 import mock
-from oslo.config import cfg
-from oslo.utils import units
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_utils import units
 
 from nova import exception
 from nova.tests.unit import fake_instance
 from nova.tests.unit.virt.hyperv import test_base
+from nova.virt import hardware
 from nova.virt.hyperv import constants
+from nova.virt.hyperv import ioutils
 from nova.virt.hyperv import vmops
 from nova.virt.hyperv import vmutils
 
@@ -39,11 +41,11 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
     FAKE_ROOT_PATH = 'C:\\path\\to\\fake.%s'
     FAKE_CONFIG_DRIVE_ISO = 'configdrive.iso'
     FAKE_CONFIG_DRIVE_VHD = 'configdrive.vhd'
+    FAKE_UUID = '4f54fb69-d3a2-45b7-bb9b-b6e6b3d893b3'
+    FAKE_LOG = 'fake_log'
 
     ISO9660 = 'iso9660'
-
-    def __init__(self, test_case_name):
-        super(VMOpsTestCase, self).__init__(test_case_name)
+    _FAKE_CONFIGDRIVE_PATH = 'C:/fake_instance_dir/configdrive.vhd'
 
     def setUp(self):
         super(VMOpsTestCase, self).setUp()
@@ -53,6 +55,65 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         self._vmops._vmutils = mock.MagicMock()
         self._vmops._vhdutils = mock.MagicMock()
         self._vmops._pathutils = mock.MagicMock()
+        self._vmops._hostutils = mock.MagicMock()
+
+    @mock.patch('nova.virt.hyperv.vmops.importutils.import_object')
+    def test_load_vif_driver_class(self, mock_import_object):
+        self._vmops._load_vif_driver_class()
+        mock_import_object.assert_called_once_with(
+            self._vmops._vif_driver_class_map[CONF.network_api_class])
+        self.assertEqual(self._vmops._vif_driver,
+                         mock_import_object.return_value)
+
+    @mock.patch('nova.virt.hyperv.vmops.importutils.import_object')
+    def test_load_vif_driver_class_error(self, mock_import_object):
+        mock_import_object.side_effect = KeyError
+        self.assertRaises(TypeError, self._vmops._load_vif_driver_class)
+
+    def test_list_instances(self):
+        mock_instance = mock.MagicMock()
+        self._vmops._vmutils.list_instances.return_value = [mock_instance]
+        response = self._vmops.list_instances()
+        self._vmops._vmutils.list_instances.assert_called_once_with()
+        self.assertEqual(response, [mock_instance])
+
+    def _test_get_info(self, vm_exists):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        mock_info = mock.MagicMock(spec_set=dict)
+        fake_info = {'EnabledState': 2,
+                     'MemoryUsage': mock.sentinel.FAKE_MEM_KB,
+                     'NumberOfProcessors': mock.sentinel.FAKE_NUM_CPU,
+                     'UpTime': mock.sentinel.FAKE_CPU_NS}
+
+        def getitem(key):
+            return fake_info[key]
+        mock_info.__getitem__.side_effect = getitem
+
+        expected = hardware.InstanceInfo(state=constants.HYPERV_POWER_STATE[2],
+                                         max_mem_kb=mock.sentinel.FAKE_MEM_KB,
+                                         mem_kb=mock.sentinel.FAKE_MEM_KB,
+                                         num_cpu=mock.sentinel.FAKE_NUM_CPU,
+                                         cpu_time_ns=mock.sentinel.FAKE_CPU_NS)
+
+        self._vmops._vmutils.vm_exists.return_value = vm_exists
+        self._vmops._vmutils.get_vm_summary_info.return_value = mock_info
+
+        if not vm_exists:
+            self.assertRaises(exception.InstanceNotFound,
+                              self._vmops.get_info, mock_instance)
+        else:
+            response = self._vmops.get_info(mock_instance)
+            self._vmops._vmutils.vm_exists.assert_called_once_with(
+                mock_instance.name)
+            self._vmops._vmutils.get_vm_summary_info.assert_called_once_with(
+                mock_instance.name)
+            self.assertEqual(response, expected)
+
+    def test_get_info(self):
+        self._test_get_info(vm_exists=True)
+
+    def test_get_info_exception(self):
+        self._test_get_info(vm_exists=False)
 
     def _prepare_create_root_vhd_mocks(self, use_cow_images, vhd_format,
                                        vhd_size):
@@ -201,6 +262,7 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
     @mock.patch('nova.virt.hyperv.vmops.VMOps._create_config_drive')
     @mock.patch('nova.virt.configdrive.required_by')
     @mock.patch('nova.virt.hyperv.vmops.VMOps.create_instance')
+    @mock.patch('nova.virt.hyperv.vmops.VMOps.get_image_vm_generation')
     @mock.patch('nova.virt.hyperv.vmops.VMOps.create_ephemeral_vhd')
     @mock.patch('nova.virt.hyperv.vmops.VMOps._create_root_vhd')
     @mock.patch('nova.virt.hyperv.volumeops.VolumeOps.'
@@ -208,15 +270,18 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
     @mock.patch('nova.virt.hyperv.vmops.VMOps._delete_disk_files')
     def _test_spawn(self, mock_delete_disk_files,
                     mock_ebs_root_in_block_devices, mock_create_root_vhd,
-                    mock_create_ephemeral_vhd, mock_create_instance,
-                    mock_configdrive_required, mock_create_config_drive,
-                    mock_attach_config_drive, mock_power_on, mock_destroy,
-                    exists, boot_from_volume, configdrive_required, fail):
+                    mock_create_ephemeral_vhd, mock_get_image_vm_gen,
+                    mock_create_instance, mock_configdrive_required,
+                    mock_create_config_drive, mock_attach_config_drive,
+                    mock_power_on, mock_destroy, exists, boot_from_volume,
+                    configdrive_required, fail):
         mock_instance = fake_instance.fake_instance_obj(self.context)
+        mock_image_meta = mock.MagicMock()
 
         fake_root_path = mock_create_root_vhd.return_value
         fake_root_path = None if boot_from_volume else fake_root_path
         fake_ephemeral_path = mock_create_ephemeral_vhd.return_value
+        fake_vm_gen = mock_get_image_vm_gen.return_value
         fake_config_drive_path = mock_create_config_drive.return_value
 
         self._vmops._vmutils.vm_exists.return_value = exists
@@ -226,17 +291,17 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         mock_create_instance.side_effect = fail
         if exists:
             self.assertRaises(exception.InstanceExists, self._vmops.spawn,
-                              self.context, mock_instance, None,
+                              self.context, mock_instance, mock_image_meta,
                               [mock.sentinel.FILE], mock.sentinel.PASSWORD,
                               mock.sentinel.INFO, mock.sentinel.DEV_INFO)
         elif fail is vmutils.HyperVException:
             self.assertRaises(vmutils.HyperVException, self._vmops.spawn,
-                              self.context, mock_instance, None,
+                              self.context, mock_instance, mock_image_meta,
                               [mock.sentinel.FILE], mock.sentinel.PASSWORD,
                               mock.sentinel.INFO, mock.sentinel.DEV_INFO)
             mock_destroy.assert_called_once_with(mock_instance)
         else:
-            self._vmops.spawn(self.context, mock_instance, None,
+            self._vmops.spawn(self.context, mock_instance, mock_image_meta,
                               [mock.sentinel.FILE], mock.sentinel.PASSWORD,
                               mock.sentinel.INFO, mock.sentinel.DEV_INFO)
             self._vmops._vmutils.vm_exists.assert_called_once_with(
@@ -249,16 +314,19 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                 mock_create_root_vhd.assert_called_once_with(self.context,
                                                              mock_instance)
             mock_create_ephemeral_vhd.assert_called_once_with(mock_instance)
+            mock_get_image_vm_gen.assert_called_once_with(fake_root_path,
+                                                          mock_image_meta)
             mock_create_instance.assert_called_once_with(
                 mock_instance, mock.sentinel.INFO, mock.sentinel.DEV_INFO,
-                fake_root_path, fake_ephemeral_path)
+                fake_root_path, fake_ephemeral_path, fake_vm_gen)
             mock_configdrive_required.assert_called_once_with(mock_instance)
             if configdrive_required:
                 mock_create_config_drive.assert_called_once_with(
                     mock_instance, [mock.sentinel.FILE],
-                    mock.sentinel.PASSWORD)
+                    mock.sentinel.PASSWORD,
+                    mock.sentinel.INFO)
                 mock_attach_config_drive.assert_called_once_with(
-                    mock_instance, fake_config_drive_path)
+                    mock_instance, fake_config_drive_path, fake_vm_gen)
             mock_power_on.assert_called_once_with(mock_instance)
 
     def test_spawn(self):
@@ -282,10 +350,22 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         self._test_spawn(exists=False, boot_from_volume=True,
                          configdrive_required=False, fail=None)
 
+    def test_spawn_no_admin_permissions(self):
+        self._vmops._vmutils.check_admin_permissions.side_effect = (
+            vmutils.HyperVException)
+        self.assertRaises(vmutils.HyperVException,
+                          self._vmops.spawn,
+                          self.context, mock.DEFAULT, mock.DEFAULT,
+                          [mock.sentinel.FILE], mock.sentinel.PASSWORD,
+                          mock.sentinel.INFO, mock.sentinel.DEV_INFO)
+
     @mock.patch('nova.virt.hyperv.volumeops.VolumeOps'
                 '.attach_volumes')
-    def _test_create_instance(self, mock_attach_volumes, fake_root_path,
-                              fake_ephemeral_path, enable_instance_metrics):
+    @mock.patch.object(vmops.VMOps, '_attach_drive')
+    def _test_create_instance(self, mock_attach_drive, mock_attach_volumes,
+                              fake_root_path, fake_ephemeral_path,
+                              enable_instance_metrics,
+                              vm_gen=constants.VM_GEN_1):
         mock_vif_driver = mock.MagicMock()
         self._vmops._vif_driver = mock_vif_driver
         self.flags(enable_instance_metrics_collection=enable_instance_metrics,
@@ -293,31 +373,39 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         fake_network_info = {'id': mock.sentinel.ID,
                              'address': mock.sentinel.ADDRESS}
         mock_instance = fake_instance.fake_instance_obj(self.context)
+        instance_path = os.path.join(CONF.instances_path, mock_instance.name)
+
         self._vmops.create_instance(instance=mock_instance,
                                     network_info=[fake_network_info],
                                     block_device_info=mock.sentinel.DEV_INFO,
                                     root_vhd_path=fake_root_path,
-                                    eph_vhd_path=fake_ephemeral_path)
+                                    eph_vhd_path=fake_ephemeral_path,
+                                    vm_gen=vm_gen)
         self._vmops._vmutils.create_vm.assert_called_once_with(
             mock_instance.name, mock_instance.memory_mb,
             mock_instance.vcpus, CONF.hyperv.limit_cpu_features,
-            CONF.hyperv.dynamic_memory_ratio, [mock_instance.uuid])
+            CONF.hyperv.dynamic_memory_ratio, vm_gen, instance_path,
+            [mock_instance.uuid])
         expected = []
+        ctrl_type = vmops.VM_GENERATIONS_CONTROLLER_TYPES[vm_gen]
         ctrl_disk_addr = 0
         if fake_root_path:
             expected.append(mock.call(mock_instance.name, fake_root_path,
-                                      0, ctrl_disk_addr, constants.DISK))
+                                      0, ctrl_disk_addr, ctrl_type,
+                                      constants.DISK))
             ctrl_disk_addr += 1
         if fake_ephemeral_path:
             expected.append(mock.call(mock_instance.name,
                                       fake_ephemeral_path, 0, ctrl_disk_addr,
-                                      constants.DISK))
-        self._vmops._vmutils.attach_ide_drive.has_calls(expected)
+                                      ctrl_type, constants.DISK))
+        mock_attach_drive.has_calls(expected)
         self._vmops._vmutils.create_scsi_controller.assert_called_once_with(
             mock_instance.name)
+
+        ebs_root = vm_gen is not constants.VM_GEN_2 and fake_root_path is None
         mock_attach_volumes.assert_called_once_with(mock.sentinel.DEV_INFO,
                                                     mock_instance.name,
-                                                    fake_root_path is None)
+                                                    ebs_root)
         self._vmops._vmutils.create_nic.assert_called_once_with(
             mock_instance.name, mock.sentinel.ID, mock.sentinel.ADDRESS)
         mock_vif_driver.plug.assert_called_once_with(mock_instance,
@@ -354,6 +442,76 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                                    fake_ephemeral_path=fake_ephemeral_path,
                                    enable_instance_metrics=False)
 
+    def test_create_instance_gen2(self):
+        self._test_create_instance(fake_root_path=None,
+                                   fake_ephemeral_path=None,
+                                   enable_instance_metrics=False,
+                                   vm_gen=constants.VM_GEN_2)
+
+    def test_attach_drive_vm_to_scsi(self):
+        self._vmops._attach_drive(
+            mock.sentinel.FAKE_VM_NAME, mock.sentinel.FAKE_PATH,
+            mock.sentinel.FAKE_DRIVE_ADDR, mock.sentinel.FAKE_CTRL_DISK_ADDR,
+            constants.CTRL_TYPE_SCSI)
+
+        self._vmops._vmutils.attach_scsi_drive.assert_called_once_with(
+            mock.sentinel.FAKE_VM_NAME, mock.sentinel.FAKE_PATH,
+            constants.DISK)
+
+    def test_attach_drive_vm_to_ide(self):
+        self._vmops._attach_drive(
+            mock.sentinel.FAKE_VM_NAME, mock.sentinel.FAKE_PATH,
+            mock.sentinel.FAKE_DRIVE_ADDR, mock.sentinel.FAKE_CTRL_DISK_ADDR,
+            constants.CTRL_TYPE_IDE)
+
+        self._vmops._vmutils.attach_ide_drive.assert_called_once_with(
+            mock.sentinel.FAKE_VM_NAME, mock.sentinel.FAKE_PATH,
+            mock.sentinel.FAKE_DRIVE_ADDR, mock.sentinel.FAKE_CTRL_DISK_ADDR,
+            constants.DISK)
+
+    def _check_get_image_vm_gen_except(self, image_prop):
+        image_meta = {"properties": {constants.IMAGE_PROP_VM_GEN: image_prop}}
+        self._vmops._hostutils.get_supported_vm_types.return_value = [
+            constants.IMAGE_PROP_VM_GEN_1, constants.IMAGE_PROP_VM_GEN_2]
+
+        self.assertRaises(vmutils.HyperVException,
+                          self._vmops.get_image_vm_generation,
+                          mock.sentinel.FAKE_PATH,
+                          image_meta)
+
+    def test_get_image_vm_generation_default(self):
+        image_meta = {"properties": {}}
+        self._vmops._hostutils.get_default_vm_generation.return_value = (
+            constants.IMAGE_PROP_VM_GEN_1)
+        self._vmops._hostutils.get_supported_vm_types.return_value = [
+            constants.IMAGE_PROP_VM_GEN_1, constants.IMAGE_PROP_VM_GEN_2]
+
+        response = self._vmops.get_image_vm_generation(mock.sentinel.FAKE_PATH,
+                                                       image_meta)
+
+        self.assertEqual(constants.VM_GEN_1, response)
+
+    def test_get_image_vm_generation_gen2(self):
+        image_meta = {"properties": {
+            constants.IMAGE_PROP_VM_GEN: constants.IMAGE_PROP_VM_GEN_2}}
+        self._vmops._hostutils.get_supported_vm_types.return_value = [
+            constants.IMAGE_PROP_VM_GEN_1, constants.IMAGE_PROP_VM_GEN_2]
+        self._vmops._vhdutils.get_vhd_format.return_value = (
+            constants.DISK_FORMAT_VHDX)
+
+        response = self._vmops.get_image_vm_generation(mock.sentinel.FAKE_PATH,
+                                                       image_meta)
+
+        self.assertEqual(constants.VM_GEN_2, response)
+
+    def test_get_image_vm_generation_bad_prop(self):
+        self._check_get_image_vm_gen_except(mock.sentinel.FAKE_IMAGE_PROP)
+
+    def test_get_image_vm_generation_not_vhdx(self):
+        self._vmops._vhdutils.get_vhd_format.return_value = (
+            constants.DISK_FORMAT_VHD)
+        self._check_get_image_vm_gen_except(constants.IMAGE_PROP_VM_GEN_2)
+
     @mock.patch('nova.api.metadata.base.InstanceMetadata')
     @mock.patch('nova.virt.configdrive.ConfigDriveBuilder')
     @mock.patch('nova.utils.execute')
@@ -373,19 +531,23 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             self.assertRaises(vmutils.UnsupportedConfigDriveFormatException,
                               self._vmops._create_config_drive,
                               mock_instance, [mock.sentinel.FILE],
-                              mock.sentinel.PASSWORD)
+                              mock.sentinel.PASSWORD,
+                              mock.sentinel.NET_INFO)
         elif side_effect is processutils.ProcessExecutionError:
             self.assertRaises(processutils.ProcessExecutionError,
                               self._vmops._create_config_drive,
                               mock_instance, [mock.sentinel.FILE],
-                              mock.sentinel.PASSWORD)
+                              mock.sentinel.PASSWORD,
+                              mock.sentinel.NET_INFO)
         else:
             path = self._vmops._create_config_drive(mock_instance,
                                                     [mock.sentinel.FILE],
-                                                    mock.sentinel.PASSWORD)
+                                                    mock.sentinel.PASSWORD,
+                                                    mock.sentinel.NET_INFO)
             mock_InstanceMetadata.assert_called_once_with(
                 mock_instance, content=[mock.sentinel.FILE],
-                extra_md={'admin_pass': mock.sentinel.PASSWORD})
+                extra_md={'admin_pass': mock.sentinel.PASSWORD},
+                network_info=mock.sentinel.NET_INFO)
             self._vmops._pathutils.get_instance_dir.assert_called_once_with(
                 mock_instance.name)
             mock_ConfigDriveBuilder.assert_called_with(
@@ -428,17 +590,75 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             config_drive_cdrom=False,
             side_effect=processutils.ProcessExecutionError)
 
-    def test_attach_config_drive(self):
+    def test_attach_config_drive_exception(self):
         instance = fake_instance.fake_instance_obj(self.context)
         self.assertRaises(exception.InvalidDiskFormat,
                           self._vmops.attach_config_drive,
-                          instance, 'C:/fake_instance_dir/configdrive.xxx')
+                          instance, 'C:/fake_instance_dir/configdrive.xxx',
+                          constants.VM_GEN_1)
+
+    @mock.patch.object(vmops.VMOps, '_attach_drive')
+    def test_attach_config_drive(self, mock_attach_drive):
+        instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops.attach_config_drive(instance,
+                                        self._FAKE_CONFIGDRIVE_PATH,
+                                        constants.VM_GEN_1)
+        mock_attach_drive.assert_called_once_with(
+            instance.name, self._FAKE_CONFIGDRIVE_PATH,
+            1, 0, constants.CTRL_TYPE_IDE, constants.DISK)
+
+    @mock.patch.object(vmops.VMOps, '_attach_drive')
+    def test_attach_config_drive_gen2(self, mock_attach_drive):
+        instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops.attach_config_drive(instance,
+                                        self._FAKE_CONFIGDRIVE_PATH,
+                                        constants.VM_GEN_2)
+        mock_attach_drive.assert_called_once_with(
+            instance.name, self._FAKE_CONFIGDRIVE_PATH,
+            1, 0, constants.CTRL_TYPE_SCSI, constants.DISK)
 
     def test_delete_disk_files(self):
         mock_instance = fake_instance.fake_instance_obj(self.context)
         self._vmops._delete_disk_files(mock_instance.name)
         self._vmops._pathutils.get_instance_dir.assert_called_once_with(
             mock_instance.name, create_dir=False, remove_dir=True)
+
+    @mock.patch('nova.virt.hyperv.volumeops.VolumeOps.disconnect_volumes')
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._delete_disk_files')
+    @mock.patch('nova.virt.hyperv.vmops.VMOps.power_off')
+    def test_destroy(self, mock_power_off, mock_delete_disk_files,
+                     mock_disconnect_volumes):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops._vmutils.vm_exists.return_value = True
+
+        self._vmops.destroy(instance=mock_instance,
+                            block_device_info=mock.sentinel.FAKE_BD_INFO)
+
+        self._vmops._vmutils.vm_exists.assert_called_with(
+            mock_instance.name)
+        mock_power_off.assert_called_once_with(mock_instance)
+        self._vmops._vmutils.destroy_vm.assert_called_once_with(
+            mock_instance.name)
+        mock_disconnect_volumes.assert_called_once_with(
+            mock.sentinel.FAKE_BD_INFO)
+        mock_delete_disk_files.assert_called_once_with(
+            mock_instance.name)
+
+    def test_destroy_inexistent_instance(self):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops._vmutils.vm_exists.return_value = False
+
+        self._vmops.destroy(instance=mock_instance)
+        self.assertFalse(self._vmops._vmutils.destroy_vm.called)
+
+    @mock.patch('nova.virt.hyperv.vmops.VMOps.power_off')
+    def test_destroy_exception(self, mock_power_off):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops._vmutils.destroy_vm.side_effect = vmutils.HyperVException
+        self._vmops._vmutils.vm_exists.return_value = True
+
+        self.assertRaises(vmutils.HyperVException,
+                          self._vmops.destroy, mock_instance)
 
     def test_reboot_hard(self):
         self._test_reboot(vmops.REBOOT_TYPE_HARD,
@@ -532,6 +752,34 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
 
         self.assertFalse(result)
 
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._set_vm_state')
+    def test_pause(self, mock_set_vm_state):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops.pause(instance=mock_instance)
+        mock_set_vm_state.assert_called_once_with(
+            mock_instance, constants.HYPERV_VM_STATE_PAUSED)
+
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._set_vm_state')
+    def test_unpause(self, mock_set_vm_state):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops.unpause(instance=mock_instance)
+        mock_set_vm_state.assert_called_once_with(
+            mock_instance, constants.HYPERV_VM_STATE_ENABLED)
+
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._set_vm_state')
+    def test_suspend(self, mock_set_vm_state):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops.suspend(instance=mock_instance)
+        mock_set_vm_state.assert_called_once_with(
+            mock_instance, constants.HYPERV_VM_STATE_SUSPENDED)
+
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._set_vm_state')
+    def test_resume(self, mock_set_vm_state):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops.resume(instance=mock_instance)
+        mock_set_vm_state.assert_called_once_with(
+            mock_instance, constants.HYPERV_VM_STATE_ENABLED)
+
     def _test_power_off(self, timeout):
         instance = fake_instance.fake_instance_obj(self.context)
         with mock.patch.object(self._vmops, '_set_vm_state') as mock_set_state:
@@ -560,6 +808,61 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             instance, 1, vmops.SHUTDOWN_TIME_INCREMENT)
         self.assertFalse(mock_set_state.called)
 
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._set_vm_state')
+    def test_power_on(self, mock_set_vm_state):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+
+        self._vmops.power_on(mock_instance)
+
+        mock_set_vm_state.assert_called_once_with(
+            mock_instance, constants.HYPERV_VM_STATE_ENABLED)
+
+    @mock.patch('nova.virt.hyperv.volumeops.VolumeOps'
+                '.fix_instance_volume_disk_paths')
+    @mock.patch('nova.virt.hyperv.vmops.VMOps._set_vm_state')
+    def test_power_on_having_block_devices(self, mock_set_vm_state,
+                                           mock_fix_instance_vol_paths):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+
+        self._vmops.power_on(mock_instance, mock.sentinel.block_device_info)
+
+        mock_fix_instance_vol_paths.assert_called_once_with(
+            mock_instance.name, mock.sentinel.block_device_info)
+        mock_set_vm_state.assert_called_once_with(
+            mock_instance, constants.HYPERV_VM_STATE_ENABLED)
+
+    @mock.patch.object(vmops.VMOps, 'log_vm_serial_output')
+    @mock.patch.object(vmops.VMOps, '_delete_vm_console_log')
+    def _test_set_vm_state(self, mock_delete_vm_console_log,
+                           mock_log_vm_output, state):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+
+        self._vmops._set_vm_state(mock_instance, state)
+        self._vmops._vmutils.set_vm_state.assert_called_once_with(
+            mock_instance.name, state)
+        if state in (constants.HYPERV_VM_STATE_DISABLED,
+                     constants.HYPERV_VM_STATE_REBOOT):
+            mock_delete_vm_console_log.assert_called_once_with(mock_instance)
+        if state in (constants.HYPERV_VM_STATE_ENABLED,
+                     constants.HYPERV_VM_STATE_REBOOT):
+            mock_log_vm_output.assert_called_once_with(mock_instance.name,
+                                                       mock_instance.uuid)
+
+    def test_set_vm_state_disabled(self):
+        self._test_set_vm_state(state=constants.HYPERV_VM_STATE_DISABLED)
+
+    def test_set_vm_state_enabled(self):
+        self._test_set_vm_state(state=constants.HYPERV_VM_STATE_ENABLED)
+
+    def test_set_vm_state_reboot(self):
+        self._test_set_vm_state(state=constants.HYPERV_VM_STATE_REBOOT)
+
+    def test_set_vm_state_exception(self):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops._vmutils.set_vm_state.side_effect = vmutils.HyperVException
+        self.assertRaises(vmutils.HyperVException, self._vmops._set_vm_state,
+                          mock_instance, mock.sentinel.STATE)
+
     def test_get_vm_state(self):
         summary_info = {'EnabledState': constants.HYPERV_VM_STATE_DISABLED}
 
@@ -585,6 +888,101 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             mock.sentinel.FAKE_VM_NAME, vmops.SHUTDOWN_TIME_INCREMENT)
         self.assertFalse(result)
 
+    @mock.patch.object(ioutils, 'IOThread')
+    def _test_log_vm_serial_output(self, mock_io_thread,
+                                   worker_running=False,
+                                   worker_exists=False):
+        self._vmops._pathutils.get_vm_console_log_paths.return_value = (
+            mock.sentinel.log_path, )
+        fake_instance_uuid = 'fake-uuid'
+        fake_existing_worker = mock.Mock()
+        fake_existing_worker.is_active.return_value = worker_running
+        fake_log_writers = {fake_instance_uuid: fake_existing_worker}
+        self._vmops._vm_log_writers = (
+            fake_log_writers if worker_exists else {})
+
+        self._vmops.log_vm_serial_output(mock.sentinel.instance_name,
+                                         fake_instance_uuid)
+
+        if not (worker_exists and worker_running):
+            expected_pipe_path = r'\\.\pipe\%s' % fake_instance_uuid
+            expected_current_worker = mock_io_thread.return_value
+            expected_current_worker.start.assert_called_once_with()
+            mock_io_thread.assert_called_once_with(
+                expected_pipe_path, mock.sentinel.log_path,
+                self._vmops._MAX_CONSOLE_LOG_FILE_SIZE)
+        else:
+            expected_current_worker = fake_existing_worker
+        self.assertEqual(expected_current_worker,
+                        self._vmops._vm_log_writers[fake_instance_uuid])
+
+    def test_log_vm_serial_output_unexisting_worker(self):
+        self._test_log_vm_serial_output()
+
+    def test_log_vm_serial_output_worker_stopped(self):
+        self._test_log_vm_serial_output(worker_exists=True)
+
+    def test_log_vm_serial_output_worker_running(self):
+        self._test_log_vm_serial_output(worker_exists=True,
+                                        worker_running=True)
+
+    def test_copy_vm_console_logs(self):
+        fake_local_paths = (mock.sentinel.FAKE_PATH,
+                            mock.sentinel.FAKE_PATH_ARCHIVED)
+        fake_remote_paths = (mock.sentinel.FAKE_REMOTE_PATH,
+                             mock.sentinel.FAKE_REMOTE_PATH_ARCHIVED)
+
+        self._vmops._pathutils.get_vm_console_log_paths.side_effect = [
+            fake_local_paths, fake_remote_paths]
+        self._vmops._pathutils.exists.side_effect = [True, False]
+
+        self._vmops.copy_vm_console_logs(mock.sentinel.FAKE_VM_NAME,
+                                         mock.sentinel.FAKE_DEST)
+
+        calls = [mock.call(mock.sentinel.FAKE_VM_NAME),
+                 mock.call(mock.sentinel.FAKE_VM_NAME,
+                           remote_server=mock.sentinel.FAKE_DEST)]
+        self._vmops._pathutils.get_vm_console_log_paths.assert_has_calls(calls)
+
+        calls = [mock.call(mock.sentinel.FAKE_PATH),
+                 mock.call(mock.sentinel.FAKE_PATH_ARCHIVED)]
+        self._vmops._pathutils.exists.assert_has_calls(calls)
+
+        self._vmops._pathutils.copy.assert_called_once_with(
+            mock.sentinel.FAKE_PATH, mock.sentinel.FAKE_REMOTE_PATH)
+
+    @mock.patch.object(vmops.ioutils, 'IOThread')
+    def test_log_vm_serial_output(self, fake_iothread):
+        self._vmops._pathutils.get_vm_console_log_paths.return_value = [
+            mock.sentinel.FAKE_PATH]
+
+        self._vmops.log_vm_serial_output(mock.sentinel.FAKE_VM_NAME,
+                                         self.FAKE_UUID)
+
+        pipe_path = r'\\.\pipe\%s' % self.FAKE_UUID
+        fake_iothread.assert_called_once_with(
+            pipe_path, mock.sentinel.FAKE_PATH,
+            self._vmops._MAX_CONSOLE_LOG_FILE_SIZE)
+        fake_iothread.return_value.start.assert_called_once_with()
+
+    @mock.patch("os.path.exists")
+    def test_get_console_output(self, fake_path_exists):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+
+        fake_path_exists.return_value = True
+        self._vmops._pathutils.get_vm_console_log_paths.return_value = (
+            mock.sentinel.FAKE_PATH, mock.sentinel.FAKE_PATH_ARCHIVED)
+
+        with mock.patch('nova.virt.hyperv.vmops.open',
+                        mock.mock_open(read_data=self.FAKE_LOG), create=True):
+            instance_log = self._vmops.get_console_output(mock_instance)
+            # get_vm_console_log_paths returns 2 paths.
+            self.assertEqual(self.FAKE_LOG * 2, instance_log)
+
+            expected_calls = [mock.call(mock.sentinel.FAKE_PATH_ARCHIVED),
+                              mock.call(mock.sentinel.FAKE_PATH)]
+            fake_path_exists.assert_has_calls(expected_calls, any_order=False)
+
     @mock.patch("__builtin__.open")
     @mock.patch("os.path.exists")
     def test_get_console_output_exception(self, fake_path_exists, fake_open):
@@ -601,6 +999,48 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                               self._vmops.get_console_output,
                               fake_vm)
 
+    @mock.patch.object(vmops.fileutils, 'delete_if_exists')
+    def test_delete_vm_console_log(self, mock_delete_if_exists):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        self._vmops._pathutils.get_vm_console_log_paths.return_value = (
+            mock.sentinel.FAKE_PATH, )
+        mock_log_writer = mock.MagicMock()
+        self._vmops._vm_log_writers[mock_instance['uuid']] = mock_log_writer
+
+        self._vmops._delete_vm_console_log(mock_instance)
+
+        mock_log_writer.join.assert_called_once_with()
+        mock_delete_if_exists.assert_called_once_with(mock.sentinel.FAKE_PATH)
+
+    def test_create_vm_com_port_pipe(self):
+        mock_instance = fake_instance.fake_instance_obj(self.context)
+        pipe_path = r'\\.\pipe\%s' % mock_instance['uuid']
+
+        self._vmops._create_vm_com_port_pipe(mock_instance)
+
+        get_vm_serial_port = self._vmops._vmutils.get_vm_serial_port_connection
+        get_vm_serial_port.assert_called_once_with(mock_instance['name'],
+                                                   update_connection=pipe_path)
+
+    @mock.patch.object(vmops.VMOps, "log_vm_serial_output")
+    @mock.patch("os.path.basename")
+    @mock.patch("os.path.exists")
+    def test_restart_vm_log_writers(self, mock_exists, mock_basename,
+                                    mock_log_vm_output):
+        self._vmops._vmutils.get_active_instances.return_value = [
+            mock.sentinel.FAKE_VM_NAME, mock.sentinel.FAKE_VM_NAME_OTHER]
+        mock_exists.side_effect = [True, False]
+
+        self._vmops.restart_vm_log_writers()
+
+        calls = [mock.call(mock.sentinel.FAKE_VM_NAME),
+                 mock.call(mock.sentinel.FAKE_VM_NAME_OTHER)]
+        self._vmops._pathutils.get_instance_dir.assert_has_calls(calls)
+        get_vm_serial_port = self._vmops._vmutils.get_vm_serial_port_connection
+        get_vm_serial_port.assert_called_once_with(mock.sentinel.FAKE_VM_NAME)
+        mock_log_vm_output.assert_called_once_with(mock.sentinel.FAKE_VM_NAME,
+                                                   mock_basename.return_value)
+
     def test_list_instance_uuids(self):
         fake_uuid = '4f54fb69-d3a2-45b7-bb9b-b6e6b3d893b3'
         with mock.patch.object(self._vmops._vmutils,
@@ -611,3 +1051,19 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             mock_list_notes.assert_called_once_with()
 
         self.assertEqual(response, [fake_uuid])
+
+    def test_copy_vm_dvd_disks(self):
+        fake_paths = [mock.sentinel.FAKE_DVD_PATH1,
+                      mock.sentinel.FAKE_DVD_PATH2]
+        mock_copy = self._vmops._pathutils.copyfile
+        mock_get_dvd_disk_paths = self._vmops._vmutils.get_vm_dvd_disk_paths
+        mock_get_dvd_disk_paths.return_value = fake_paths
+
+        self._vmops.copy_vm_dvd_disks(mock.sentinel.FAKE_VM_NAME,
+                                      mock.sentinel.FAKE_DEST)
+
+        mock_get_dvd_disk_paths.assert_called_with(mock.sentinel.FAKE_VM_NAME)
+        mock_copy.has_calls(mock.call(mock.sentinel.FAKE_DVD_PATH1,
+                                      mock.sentinel.FAKE_DEST),
+                            mock.call(mock.sentinel.FAKE_DVD_PATH2,
+                                      mock.sentinel.FAKE_DEST))

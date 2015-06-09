@@ -19,10 +19,13 @@ Cells Service Manager
 import datetime
 import time
 
-from oslo.config import cfg
-from oslo import messaging as oslo_messaging
-from oslo.utils import importutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_utils import importutils
+from oslo_utils import timeutils
+import six
+from six.moves import range
 
 from nova.cells import messaging
 from nova.cells import state as cells_state
@@ -33,7 +36,7 @@ from nova.i18n import _LW
 from nova import manager
 from nova import objects
 from nova.objects import base as base_obj
-from nova.openstack.common import log as logging
+from nova.objects import instance as instance_obj
 from nova.openstack.common import periodic_task
 
 cell_manager_opts = [
@@ -73,7 +76,7 @@ class CellsManager(manager.Manager):
     Scheduling requests get passed to the scheduler class.
     """
 
-    target = oslo_messaging.Target(version='1.31')
+    target = oslo_messaging.Target(version='1.34')
 
     def __init__(self, *args, **kwargs):
         LOG.warning(_LW('The cells feature of Nova is considered experimental '
@@ -147,7 +150,7 @@ class CellsManager(manager.Manager):
 
         def _next_instance():
             try:
-                instance = self.instances_to_heal.next()
+                instance = next(self.instances_to_heal)
             except StopIteration:
                 if info['updated_list']:
                     return
@@ -161,14 +164,14 @@ class CellsManager(manager.Manager):
                         uuids_only=True)
                 info['updated_list'] = True
                 try:
-                    instance = self.instances_to_heal.next()
+                    instance = next(self.instances_to_heal)
                 except StopIteration:
                     return
             return instance
 
         rd_context = ctxt.elevated(read_deleted='yes')
 
-        for i in xrange(CONF.cells.instance_update_num_instances):
+        for i in range(CONF.cells.instance_update_num_instances):
             while True:
                 # Yield to other greenthreads
                 time.sleep(0)
@@ -206,6 +209,13 @@ class CellsManager(manager.Manager):
             flavor = objects.Flavor(**filter_properties['instance_type'])
             build_inst_kwargs['filter_properties'] = dict(
                 filter_properties, instance_type=flavor)
+        instances = build_inst_kwargs['instances']
+        if not isinstance(instances[0], objects.Instance):
+            # NOTE(danms): Handle pre-1.32 build_instances() call. Remove me
+            # when we bump the RPC API version to 2.0
+            build_inst_kwargs['instances'] = instance_obj._make_instance_list(
+                ctxt, objects.InstanceList(), instances, ['system_metadata',
+                                                          'metadata'])
         our_cell = self.state_manager.get_my_state()
         self.msg_runner.build_instances(ctxt, our_cell, build_inst_kwargs)
 
@@ -264,10 +274,12 @@ class CellsManager(manager.Manager):
         for response in responses:
             services = response.value_or_raise()
             for service in services:
-                cells_utils.add_cell_to_service(service, response.cell_name)
+                service = cells_utils.add_cell_to_service(
+                    service, response.cell_name)
                 ret_services.append(service)
         return ret_services
 
+    @oslo_messaging.expected_exceptions(exception.CellRoutingInconsistency)
     def service_get_by_compute_host(self, ctxt, host_name):
         """Return a service entry for a compute host in a certain cell."""
         cell_name, host_name = cells_utils.split_cell_and_item(host_name)
@@ -275,7 +287,7 @@ class CellsManager(manager.Manager):
                                                                cell_name,
                                                                host_name)
         service = response.value_or_raise()
-        cells_utils.add_cell_to_service(service, response.cell_name)
+        service = cells_utils.add_cell_to_service(service, response.cell_name)
         return service
 
     def get_host_uptime(self, ctxt, host_name):
@@ -303,7 +315,7 @@ class CellsManager(manager.Manager):
         response = self.msg_runner.service_update(
             ctxt, cell_name, host_name, binary, params_to_update)
         service = response.value_or_raise()
-        cells_utils.add_cell_to_service(service, response.cell_name)
+        service = cells_utils.add_cell_to_service(service, response.cell_name)
         return service
 
     def service_delete(self, ctxt, cell_service_id):
@@ -312,6 +324,7 @@ class CellsManager(manager.Manager):
             cell_service_id)
         self.msg_runner.service_delete(ctxt, cell_name, service_id)
 
+    @oslo_messaging.expected_exceptions(exception.CellRoutingInconsistency)
     def proxy_rpc_to_manager(self, ctxt, topic, rpc_message, call, timeout):
         """Proxy an RPC message as-is to a manager."""
         compute_topic = CONF.compute_topic
@@ -355,6 +368,7 @@ class CellsManager(manager.Manager):
                 ret_task_logs.append(task_log)
         return ret_task_logs
 
+    @oslo_messaging.expected_exceptions(exception.CellRoutingInconsistency)
     def compute_node_get(self, ctxt, compute_id):
         """Get a compute node by ID in a specific cell."""
         cell_name, compute_id = cells_utils.split_cell_and_item(
@@ -362,7 +376,7 @@ class CellsManager(manager.Manager):
         response = self.msg_runner.compute_node_get(ctxt, cell_name,
                                                     compute_id)
         node = response.value_or_raise()
-        cells_utils.add_cell_to_compute_node(node, cell_name)
+        node = cells_utils.add_cell_to_compute_node(node, cell_name)
         return node
 
     def compute_node_get_all(self, ctxt, hypervisor_match=None):
@@ -375,8 +389,8 @@ class CellsManager(manager.Manager):
         for response in responses:
             nodes = response.value_or_raise()
             for node in nodes:
-                cells_utils.add_cell_to_compute_node(node,
-                                                     response.cell_name)
+                node = cells_utils.add_cell_to_compute_node(node,
+                                                            response.cell_name)
                 ret_nodes.append(node)
         return ret_nodes
 
@@ -386,7 +400,7 @@ class CellsManager(manager.Manager):
         totals = {}
         for response in responses:
             data = response.value_or_raise()
-            for key, val in data.iteritems():
+            for key, val in six.iteritems(data):
                 totals.setdefault(key, 0)
                 totals[key] += val
         return totals
@@ -515,10 +529,12 @@ class CellsManager(manager.Manager):
         self.msg_runner.soft_delete_instance(ctxt, instance)
 
     def resize_instance(self, ctxt, instance, flavor,
-                        extra_instance_updates):
+                        extra_instance_updates,
+                        clean_shutdown=True):
         """Resize an instance in its cell."""
         self.msg_runner.resize_instance(ctxt, instance,
-                                        flavor, extra_instance_updates)
+                                        flavor, extra_instance_updates,
+                                        clean_shutdown=clean_shutdown)
 
     def live_migrate_instance(self, ctxt, instance, block_migration,
                               disk_over_commit, host_name):

@@ -15,16 +15,15 @@
 
 import uuid as uuid_lib
 
-from lxml import etree
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_utils import timeutils
 from webob import exc
 
 from nova.api.openstack.compute.contrib import cloudpipe as cloudpipe_v2
 from nova.api.openstack.compute.plugins.v3 import cloudpipe as cloudpipe_v21
-from nova.api.openstack import wsgi
 from nova.compute import utils as compute_utils
 from nova import exception
+from nova import objects
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_network
@@ -40,18 +39,17 @@ uuid = str(uuid_lib.uuid4())
 
 
 def fake_vpn_instance():
-    return {
-        'id': 7, 'image_ref': CONF.vpn_image_id, 'vm_state': 'active',
-        'created_at': timeutils.parse_strtime('1981-10-20T00:00:00.000000'),
-        'uuid': uuid, 'project_id': project_id,
-    }
+    return objects.Instance(
+        id=7, image_ref=CONF.vpn_image_id, vm_state='active',
+        created_at=timeutils.parse_strtime('1981-10-20T00:00:00.000000'),
+        uuid=uuid, project_id=project_id)
 
 
-def compute_api_get_all_empty(context, search_opts=None):
+def compute_api_get_all_empty(context, search_opts=None, want_objects=True):
     return []
 
 
-def compute_api_get_all(context, search_opts=None):
+def compute_api_get_all(context, search_opts=None, want_objects=True):
         return [fake_vpn_instance()]
 
 
@@ -69,6 +67,7 @@ class CloudpipeTestV21(test.NoDBTestCase):
         self.stubs.Set(self.controller.compute_api, "get_all",
                        compute_api_get_all_empty)
         self.stubs.Set(utils, 'vpn_ping', utils_vpn_ping)
+        self.req = fakes.HTTPRequest.blank('')
 
     def test_cloudpipe_list_no_network(self):
 
@@ -79,8 +78,7 @@ class CloudpipeTestV21(test.NoDBTestCase):
                        fake_get_nw_info_for_instance)
         self.stubs.Set(self.controller.compute_api, "get_all",
                        compute_api_get_all)
-        req = fakes.HTTPRequest.blank(self.url)
-        res_dict = self.controller.index(req)
+        res_dict = self.controller.index(self.req)
         response = {'cloudpipes': [{'project_id': project_id,
                                     'instance_id': uuid,
                                     'created_at': '1981-10-20T00:00:00Z'}]}
@@ -102,8 +100,7 @@ class CloudpipeTestV21(test.NoDBTestCase):
                        network_api_get)
         self.stubs.Set(self.controller.compute_api, "get_all",
                        compute_api_get_all)
-        req = fakes.HTTPRequest.blank(self.url)
-        res_dict = self.controller.index(req)
+        res_dict = self.controller.index(self.req)
         response = {'cloudpipes': [{'project_id': project_id,
                                     'internal_ip': '192.168.1.100',
                                     'public_ip': '127.0.0.1',
@@ -120,8 +117,7 @@ class CloudpipeTestV21(test.NoDBTestCase):
         self.stubs.Set(self.controller.cloudpipe, 'launch_vpn_instance',
                        launch_vpn_instance)
         body = {'cloudpipe': {'project_id': project_id}}
-        req = fakes.HTTPRequest.blank(self.url)
-        res_dict = self.controller.create(req, body=body)
+        res_dict = self.controller.create(self.req, body=body)
 
         response = {'instance_id': uuid}
         self.assertEqual(res_dict, response)
@@ -165,46 +161,32 @@ class CloudpipeTestV2(CloudpipeTestV21):
         pass
 
 
-class CloudpipesXMLSerializerTestV2(test.NoDBTestCase):
-    def test_default_serializer(self):
-        serializer = cloudpipe_v2.CloudpipeTemplate()
-        exemplar = dict(cloudpipe=dict(instance_id='1234-1234-1234-1234'))
-        text = serializer.serialize(exemplar)
-        tree = etree.fromstring(text)
-        self.assertEqual('cloudpipe', tree.tag)
-        for child in tree:
-            self.assertIn(child.tag, exemplar['cloudpipe'])
-            self.assertEqual(child.text, exemplar['cloudpipe'][child.tag])
+class CloudpipePolicyEnforcementV21(test.NoDBTestCase):
 
-    def test_index_serializer(self):
-        serializer = cloudpipe_v2.CloudpipesTemplate()
-        exemplar = dict(cloudpipes=[
-                dict(
-                        project_id='1234',
-                        public_ip='1.2.3.4',
-                        public_port='321',
-                        instance_id='1234-1234-1234-1234',
-                        created_at=timeutils.isotime(),
-                        state='running'),
-                dict(
-                        project_id='4321',
-                        public_ip='4.3.2.1',
-                        public_port='123',
-                        state='pending')])
-        text = serializer.serialize(exemplar)
-        tree = etree.fromstring(text)
-        self.assertEqual('cloudpipes', tree.tag)
-        self.assertEqual(len(exemplar['cloudpipes']), len(tree))
-        for idx, cl_pipe in enumerate(tree):
-            kp_data = exemplar['cloudpipes'][idx]
-            for child in cl_pipe:
-                self.assertIn(child.tag, kp_data)
-                self.assertEqual(child.text, kp_data[child.tag])
+    def setUp(self):
+        super(CloudpipePolicyEnforcementV21, self).setUp()
+        self.controller = cloudpipe_v21.CloudpipeController()
+        self.req = fakes.HTTPRequest.blank('')
 
-    def test_deserializer(self):
-        deserializer = wsgi.XMLDeserializer()
-        exemplar = dict(cloudpipe=dict(project_id='4321'))
-        intext = ("<?xml version='1.0' encoding='UTF-8'?>\n"
-                  '<cloudpipe><project_id>4321</project_id></cloudpipe>')
-        result = deserializer.deserialize(intext)['body']
-        self.assertEqual(result, exemplar)
+    def _common_policy_check(self, func, *arg, **kwarg):
+        rule_name = "os_compute_api:os-cloudpipe"
+        rule = {rule_name: "project:non_fake"}
+        self.policy.set_rules(rule)
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized, func, *arg, **kwarg)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+    def test_list_policy_failed(self):
+        self._common_policy_check(self.controller.index, self.req)
+
+    def test_create_policy_failed(self):
+        body = {'cloudpipe': {'project_id': uuid}}
+        self._common_policy_check(self.controller.create, self.req, body=body)
+
+    def test_update_policy_failed(self):
+        body = {"configure_project": {'vpn_ip': '192.168.1.1',
+                                      'vpn_port': 2000}}
+        self._common_policy_check(
+            self.controller.update, self.req, uuid, body=body)

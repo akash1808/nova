@@ -23,8 +23,10 @@ datastore.
 import base64
 import time
 
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
+import six
 
 from nova.api.ec2 import ec2utils
 from nova.api.ec2 import inst_state
@@ -39,14 +41,14 @@ from nova.compute import api as compute_api
 from nova.compute import vm_states
 from nova import exception
 from nova.i18n import _
+from nova.i18n import _LI
 from nova.i18n import _LW
 from nova.image import s3
 from nova import network
 from nova.network.security_group import neutron_driver
 from nova.network.security_group import openstack_driver
 from nova import objects
-from nova.objects import base as obj_base
-from nova.openstack.common import log as logging
+from nova.openstack.common import versionutils
 from nova import quota
 from nova import servicegroup
 from nova import utils
@@ -64,10 +66,11 @@ ec2_opts = [
                help='The port of the EC2 API server'),
     cfg.StrOpt('ec2_scheme',
                default='http',
+               choices=('http', 'https'),
                help='The protocol to use when connecting to the EC2 API '
-                    'server (http, https)'),
+                    'server'),
     cfg.StrOpt('ec2_path',
-               default='/services/Cloud',
+               default='/',
                help='The path prefix used to call the ec2 API server'),
     cfg.ListOpt('region_list',
                 default=[],
@@ -229,6 +232,13 @@ class CloudController(object):
  sent to the other nodes.
 """
     def __init__(self):
+        versionutils.report_deprecated_feature(
+            LOG,
+            _LW('The in tree EC2 API is deprecated as of Kilo release and may '
+                'be removed in a future release. The stackforge ec2-api '
+                'project http://git.openstack.org/cgit/stackforge/ec2-api/ '
+                'is the target replacement for this functionality.')
+        )
         self.image_service = s3.S3ImageService()
         self.network_api = network.API()
         self.volume_api = volume.API()
@@ -404,7 +414,7 @@ class CloudController(object):
 
     def create_snapshot(self, context, volume_id, **kwargs):
         validate_volume_id(volume_id)
-        LOG.audit(_("Create snapshot of volume %s"), volume_id,
+        LOG.info(_LI("Create snapshot of volume %s"), volume_id,
                   context=context)
         volume_id = ec2utils.ec2_vol_id_to_uuid(volume_id)
         args = (context, volume_id, kwargs.get('name'),
@@ -447,7 +457,7 @@ class CloudController(object):
         return {'keySet': result}
 
     def create_key_pair(self, context, key_name, **kwargs):
-        LOG.audit(_("Create key pair %s"), key_name, context=context)
+        LOG.info(_LI("Create key pair %s"), key_name, context=context)
 
         keypair, private_key = self.keypair_api.create_key_pair(
             context, context.user_id, key_name)
@@ -459,7 +469,7 @@ class CloudController(object):
 
     def import_key_pair(self, context, key_name, public_key_material,
                         **kwargs):
-        LOG.audit(_("Import key %s"), key_name, context=context)
+        LOG.info(_LI("Import key %s"), key_name, context=context)
 
         public_key = base64.b64decode(public_key_material)
 
@@ -472,7 +482,7 @@ class CloudController(object):
                 'keyFingerprint': keypair['fingerprint']}
 
     def delete_key_pair(self, context, key_name, **kwargs):
-        LOG.audit(_("Delete key pair %s"), key_name, context=context)
+        LOG.info(_LI("Delete key pair %s"), key_name, context=context)
         try:
             self.keypair_api.delete_key_pair(context, context.user_id,
                                              key_name)
@@ -566,7 +576,7 @@ class CloudController(object):
     def _cidr_args_split(self, kwargs):
         cidr_args_split = []
         cidrs = kwargs['ip_ranges']
-        for key, cidr in cidrs.iteritems():
+        for key, cidr in six.iteritems(cidrs):
             mykwargs = kwargs.copy()
             del mykwargs['ip_ranges']
             mykwargs['cidr_ip'] = cidr['cidr_ip']
@@ -576,7 +586,7 @@ class CloudController(object):
     def _groups_args_split(self, kwargs):
         groups_args_split = []
         groups = kwargs['groups']
-        for key, group in groups.iteritems():
+        for key, group in six.iteritems(groups):
             mykwargs = kwargs.copy()
             del mykwargs['groups']
             if 'group_name' in group:
@@ -718,7 +728,7 @@ class CloudController(object):
         return source_project_id
 
     def create_security_group(self, context, group_name, group_description):
-        if isinstance(group_name, unicode):
+        if isinstance(group_name, six.text_type):
             group_name = utils.utf8(group_name)
         if CONF.ec2_strict_validation:
             # EC2 specification gives constraints for name and description:
@@ -775,7 +785,7 @@ class CloudController(object):
                 "passwordData": output}
 
     def get_console_output(self, context, instance_id, **kwargs):
-        LOG.audit(_("Get console output for instance %s"), instance_id,
+        LOG.info(_LI("Get console output for instance %s"), instance_id,
                   context=context)
         # instance_id may be passed in as a list of instances
         if isinstance(instance_id, list):
@@ -826,12 +836,13 @@ class CloudController(object):
         v['size'] = volume['size']
         v['availabilityZone'] = volume['availability_zone']
         v['createTime'] = volume['created_at']
-        if volume['attach_status'] == 'attached':
-            v['attachmentSet'] = [{'attachTime': volume['attach_time'],
+        if v['status'] == 'in-use':
+            v['attachmentSet'] = [{'attachTime': volume.get('attach_time'),
                                    'deleteOnTermination': False,
                                    'device': volume['mountpoint'],
                                    'instanceId': instance_ec2_id,
-                                   'status': 'attached',
+                                   'status': self._get_volume_attach_status(
+                                                                    volume),
                                    'volumeId': v['volumeId']}]
         else:
             v['attachmentSet'] = [{}]
@@ -847,11 +858,11 @@ class CloudController(object):
         if snapshot_ec2id is not None:
             snapshot_id = ec2utils.ec2_snap_id_to_uuid(kwargs['snapshot_id'])
             snapshot = self.volume_api.get_snapshot(context, snapshot_id)
-            LOG.audit(_("Create volume from snapshot %s"), snapshot_ec2id,
+            LOG.info(_LI("Create volume from snapshot %s"), snapshot_ec2id,
                       context=context)
         else:
             snapshot = None
-            LOG.audit(_("Create volume of %s GB"),
+            LOG.info(_LI("Create volume of %s GB"),
                         kwargs.get('size'),
                         context=context)
 
@@ -891,7 +902,7 @@ class CloudController(object):
         instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, instance_id)
         instance = self.compute_api.get(context, instance_uuid,
                                         want_objects=True)
-        LOG.audit(_('Attach volume %(volume_id)s to instance %(instance_id)s '
+        LOG.info(_LI('Attach volume %(volume_id)s to instance %(instance_id)s '
                     'at %(device)s'),
                   {'volume_id': volume_id,
                    'instance_id': instance_id,
@@ -921,7 +932,7 @@ class CloudController(object):
     def detach_volume(self, context, volume_id, **kwargs):
         validate_volume_id(volume_id)
         volume_id = ec2utils.ec2_vol_id_to_uuid(volume_id)
-        LOG.audit(_("Detach volume %s"), volume_id, context=context)
+        LOG.info(_LI("Detach volume %s"), volume_id, context=context)
         volume = self.volume_api.get(context, volume_id)
         instance = self._get_instance_from_volume(context, volume)
 
@@ -958,18 +969,18 @@ class CloudController(object):
         def _format_attr_block_device_mapping(instance, result):
             tmp = {}
             self._format_instance_root_device_name(instance, tmp)
-            self._format_instance_bdm(context, instance['uuid'],
+            self._format_instance_bdm(context, instance.uuid,
                                       tmp['rootDeviceName'], result)
 
         def _format_attr_disable_api_termination(instance, result):
-            result['disableApiTermination'] = instance['disable_terminate']
+            result['disableApiTermination'] = instance.disable_terminate
 
         def _format_attr_group_set(instance, result):
             CloudController._format_group_set(instance, result)
 
         def _format_attr_instance_initiated_shutdown_behavior(instance,
                                                                result):
-            if instance['shutdown_terminate']:
+            if instance.shutdown_terminate:
                 result['instanceInitiatedShutdownBehavior'] = 'terminate'
             else:
                 result['instanceInitiatedShutdownBehavior'] = 'stop'
@@ -990,7 +1001,7 @@ class CloudController(object):
             _unsupported_attribute(instance, result)
 
         def _format_attr_user_data(instance, result):
-            result['userData'] = base64.b64decode(instance['user_data'])
+            result['userData'] = base64.b64decode(instance.user_data)
 
         attribute_formatter = {
             'blockDeviceMapping': _format_attr_block_device_mapping,
@@ -1057,9 +1068,10 @@ class CloudController(object):
                                         previous_state['shutdown_terminate'])
             try:
                 instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
-                instance = self.compute_api.get(context, instance_uuid)
-                i['currentState'] = _state_description(instance['vm_state'],
-                                            instance['shutdown_terminate'])
+                instance = self.compute_api.get(context, instance_uuid,
+                                                want_objects=True)
+                i['currentState'] = _state_description(instance.vm_state,
+                                            instance.shutdown_terminate)
             except exception.NotFound:
                 i['currentState'] = _state_description(
                                             inst_state.SHUTTING_DOWN, True)
@@ -1114,7 +1126,7 @@ class CloudController(object):
             ebs = {'volumeId': ec2utils.id_to_ec2_vol_id(volume_id),
                    'deleteOnTermination': bdm.delete_on_termination,
                    'attachTime': vol['attach_time'] or '',
-                   'status': vol['attach_status'], }
+                   'status': self._get_volume_attach_status(vol), }
             res = {'deviceName': bdm.device_name,
                    'ebs': ebs, }
             mapping.append(res)
@@ -1122,6 +1134,12 @@ class CloudController(object):
         if mapping:
             result['blockDeviceMapping'] = mapping
         result['rootDeviceType'] = root_device_type
+
+    @staticmethod
+    def _get_volume_attach_status(volume):
+        return (volume['status']
+                if volume['status'] in ('attaching', 'detaching') else
+                volume['attach_status'])
 
     @staticmethod
     def _format_instance_root_device_name(instance, result):
@@ -1137,7 +1155,7 @@ class CloudController(object):
     def _format_group_set(instance, result):
         security_group_names = []
         if instance.get('security_groups'):
-            for security_group in instance['security_groups']:
+            for security_group in instance.security_groups:
                 security_group_names.append(security_group['name'])
         result['groupSet'] = utils.convert_to_list_dict(
             security_group_names, 'groupId')
@@ -1182,18 +1200,18 @@ class CloudController(object):
 
         for instance in instances:
             if not context.is_admin:
-                if pipelib.is_vpn_image(instance['image_ref']):
+                if pipelib.is_vpn_image(instance.image_ref):
                     continue
             i = {}
-            instance_uuid = instance['uuid']
+            instance_uuid = instance.uuid
             ec2_id = ec2utils.id_to_ec2_inst_id(instance_uuid)
             i['instanceId'] = ec2_id
-            image_uuid = instance['image_ref']
+            image_uuid = instance.image_ref
             i['imageId'] = ec2utils.glance_id_to_ec2_id(context, image_uuid)
             self._format_kernel_id(context, instance, i, 'kernelId')
             self._format_ramdisk_id(context, instance, i, 'ramdiskId')
             i['instanceState'] = _state_description(
-                instance['vm_state'], instance['shutdown_terminate'])
+                instance.vm_state, instance.shutdown_terminate)
 
             fixed_ip = None
             floating_ip = None
@@ -1207,15 +1225,15 @@ class CloudController(object):
             if CONF.ec2_private_dns_show_ip:
                 i['privateDnsName'] = fixed_ip
             else:
-                i['privateDnsName'] = instance['hostname']
+                i['privateDnsName'] = instance.hostname
             i['privateIpAddress'] = fixed_ip
             if floating_ip is not None:
                 i['ipAddress'] = floating_ip
             i['dnsName'] = floating_ip
-            i['keyName'] = instance['key_name']
+            i['keyName'] = instance.key_name
             i['tagSet'] = []
 
-            for k, v in utils.instance_meta(instance).iteritems():
+            for k, v in six.iteritems(utils.instance_meta(instance)):
                 i['tagSet'].append({'key': k, 'value': v})
 
             client_token = self._get_client_token(context, instance_uuid)
@@ -1224,27 +1242,27 @@ class CloudController(object):
 
             if context.is_admin:
                 i['keyName'] = '%s (%s, %s)' % (i['keyName'],
-                    instance['project_id'],
-                    instance['host'])
+                    instance.project_id,
+                    instance.host)
             i['productCodesSet'] = utils.convert_to_list_dict([],
                                                               'product_codes')
             self._format_instance_type(instance, i)
-            i['launchTime'] = instance['created_at']
-            i['amiLaunchIndex'] = instance['launch_index']
+            i['launchTime'] = instance.created_at
+            i['amiLaunchIndex'] = instance.launch_index
             self._format_instance_root_device_name(instance, i)
-            self._format_instance_bdm(context, instance['uuid'],
+            self._format_instance_bdm(context, instance.uuid,
                                       i['rootDeviceName'], i)
-            host = instance['host']
-            zone = ec2utils.get_availability_zone_by_host(host)
+            zone = availability_zones.get_instance_availability_zone(context,
+                                                                     instance)
             i['placement'] = {'availabilityZone': zone}
-            if instance['reservation_id'] not in reservations:
+            if instance.reservation_id not in reservations:
                 r = {}
-                r['reservationId'] = instance['reservation_id']
-                r['ownerId'] = instance['project_id']
+                r['reservationId'] = instance.reservation_id
+                r['ownerId'] = instance.project_id
                 self._format_group_set(instance, r)
                 r['instancesSet'] = []
-                reservations[instance['reservation_id']] = r
-            reservations[instance['reservation_id']]['instancesSet'].append(i)
+                reservations[instance.reservation_id] = r
+            reservations[instance.reservation_id]['instancesSet'].append(i)
 
         return list(reservations.values())
 
@@ -1281,17 +1299,17 @@ class CloudController(object):
         return address
 
     def allocate_address(self, context, **kwargs):
-        LOG.audit(_("Allocate address"), context=context)
+        LOG.info(_LI("Allocate address"), context=context)
         public_ip = self.network_api.allocate_floating_ip(context)
         return {'publicIp': public_ip}
 
     def release_address(self, context, public_ip, **kwargs):
-        LOG.audit(_('Release address %s'), public_ip, context=context)
+        LOG.info(_LI('Release address %s'), public_ip, context=context)
         self.network_api.release_floating_ip(context, address=public_ip)
         return {'return': "true"}
 
     def associate_address(self, context, instance_id, public_ip, **kwargs):
-        LOG.audit(_("Associate address %(public_ip)s to instance "
+        LOG.info(_LI("Associate address %(public_ip)s to instance "
                     "%(instance_id)s"),
                   {'public_ip': public_ip, 'instance_id': instance_id},
                   context=context)
@@ -1324,7 +1342,8 @@ class CloudController(object):
         if instance_id:
             instance = self.compute_api.get(context, instance_id,
                                             want_objects=True)
-            LOG.audit(_("Disassociate address %s"), public_ip, context=context)
+            LOG.info(_LI("Disassociate address %s"),
+                     public_ip, context=context)
             self.network_api.disassociate_floating_ip(context, instance,
                                                       address=public_ip)
         else:
@@ -1386,7 +1405,7 @@ class CloudController(object):
                                             kwargs.get('instance_type', None))
 
         (instances, resv_id) = self.compute_api.create(context,
-            instance_type=obj_base.obj_to_primitive(flavor),
+            instance_type=flavor,
             image_href=image_uuid,
             max_count=int(kwargs.get('max_count', min_count)),
             min_count=min_count,
@@ -1476,7 +1495,7 @@ class CloudController(object):
     def reboot_instances(self, context, instance_id, **kwargs):
         """instance_id is a list of instance ids."""
         instances = self._ec2_ids_to_instances(context, instance_id)
-        LOG.audit(_("Reboot instance %r"), instance_id, context=context)
+        LOG.info(_LI("Reboot instance %r"), instance_id, context=context)
         for instance in instances:
             self.compute_api.reboot(context, instance, 'HARD')
         return True
@@ -1591,7 +1610,7 @@ class CloudController(object):
         return {'imagesSet': images}
 
     def deregister_image(self, context, image_id, **kwargs):
-        LOG.audit(_("De-registering image %s"), image_id, context=context)
+        LOG.info(_LI("De-registering image %s"), image_id, context=context)
         image = self._get_image(context, image_id)
         internal_id = image['id']
         self.image_service.delete(context, internal_id)
@@ -1627,7 +1646,7 @@ class CloudController(object):
             metadata['properties']['block_device_mapping'] = mappings
 
         image_id = self._register_image(context, metadata)
-        LOG.audit(_('Registered image %(image_location)s with id '
+        LOG.info(_LI('Registered image %(image_location)s with id '
                     '%(image_id)s'),
                   {'image_location': image_location, 'image_id': image_id},
                   context=context)
@@ -1696,7 +1715,7 @@ class CloudController(object):
         if operation_type not in ['add', 'remove']:
             msg = _('operation_type must be add or remove')
             raise exception.InvalidParameterValue(message=msg)
-        LOG.audit(_("Updating image %s publicity"), image_id, context=context)
+        LOG.info(_LI("Updating image %s publicity"), image_id, context=context)
 
         try:
             image = self._get_image(context, image_id)

@@ -17,34 +17,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 
-from nova import conductor
-from nova import context
 from nova.i18n import _, _LE
-from nova.openstack.common import log as logging
 from nova.openstack.common import memorycache
 from nova.servicegroup import api
+from nova.servicegroup.drivers import base
 
 
 CONF = cfg.CONF
 CONF.import_opt('service_down_time', 'nova.service')
-CONF.import_opt('memcached_servers', 'nova.openstack.common.memorycache')
 
 
 LOG = logging.getLogger(__name__)
 
 
-class MemcachedDriver(api.ServiceGroupDriver):
+class MemcachedDriver(base.Driver):
 
     def __init__(self, *args, **kwargs):
-        test = kwargs.get('test')
-        if not CONF.memcached_servers and not test:
+        if not CONF.memcached_servers:
             raise RuntimeError(_('memcached_servers not defined'))
         self.mc = memorycache.get_client()
-        self.db_allowed = kwargs.get('db_allowed', True)
-        self.conductor_api = conductor.API(use_local=self.db_allowed)
 
     def join(self, member_id, group_id, service=None):
         """Join the given service with its group."""
@@ -74,19 +69,6 @@ class MemcachedDriver(api.ServiceGroupDriver):
 
         return is_up
 
-    def get_all(self, group_id):
-        """Returns ALL members of the given group
-        """
-        LOG.debug('Memcached_Driver: get_all members of the %s group',
-                  group_id)
-        rs = []
-        ctxt = context.get_admin_context()
-        services = self.conductor_api.service_get_all_by_topic(ctxt, group_id)
-        for service in services:
-            if self.is_up(service):
-                rs.append(service['host'])
-        return rs
-
     def _report_state(self, service):
         """Update the state of this service in the datastore."""
         try:
@@ -104,7 +86,7 @@ class MemcachedDriver(api.ServiceGroupDriver):
                 LOG.error(_LE('Recovered model server connection!'))
 
         # TODO(vish): this should probably only catch connection errors
-        except Exception:  # pylint: disable=W0702
+        except Exception:
             if not getattr(service, 'model_disconnected', False):
                 service.model_disconnected = True
                 LOG.exception(_LE('model server went away'))

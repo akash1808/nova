@@ -17,7 +17,10 @@ from nova.objects import fields
 from nova import utils
 
 
-class NetworkRequest(obj_base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@obj_base.NovaObjectRegistry.register
+class NetworkRequest(obj_base.NovaObject,
+                     obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added pci_request_id
     VERSION = '1.1'
@@ -55,6 +58,7 @@ class NetworkRequest(obj_base.NovaObject):
             return cls(network_id=network_id, address=address)
 
 
+@obj_base.NovaObjectRegistry.register
 class NetworkRequestList(obj_base.ObjectListBase, obj_base.NovaObject):
     fields = {
         'objects': fields.ListOfObjectsField('NetworkRequest'),

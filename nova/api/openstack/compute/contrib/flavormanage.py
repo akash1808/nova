@@ -12,7 +12,6 @@
 
 import webob
 
-from nova.api.openstack.compute import flavors as flavors_api
 from nova.api.openstack.compute.views import flavors as flavors_view
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
@@ -35,7 +34,6 @@ class FlavorManageController(wsgi.Controller):
     def _delete(self, req, id):
         context = req.environ['nova.context']
         authorize(context)
-
         try:
             flavor = flavors.get_flavor_by_flavor_id(
                     id, ctxt=context, read_deleted="no")
@@ -47,7 +45,6 @@ class FlavorManageController(wsgi.Controller):
         return webob.Response(status_int=202)
 
     @wsgi.action("create")
-    @wsgi.serializers(xml=flavors_api.FlavorTemplate)
     def _create(self, req, body):
         context = req.environ['nova.context']
         authorize(context)

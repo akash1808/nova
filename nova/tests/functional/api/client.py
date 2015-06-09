@@ -14,15 +14,59 @@
 
 import urllib
 
-from oslo.serialization import jsonutils
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 import requests
+import six
 
-from nova.i18n import _
-from nova.openstack.common import log as logging
 from nova.tests.unit.image import fake
 
 
 LOG = logging.getLogger(__name__)
+
+
+class APIResponse(object):
+    """Decoded API Response
+
+    This provides a decoded version of the Requests response which
+    include a json decoded body, far more convenient for testing that
+    returned structures are correct, or using parts of returned
+    structures in tests.
+
+
+    This class is a simple wrapper around dictionaries for API
+    responses in tests. It includes extra attributes so that they can
+    be inspected in addition to the attributes.
+
+    All json responses from Nova APIs are dictionary compatible, or
+    blank, so other possible base classes are not needed.
+
+    """
+    status = 200
+    """The HTTP status code as an int"""
+    content = ""
+    """The Raw HTTP response body as a string"""
+    body = {}
+    """The decoded json body as a dictionary"""
+    headers = {}
+    """Response headers as a dictionary"""
+
+    def __init__(self, response):
+        """Construct an API response from a Requests response
+
+        :param response: a ``requests`` library response
+        """
+        super(APIResponse, self).__init__()
+        self.status = response.status_code
+        self.content = response.content
+        if self.content:
+            self.body = jsonutils.loads(self.content)
+        self.headers = response.headers
+
+    def __str__(self):
+        # because __str__ falls back to __repr__ we can still use repr
+        # on self but add in the other attributes.
+        return "<Response body:%r, status_code:%s>" % (self.body, self.status)
 
 
 class OpenStackApiException(Exception):
@@ -35,10 +79,10 @@ class OpenStackApiException(Exception):
             _status = response.status_code
             _body = response.content
 
-            message = (_('%(message)s\nStatus Code: %(_status)s\n'
-                         'Body: %(_body)s') %
-                         {'message': message, '_status': _status,
-                          '_body': _body})
+            message = ('%(message)s\nStatus Code: %(_status)s\n'
+                       'Body: %(_body)s' %
+                       {'message': message, '_status': _status,
+                        '_body': _body})
 
         super(OpenStackApiException, self).__init__(message)
 
@@ -46,7 +90,7 @@ class OpenStackApiException(Exception):
 class OpenStackApiAuthenticationException(OpenStackApiException):
     def __init__(self, response=None, message=None):
         if not message:
-            message = _("Authentication error")
+            message = "Authentication error"
         super(OpenStackApiAuthenticationException, self).__init__(message,
                                                                   response)
 
@@ -54,7 +98,7 @@ class OpenStackApiAuthenticationException(OpenStackApiException):
 class OpenStackApiAuthorizationException(OpenStackApiException):
     def __init__(self, response=None, message=None):
         if not message:
-            message = _("Authorization error")
+            message = "Authorization error"
         super(OpenStackApiAuthorizationException, self).__init__(message,
                                                                   response)
 
@@ -62,7 +106,7 @@ class OpenStackApiAuthorizationException(OpenStackApiException):
 class OpenStackApiNotFoundException(OpenStackApiException):
     def __init__(self, response=None, message=None):
         if not message:
-            message = _("Item not found")
+            message = "Item not found"
         super(OpenStackApiNotFoundException, self).__init__(message, response)
 
 
@@ -140,23 +184,20 @@ class TestOpenStackClient(object):
                     raise OpenStackApiAuthorizationException(response=response)
                 else:
                     raise OpenStackApiException(
-                                        message=_("Unexpected status code"),
-                                        response=response)
+                        message="Unexpected status code",
+                        response=response)
 
         return response
 
     def _decode_json(self, response):
-        body = response.content
-        LOG.debug("Decoding JSON: %s", body)
-        if body:
-            return jsonutils.loads(body)
-        else:
-            return ""
+        resp = APIResponse(status=response.status_code)
+        if response.content:
+            resp.body = jsonutils.loads(response.content)
+        return resp
 
     def api_get(self, relative_uri, **kwargs):
         kwargs.setdefault('check_response_status', [200])
-        response = self.api_request(relative_uri, **kwargs)
-        return self._decode_json(response)
+        return APIResponse(self.api_request(relative_uri, **kwargs))
 
     def api_post(self, relative_uri, body, **kwargs):
         kwargs['method'] = 'POST'
@@ -166,8 +207,7 @@ class TestOpenStackClient(object):
             kwargs['body'] = jsonutils.dumps(body)
 
         kwargs.setdefault('check_response_status', [200, 202])
-        response = self.api_request(relative_uri, **kwargs)
-        return self._decode_json(response)
+        return APIResponse(self.api_request(relative_uri, **kwargs))
 
     def api_put(self, relative_uri, body, **kwargs):
         kwargs['method'] = 'PUT'
@@ -177,96 +217,115 @@ class TestOpenStackClient(object):
             kwargs['body'] = jsonutils.dumps(body)
 
         kwargs.setdefault('check_response_status', [200, 202, 204])
-        response = self.api_request(relative_uri, **kwargs)
-        return self._decode_json(response)
+        return APIResponse(self.api_request(relative_uri, **kwargs))
 
     def api_delete(self, relative_uri, **kwargs):
         kwargs['method'] = 'DELETE'
         kwargs.setdefault('check_response_status', [200, 202, 204])
-        return self.api_request(relative_uri, **kwargs)
+        return APIResponse(self.api_request(relative_uri, **kwargs))
+
+    #####################################
+    #
+    # Convenience methods
+    #
+    # The following are a set of convenience methods to get well known
+    # resources, they can be helpful in setting up resources in
+    # tests. All of these convenience methods throw exceptions if they
+    # get a non 20x status code, so will appropriately abort tests if
+    # they fail.
+    #
+    # They all return the most relevant part of their response body as
+    # decoded data structure.
+    #
+    #####################################
 
     def get_server(self, server_id):
-        return self.api_get('/servers/%s' % server_id)['server']
+        return self.api_get('/servers/%s' % server_id).body['server']
 
     def get_servers(self, detail=True, search_opts=None):
         rel_url = '/servers/detail' if detail else '/servers'
 
         if search_opts is not None:
             qparams = {}
-            for opt, val in search_opts.iteritems():
+            for opt, val in six.iteritems(search_opts):
                 qparams[opt] = val
             if qparams:
                 query_string = "?%s" % urllib.urlencode(qparams)
                 rel_url += query_string
-        return self.api_get(rel_url)['servers']
+        return self.api_get(rel_url).body['servers']
 
     def post_server(self, server):
-        response = self.api_post('/servers', server)
+        response = self.api_post('/servers', server).body
         if 'reservation_id' in response:
             return response
         else:
             return response['server']
 
     def put_server(self, server_id, server):
-        return self.api_put('/servers/%s' % server_id, server)
+        return self.api_put('/servers/%s' % server_id, server).body
 
     def post_server_action(self, server_id, data):
-        return self.api_post('/servers/%s/action' % server_id, data)
+        return self.api_post('/servers/%s/action' % server_id, data).body
 
     def delete_server(self, server_id):
         return self.api_delete('/servers/%s' % server_id)
 
     def get_image(self, image_id):
-        return self.api_get('/images/%s' % image_id)['image']
+        return self.api_get('/images/%s' % image_id).body['image']
 
     def get_images(self, detail=True):
         rel_url = '/images/detail' if detail else '/images'
-        return self.api_get(rel_url)['images']
+        return self.api_get(rel_url).body['images']
 
     def post_image(self, image):
-        return self.api_post('/images', image)['image']
+        return self.api_post('/images', image).body['image']
 
     def delete_image(self, image_id):
         return self.api_delete('/images/%s' % image_id)
 
     def get_flavor(self, flavor_id):
-        return self.api_get('/flavors/%s' % flavor_id)['flavor']
+        return self.api_get('/flavors/%s' % flavor_id).body['flavor']
 
     def get_flavors(self, detail=True):
         rel_url = '/flavors/detail' if detail else '/flavors'
-        return self.api_get(rel_url)['flavors']
+        return self.api_get(rel_url).body['flavors']
 
     def post_flavor(self, flavor):
-        return self.api_post('/flavors', flavor)['flavor']
+        return self.api_post('/flavors', flavor).body['flavor']
 
     def delete_flavor(self, flavor_id):
         return self.api_delete('/flavors/%s' % flavor_id)
 
+    def post_extra_spec(self, flavor_id, spec):
+        return self.api_post('/flavors/%s/os-extra_specs' %
+                             flavor_id, spec)
+
     def get_volume(self, volume_id):
-        return self.api_get('/volumes/%s' % volume_id)['volume']
+        return self.api_get('/volumes/%s' % volume_id).body['volume']
 
     def get_volumes(self, detail=True):
         rel_url = '/volumes/detail' if detail else '/volumes'
-        return self.api_get(rel_url)['volumes']
+        return self.api_get(rel_url).body['volumes']
 
     def post_volume(self, volume):
-        return self.api_post('/volumes', volume)['volume']
+        return self.api_post('/volumes', volume).body['volume']
 
     def delete_volume(self, volume_id):
         return self.api_delete('/volumes/%s' % volume_id)
 
     def get_server_volume(self, server_id, attachment_id):
         return self.api_get('/servers/%s/os-volume_attachments/%s' %
-                            (server_id, attachment_id))['volumeAttachment']
+                            (server_id, attachment_id)
+                        ).body['volumeAttachment']
 
     def get_server_volumes(self, server_id):
         return self.api_get('/servers/%s/os-volume_attachments' %
-                            (server_id))['volumeAttachments']
+                            (server_id)).body['volumeAttachments']
 
     def post_server_volume(self, server_id, volume_attachment):
         return self.api_post('/servers/%s/os-volume_attachments' %
                              (server_id), volume_attachment
-                            )['volumeAttachment']
+                            ).body['volumeAttachment']
 
     def delete_server_volume(self, server_id, attachment_id):
         return self.api_delete('/servers/%s/os-volume_attachments/%s' %

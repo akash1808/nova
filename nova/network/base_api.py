@@ -16,15 +16,15 @@
 import functools
 import inspect
 
-from oslo.utils import excutils
 from oslo_concurrency import lockutils
+from oslo_log import log as logging
+from oslo_utils import excutils
 
 from nova.db import base
 from nova import hooks
 from nova.i18n import _, _LE
 from nova.network import model as network_model
 from nova import objects
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def update_instance_cache_with_nw_info(impl, context, instance,
         # NOTE(comstud): The save() method actually handles updating or
         # creating the instance.  We don't need to retrieve the object
         # from the DB first.
-        ic = objects.InstanceInfoCache.new(context, instance['uuid'])
+        ic = objects.InstanceInfoCache.new(context, instance.uuid)
         ic.network_info = nw_info
         ic.save(update_cells=update_cells)
     except Exception:
@@ -71,7 +71,7 @@ def refresh_cache(f):
             msg = _('instance is a required argument to use @refresh_cache')
             raise Exception(msg)
 
-        with lockutils.lock('refresh_cache-%s' % instance['uuid']):
+        with lockutils.lock('refresh_cache-%s' % instance.uuid):
             update_instance_cache_with_nw_info(self, context, instance,
                                                nw_info=res)
         # return the original function's return value
@@ -86,7 +86,8 @@ class NetworkAPI(base.Base):
     """Base Network API for doing networking operations.
     New operations available on specific clients must be added here as well.
     """
-    def __init__(self, **kwargs):
+    def __init__(self, skip_policy_check=False, **kwargs):
+        self.skip_policy_check = skip_policy_check
         super(NetworkAPI, self).__init__(**kwargs)
 
     def get_all(self, context):
@@ -257,12 +258,6 @@ class NetworkAPI(base.Base):
         """
         raise NotImplementedError()
 
-    def get_instance_uuids_by_ip_filter(self, context, filters):
-        """Returns a list of dicts in the form of
-        {'instance_uuid': uuid, 'ip': ip} that matched the ip_filter
-        """
-        raise NotImplementedError()
-
     def get_dns_domains(self, context):
         """Returns a list of available dns domains.
         These can be used to create DNS entries for floating ips.
@@ -314,4 +309,22 @@ class NetworkAPI(base.Base):
 
     def migrate_instance_finish(self, context, instance, migration):
         """Finish migrating the network of an instance."""
+        raise NotImplementedError()
+
+    def setup_instance_network_on_host(self, context, instance, host):
+        """Setup network for specified instance on host.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param host: The host which network should be setup for instance.
+        """
+        raise NotImplementedError()
+
+    def cleanup_instance_network_on_host(self, context, instance, host):
+        """Cleanup network for specified instance on host.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param host: The host which network should be cleanup for instance.
+        """
         raise NotImplementedError()

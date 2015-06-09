@@ -18,17 +18,19 @@ import datetime
 
 import iso8601
 import mock
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 import webob.exc
 
 from nova.api.openstack.compute.contrib import services as services_v2
 from nova.api.openstack.compute.plugins.v3 import services as services_v21
 from nova.api.openstack import extensions
 from nova import availability_zones
+from nova.cells import utils as cells_utils
 from nova.compute import cells_api
 from nova import context
 from nova import db
 from nova import exception
+from nova import objects
 from nova.servicegroup.drivers import db as db_driver
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -175,10 +177,12 @@ class ServicesTestV21(test.TestCase):
         self.stubs.Set(timeutils, "utcnow", fake_utcnow)
         self.stubs.Set(timeutils, "utcnow_ts", fake_utcnow_ts)
 
-        self.stubs.Set(db, "service_get_by_args",
+        self.stubs.Set(db, "service_get_by_host_and_binary",
                        fake_db_service_get_by_host_binary(fake_services_list))
         self.stubs.Set(db, "service_update",
                        fake_db_service_update(fake_services_list))
+
+        self.req = fakes.HTTPRequest.blank('')
 
     def _process_output(self, services, has_disabled=False, has_id=False):
         return services
@@ -298,7 +302,6 @@ class ServicesTestV21(test.TestCase):
                     'zone': 'internal',
                     'status': 'disabled',
                     'id': 1,
-                    'disabled_reason': 'test1',
                     'state': 'up',
                     'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
                     'disabled_reason': 'test1'},
@@ -308,7 +311,6 @@ class ServicesTestV21(test.TestCase):
                      'status': 'disabled',
                      'state': 'up',
                      'id': 2,
-                     'disabled_reason': 'test2',
                      'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 5),
                      'disabled_reason': 'test2'},
                     {'binary': 'nova-scheduler',
@@ -316,7 +318,6 @@ class ServicesTestV21(test.TestCase):
                      'zone': 'internal',
                      'status': 'enabled',
                      'id': 3,
-                     'disabled_reason': 'test3',
                      'state': 'down',
                      'updated_at': datetime.datetime(2012, 9, 19, 6, 55, 34),
                      'disabled_reason': None},
@@ -324,7 +325,6 @@ class ServicesTestV21(test.TestCase):
                      'host': 'host2',
                      'zone': 'nova',
                      'id': 4,
-                     'disabled_reason': 'test4',
                      'status': 'disabled',
                      'state': 'down',
                      'updated_at': datetime.datetime(2012, 9, 18, 8, 3, 38),
@@ -367,7 +367,6 @@ class ServicesTestV21(test.TestCase):
                     'host': 'host1',
                     'zone': 'nova',
                     'id': 2,
-                    'disabled_reason': 'test2',
                     'status': 'disabled',
                     'state': 'up',
                     'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 5),
@@ -375,7 +374,6 @@ class ServicesTestV21(test.TestCase):
                     {'binary': 'nova-compute',
                      'host': 'host2',
                      'id': 4,
-                     'disabled_reason': 'test4',
                      'zone': 'nova',
                      'status': 'disabled',
                      'state': 'down',
@@ -450,65 +448,56 @@ class ServicesTestV21(test.TestCase):
         self.stubs.Set(db, "service_update", _service_update)
 
         body = {'host': 'host1', 'binary': 'nova-compute'}
-        req = fakes.HTTPRequest.blank('/v2/fake/os-services/enable')
-
-        res_dict = self.controller.update(req, "enable", body=body)
+        res_dict = self.controller.update(self.req, "enable", body=body)
         self.assertEqual(res_dict['service']['status'], 'enabled')
         self.assertNotIn('disabled_reason', res_dict['service'])
 
     def test_services_enable_with_invalid_host(self):
         body = {'host': 'invalid', 'binary': 'nova-compute'}
-        req = fakes.HTTPRequest.blank('/v2/fake/os-services/enable')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.update,
-                          req,
+                          self.req,
                           "enable",
                           body=body)
 
     def test_services_enable_with_invalid_binary(self):
         body = {'host': 'host1', 'binary': 'invalid'}
-        req = fakes.HTTPRequest.blank('/v2/fake/os-services/enable')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.update,
-                          req,
+                          self.req,
                           "enable",
                           body=body)
 
     def test_services_disable(self):
-        req = fakes.HTTPRequest.blank('/v2/fake/os-services/disable')
         body = {'host': 'host1', 'binary': 'nova-compute'}
-        res_dict = self.controller.update(req, "disable", body=body)
+        res_dict = self.controller.update(self.req, "disable", body=body)
 
         self.assertEqual(res_dict['service']['status'], 'disabled')
         self.assertNotIn('disabled_reason', res_dict['service'])
 
     def test_services_disable_with_invalid_host(self):
         body = {'host': 'invalid', 'binary': 'nova-compute'}
-        req = fakes.HTTPRequest.blank('/v2/fake/os-services/disable')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.update,
-                          req,
+                          self.req,
                           "disable",
                           body=body)
 
     def test_services_disable_with_invalid_binary(self):
         body = {'host': 'host1', 'binary': 'invalid'}
-        req = fakes.HTTPRequest.blank('/v2/fake/os-services/disable')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.update,
-                          req,
+                          self.req,
                           "disable",
                           body=body)
 
     def test_services_disable_log_reason(self):
         self.ext_mgr.extensions['os-extended-services'] = True
-        req = \
-            fakes.HTTPRequest.blank('/v2/fake/os-services/disable-log-reason')
         body = {'host': 'host1',
                 'binary': 'nova-compute',
                 'disabled_reason': 'test-reason',
                 }
-        res_dict = self.controller.update(req,
+        res_dict = self.controller.update(self.req,
                                           "disable-log-reason",
                                           body=body)
 
@@ -517,48 +506,39 @@ class ServicesTestV21(test.TestCase):
 
     def test_mandatory_reason_field(self):
         self.ext_mgr.extensions['os-extended-services'] = True
-        req = \
-            fakes.HTTPRequest.blank('/v2/fake/os-services/disable-log-reason')
         body = {'host': 'host1',
                 'binary': 'nova-compute',
                }
         self.assertRaises(webob.exc.HTTPBadRequest,
-                self.controller.update, req, "disable-log-reason", body=body)
+                self.controller.update, self.req, "disable-log-reason",
+                body=body)
 
     def test_invalid_reason_field(self):
         self.ext_mgr.extensions['os-extended-services'] = True
-        url = '/v2/fake/os-services/disable-log-reason'
-        req = fakes.HTTPRequest.blank(url)
         reason = 'a' * 256
         body = {'host': 'host1',
                 'binary': 'nova-compute',
                 'disabled_reason': reason,
                }
         self.assertRaises(self.bad_request,
-                self.controller.update, req, "disable-log-reason", body=body)
+                self.controller.update, self.req, "disable-log-reason",
+                body=body)
 
     def test_services_delete(self):
         self.ext_mgr.extensions['os-extended-services-delete'] = True
 
-        request = fakes.HTTPRequest.blank('/v2/fakes/os-services/1',
-                                          use_admin_context=True)
-        request.method = 'DELETE'
-
         with mock.patch.object(self.controller.host_api,
                                'service_delete') as service_delete:
-            self.controller.delete(request, '1')
+            self.controller.delete(self.req, '1')
             service_delete.assert_called_once_with(
-                request.environ['nova.context'], '1')
+                self.req.environ['nova.context'], '1')
             self.assertEqual(self.controller.delete.wsgi_code, 204)
 
     def test_services_delete_not_found(self):
         self.ext_mgr.extensions['os-extended-services-delete'] = True
 
-        request = fakes.HTTPRequest.blank('/v2/fakes/os-services/abc',
-                                          use_admin_context=True)
-        request.method = 'DELETE'
         self.assertRaises(webob.exc.HTTPNotFound,
-                          self.controller.delete, request, 'abc')
+                          self.controller.delete, self.req, 'abc')
 
     # This test is just to verify that the servicegroup API gets used when
     # calling the API
@@ -575,15 +555,17 @@ class ServicesTestV20(ServicesTestV21):
     service_is_up_exc = KeyError
     bad_request = webob.exc.HTTPBadRequest
 
+    def setUp(self):
+        super(ServicesTestV20, self).setUp()
+        self.req = fakes.HTTPRequest.blank('', use_admin_context=True)
+        self.non_admin_req = fakes.HTTPRequest.blank('')
+
     def _set_up_controller(self):
         self.controller = services_v2.ServiceController(self.ext_mgr)
 
     def test_services_delete_not_enabled(self):
-        request = fakes.HTTPRequest.blank('v2/fakes/os-services/300',
-                                          use_admin_context=True)
-        request.method = 'DELETE'
         self.assertRaises(webob.exc.HTTPMethodNotAllowed,
-                          self.controller.delete, request, '300')
+                          self.controller.delete, self.req, '300')
 
     def _process_output(self, services, has_disabled=False, has_id=False):
         for service in services['services']:
@@ -592,6 +574,19 @@ class ServicesTestV20(ServicesTestV21):
             if not has_id:
                 service.pop('id')
         return services
+
+    def test_update_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired, self.controller.update,
+                          self.non_admin_req, fakes.FAKE_UUID, body={})
+
+    def test_delete_with_non_admin(self):
+        self.ext_mgr.extensions['os-extended-services-delete'] = True
+        self.assertRaises(exception.AdminRequired, self.controller.delete,
+                          self.non_admin_req, fakes.FAKE_UUID)
+
+    def test_index_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired, self.controller.index,
+                          self.non_admin_req)
 
 
 class ServicesCellsTestV21(test.TestCase):
@@ -612,8 +607,9 @@ class ServicesCellsTestV21(test.TestCase):
         services_list = []
         for service in fake_services_list:
             service = service.copy()
-            service['id'] = 'cell1@%d' % service['id']
-            services_list.append(service)
+            service_obj = objects.Service(**service)
+            service_proxy = cells_utils.ServiceProxy(service_obj, 'cell1')
+            services_list.append(service_proxy)
 
         self.stubs.Set(host_api.cells_rpcapi, "service_get_all",
                        fake_service_get_all(services_list))
@@ -633,7 +629,7 @@ class ServicesCellsTestV21(test.TestCase):
         response = {'services': [
                     {'id': 'cell1@1',
                      'binary': 'nova-scheduler',
-                     'host': 'host1',
+                     'host': 'cell1@host1',
                      'zone': 'internal',
                      'status': 'disabled',
                      'state': 'up',
@@ -641,7 +637,7 @@ class ServicesCellsTestV21(test.TestCase):
                                                      tzinfo=utc)},
                     {'id': 'cell1@2',
                      'binary': 'nova-compute',
-                     'host': 'host1',
+                     'host': 'cell1@host1',
                      'zone': 'nova',
                      'status': 'disabled',
                      'state': 'up',
@@ -649,7 +645,7 @@ class ServicesCellsTestV21(test.TestCase):
                                                      tzinfo=utc)},
                     {'id': 'cell1@3',
                      'binary': 'nova-scheduler',
-                     'host': 'host2',
+                     'host': 'cell1@host2',
                      'zone': 'internal',
                      'status': 'enabled',
                      'state': 'down',
@@ -657,14 +653,14 @@ class ServicesCellsTestV21(test.TestCase):
                                                      tzinfo=utc)},
                     {'id': 'cell1@4',
                      'binary': 'nova-compute',
-                     'host': 'host2',
+                     'host': 'cell1@host2',
                      'zone': 'nova',
                      'status': 'disabled',
                      'state': 'down',
                      'updated_at': datetime.datetime(2012, 9, 18, 8, 3, 38,
                                                      tzinfo=utc)}]}
         self._process_out(res_dict)
-        self.assertEqual(res_dict, response)
+        self.assertEqual(response, res_dict)
 
 
 class ServicesCellsTestV20(ServicesCellsTestV21):
@@ -674,3 +670,43 @@ class ServicesCellsTestV20(ServicesCellsTestV21):
 
     def _process_out(self, res_dict):
         pass
+
+
+class ServicesPolicyEnforcementV21(test.NoDBTestCase):
+
+    def setUp(self):
+        super(ServicesPolicyEnforcementV21, self).setUp()
+        self.controller = services_v21.ServiceController()
+        self.req = fakes.HTTPRequest.blank('')
+
+    def test_update_policy_failed(self):
+        rule_name = "os_compute_api:os-services"
+        self.policy.set_rules({rule_name: "project_id:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.update, self.req, fakes.FAKE_UUID,
+            body={'host': 'host1',
+                  'binary': 'nova-compute'})
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+    def test_delete_policy_failed(self):
+        rule_name = "os_compute_api:os-services"
+        self.policy.set_rules({rule_name: "project_id:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.delete, self.req, fakes.FAKE_UUID)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+    def test_index_policy_failed(self):
+        rule_name = "os_compute_api:os-services"
+        self.policy.set_rules({rule_name: "project_id:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.index, self.req)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())

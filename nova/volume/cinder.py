@@ -26,15 +26,16 @@ from cinderclient import exceptions as cinder_exception
 from cinderclient.v1 import client as v1_client
 from keystoneclient import exceptions as keystone_exception
 from keystoneclient import session
-from oslo.config import cfg
-from oslo.utils import strutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import strutils
+import six
 import six.moves.urllib.parse as urlparse
 
 from nova import availability_zones as az
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 
 cinder_opts = [
     cfg.StrOpt('catalog_info',
@@ -97,7 +98,6 @@ def cinderclient(context):
 
     url = None
     endpoint_override = None
-    version = None
 
     auth = context.get_auth_plugin()
     service_type, service_name, interface = CONF.cinder.catalog_info.split(':')
@@ -122,7 +122,7 @@ def cinderclient(context):
         msg = _LW('Cinder V1 API is deprecated as of the Juno '
                   'release, and Nova is still configured to use it. '
                   'Enable the V2 API in Cinder and set '
-                  'cinder_catalog_info in nova.conf to use it.')
+                  'cinder.catalog_info in nova.conf to use it.')
         LOG.warn(msg)
         _V1_ERROR_RAISED = True
 
@@ -219,14 +219,15 @@ def translate_volume_exception(method):
                 exc_value = exception.VolumeNotFound(volume_id=volume_id)
             elif isinstance(exc_value, (keystone_exception.BadRequest,
                                         cinder_exception.BadRequest)):
-                exc_value = exception.InvalidInput(reason=exc_value.message)
-            raise exc_value, None, exc_trace
+                exc_value = exception.InvalidInput(
+                    reason=six.text_type(exc_value))
+            six.reraise(exc_value, None, exc_trace)
         except (cinder_exception.ConnectionError,
                 keystone_exception.ConnectionError):
             exc_type, exc_value, exc_trace = sys.exc_info()
             exc_value = exception.CinderConnectionFailed(
-                                                   reason=exc_value.message)
-            raise exc_value, None, exc_trace
+                reason=six.text_type(exc_value))
+            six.reraise(exc_value, None, exc_trace)
         return res
     return wrapper
 
@@ -244,13 +245,13 @@ def translate_snapshot_exception(method):
             if isinstance(exc_value, (keystone_exception.NotFound,
                                       cinder_exception.NotFound)):
                 exc_value = exception.SnapshotNotFound(snapshot_id=snapshot_id)
-            raise exc_value, None, exc_trace
+            six.reraise(exc_value, None, exc_trace)
         except (cinder_exception.ConnectionError,
                 keystone_exception.ConnectionError):
             exc_type, exc_value, exc_trace = sys.exc_info()
-            exc_value = exception.CinderConnectionFailed(
-                                                  reason=exc_value.message)
-            raise exc_value, None, exc_trace
+            reason = six.text_type(exc_value)
+            exc_value = exception.CinderConnectionFailed(reason=reason)
+            six.reraise(exc_value, None, exc_trace)
         return res
     return wrapper
 
@@ -286,7 +287,9 @@ class API(object):
 
     def get_all(self, context, search_opts=None):
         search_opts = search_opts or {}
-        items = cinderclient(context).volumes.list(detailed=True)
+        items = cinderclient(context).volumes.list(detailed=True,
+                                                   search_opts=search_opts)
+
         rval = []
 
         for item in items:

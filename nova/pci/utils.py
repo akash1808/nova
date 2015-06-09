@@ -19,9 +19,11 @@ import glob
 import os
 import re
 
+from oslo_log import log as logging
+import six
+
 from nova import exception
 from nova.i18n import _LE
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
@@ -47,7 +49,7 @@ def pci_device_prop_match(pci_dev, specs):
 
     """
     def _matching_devices(spec):
-        return all(pci_dev.get(k) == v for k, v in spec.iteritems())
+        return all(pci_dev.get(k) == v for k, v in six.iteritems(spec))
 
     return any(_matching_devices(spec) for spec in specs)
 
@@ -85,10 +87,10 @@ def get_function_by_ifname(ifname):
         return None, False
 
 
-def is_physical_function(PciAddress):
+def is_physical_function(pci_addr):
     dev_path = "/sys/bus/pci/devices/%(d)s:%(b)s:%(s)s.%(f)s/" % {
-        "d": PciAddress.domain, "b": PciAddress.bus,
-        "s": PciAddress.slot, "f": PciAddress.func}
+        "d": pci_addr.domain, "b": pci_addr.bus,
+        "s": pci_addr.slot, "f": pci_addr.func}
     try:
         dev_info = os.listdir(dev_path)
         for dev_file in dev_info:

@@ -19,12 +19,13 @@ Cells Scheduler
 import copy
 import time
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from six.moves import range
 
 from nova.cells import filters
 from nova.cells import weights
 from nova import compute
-from nova.compute import flavors
 from nova.compute import instance_actions
 from nova.compute import vm_states
 from nova import conductor
@@ -33,7 +34,6 @@ from nova import exception
 from nova.i18n import _LE, _LI
 from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import log as logging
 from nova.scheduler import utils as scheduler_utils
 from nova import utils
 
@@ -87,17 +87,13 @@ class CellsScheduler(base.Base):
         # The parent may pass these metadata values as lists, and the
         # create call expects it to be a dict.
         instance_values['metadata'] = utils.instance_meta(instance_values)
-        sys_metadata = utils.instance_sys_meta(instance_values)
-        # Make sure the flavor info is set.  It may not have been passed
-        # down.
-        sys_metadata = flavors.save_flavor_info(sys_metadata, instance_type)
-        instance_values['system_metadata'] = sys_metadata
         # Pop out things that will get set properly when re-creating the
         # instance record.
         instance_values.pop('id')
         instance_values.pop('name')
         instance_values.pop('info_cache')
         instance_values.pop('security_groups')
+        instance_values.pop('flavor')
 
         # FIXME(danms): The instance was brutally serialized before being
         # sent over RPC to us. Thus, the pci_requests value wasn't really
@@ -112,6 +108,9 @@ class CellsScheduler(base.Base):
             instance = objects.Instance(context=ctxt)
             instance.update(instance_values)
             instance.uuid = instance_uuid
+            instance.flavor = instance_type
+            instance.old_flavor = None
+            instance.new_flavor = None
             instance = self.compute_api.create_db_entry_for_new_instance(
                     ctxt,
                     instance_type,
@@ -167,7 +166,8 @@ class CellsScheduler(base.Base):
             build_inst_kwargs):
         """Attempt to build instance(s) or send msg to child cell."""
         ctxt = message.ctxt
-        instance_properties = build_inst_kwargs['instances'][0]
+        instance_properties = obj_base.obj_to_primitive(
+            build_inst_kwargs['instances'][0])
         filter_properties = build_inst_kwargs['filter_properties']
         instance_type = filter_properties['instance_type']
         image = build_inst_kwargs['image']
@@ -224,7 +224,7 @@ class CellsScheduler(base.Base):
             filter_properties, method, method_kwargs):
         """Pick a cell where we should create a new instance(s)."""
         try:
-            for i in xrange(max(0, CONF.cells.scheduler_retries) + 1):
+            for i in range(max(0, CONF.cells.scheduler_retries) + 1):
                 try:
                     target_cells = self._grab_target_cells(filter_properties)
                     if target_cells is None:

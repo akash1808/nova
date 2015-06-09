@@ -16,7 +16,7 @@
 
 import datetime
 
-from oslo.config import cfg
+from oslo_config import cfg
 import webob.exc
 
 from nova.api.openstack import extensions
@@ -30,7 +30,7 @@ CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
 
 
 ALIAS = 'os-instance-usage-audit-log'
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class InstanceUsageAuditLogController(wsgi.Controller):
@@ -103,11 +103,11 @@ class InstanceUsageAuditLogController(wsgi.Controller):
                 running_hosts.add(tlog['host'])
             total_errors += tlog['errors']
             total_items += tlog['task_items']
-        log = dict((tl['host'], dict(state=tl['state'],
-                                  instances=tl['task_items'],
-                                  errors=tl['errors'],
-                                  message=tl['message']))
-                  for tl in task_logs)
+        log = {tl['host']: dict(state=tl['state'],
+                                instances=tl['task_items'],
+                                errors=tl['errors'],
+                                message=tl['message'])
+               for tl in task_logs}
         missing_hosts = hosts - seen_hosts
         overall_status = "%s hosts done. %s errors." % (
                     'ALL' if len(done_hosts) == len(hosts)
@@ -128,7 +128,7 @@ class InstanceUsageAuditLogController(wsgi.Controller):
 
 class InstanceUsageAuditLog(extensions.V3APIExtensionBase):
     """Admin-only Task Log Monitoring."""
-    name = "InstanceUsageAuditLog"
+    name = "OSInstanceUsageAuditLog"
     alias = ALIAS
     version = 1
 

@@ -15,14 +15,15 @@
 
 import mock
 from mox3 import mox
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+from oslo_serialization import jsonutils
+from six.moves import range
 from webob import exc
 
 from nova.api.openstack.compute import extensions
 from nova.api.openstack.compute import plugins
 from nova.api.openstack.compute.plugins.v3 import block_device_mapping
-from nova.api.openstack.compute.plugins.v3 import servers as servers_v3
+from nova.api.openstack.compute.plugins.v3 import servers as servers_v21
 from nova.api.openstack.compute import servers as servers_v2
 from nova import block_device
 from nova.compute import api as compute_api
@@ -37,13 +38,15 @@ CONF = cfg.CONF
 
 
 class BlockDeviceMappingTestV21(test.TestCase):
+    validation_error = exception.ValidationError
 
     def _setup_controller(self):
         ext_info = plugins.LoadedExtensionInfo()
-        self.controller = servers_v3.ServersController(extension_info=ext_info)
+        self.controller = servers_v21.ServersController(
+                                        extension_info=ext_info)
         CONF.set_override('extensions_blacklist', 'os-block-device-mapping',
                           'osapi_v3')
-        self.no_bdm_v2_controller = servers_v3.ServersController(
+        self.no_bdm_v2_controller = servers_v21.ServersController(
                 extension_info=ext_info)
         CONF.set_override('extensions_blacklist', '', 'osapi_v3')
 
@@ -158,13 +161,13 @@ class BlockDeviceMappingTestV21(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(self.validation_error,
                           self._test_create, params, no_image=True)
 
     @mock.patch.object(compute_api.API, 'create')
     def test_create_instance_with_bdm_param_not_list(self, mock_create):
         self.params = {'block_device_mapping': '/dev/vdb'}
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(self.validation_error,
                           self._test_create, self.params)
 
     def test_create_instance_with_device_name_empty(self):
@@ -179,7 +182,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(self.validation_error,
                           self._test_create, params, no_image=True)
 
     def test_create_instance_with_device_name_too_long(self):
@@ -194,7 +197,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(self.validation_error,
                           self._test_create, params, no_image=True)
 
     def test_create_instance_with_space_in_device_name(self):
@@ -210,7 +213,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(self.validation_error,
                           self._test_create, params, no_image=True)
 
     def test_create_instance_with_invalid_size(self):
@@ -225,7 +228,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
         self.stubs.Set(compute_api.API, 'create', create)
 
         params = {block_device_mapping.ATTRIBUTE_NAME: self.bdm}
-        self.assertRaises(exc.HTTPBadRequest,
+        self.assertRaises(self.validation_error,
                           self._test_create, params, no_image=True)
 
     def test_create_instance_bdm(self):
@@ -311,7 +314,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
 
         def _validate_bdm(*args, **kwargs):
             self.validation_fail_test_validate_called = True
-            ex, kargs = ex_iter.next()
+            ex, kargs = next(ex_iter)
             raise ex(**kargs)
 
         def _instance_destroy(*args, **kwargs):
@@ -320,7 +323,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
         self.stubs.Set(compute_api.API, '_validate_bdm', _validate_bdm)
         self.stubs.Set(objects.Instance, 'destroy', _instance_destroy)
 
-        for _unused in xrange(len(bdm_exceptions)):
+        for _unused in range(len(bdm_exceptions)):
             params = {block_device_mapping.ATTRIBUTE_NAME:
                       [self.bdm[0].copy()]}
             self.assertRaises(exc.HTTPBadRequest,
@@ -332,6 +335,7 @@ class BlockDeviceMappingTestV21(test.TestCase):
 
 
 class BlockDeviceMappingTestV2(BlockDeviceMappingTestV21):
+    validation_error = exc.HTTPBadRequest
 
     def _setup_controller(self):
         self.ext_mgr = extensions.ExtensionManager()

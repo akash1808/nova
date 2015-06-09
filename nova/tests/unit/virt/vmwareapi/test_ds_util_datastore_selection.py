@@ -14,7 +14,8 @@
 import collections
 import re
 
-from oslo.utils import units
+from oslo_utils import units
+from oslo_vmware.objects import datastore as ds_obj
 
 from nova import test
 from nova.virt.vmwareapi import ds_util
@@ -62,7 +63,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
 
     def test_filter_datastores_simple(self):
         datastores = self.build_result_set(self.data)
-        best_match = ds_util.Datastore(ref='fake_ref', name='ds',
+        best_match = ds_obj.Datastore(ref='fake_ref', name='ds',
                               capacity=0, freespace=0)
         rec = ds_util._select_datastore(None, datastores, best_match)
 
@@ -76,7 +77,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
         data = []
         datastores = self.build_result_set(data)
 
-        best_match = ds_util.Datastore(ref='fake_ref', name='ds',
+        best_match = ds_obj.Datastore(ref='fake_ref', name='ds',
                               capacity=0, freespace=0)
         rec = ds_util._select_datastore(None, datastores, best_match)
 
@@ -86,7 +87,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
         datastores = self.build_result_set(self.data)
         datastore_regex = re.compile('no_match.*')
 
-        best_match = ds_util.Datastore(ref='fake_ref', name='ds',
+        best_match = ds_obj.Datastore(ref='fake_ref', name='ds',
                               capacity=0, freespace=0)
         rec = ds_util._select_datastore(None, datastores,
                                         best_match,
@@ -110,7 +111,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
         datastores = self.build_result_set(data)
         datastore_regex = re.compile('.*-good$')
 
-        best_match = ds_util.Datastore(ref='fake_ref', name='ds',
+        best_match = ds_obj.Datastore(ref='fake_ref', name='ds',
                               capacity=0, freespace=0)
         rec = ds_util._select_datastore(None, datastores,
                                         best_match,
@@ -136,7 +137,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
         prop_names = ['summary.type', 'summary.name',
                       'summary.capacity', 'summary.freeSpace']
         datastores = self.build_result_set(data, prop_names)
-        best_match = ds_util.Datastore(ref='fake_ref', name='ds',
+        best_match = ds_obj.Datastore(ref='fake_ref', name='ds',
                               capacity=0, freespace=0)
 
         rec = ds_util._select_datastore(None, datastores, best_match)
@@ -146,6 +147,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
         data = [
             ['VMFS', 'spam-good', True, 20 * units.Gi, 10 * units.Gi],
             ['NFS', 'eggs-good', True, 40 * units.Gi, 15 * units.Gi],
+            ['NFS41', 'nfs41-is-good', True, 35 * units.Gi, 12 * units.Gi],
             ['BAD', 'some-name-bad', True, 30 * units.Gi, 20 * units.Gi],
             ['VMFS', 'some-name-good', True, 50 * units.Gi, 5 * units.Gi],
             ['VMFS', 'some-other-good', True, 10 * units.Gi, 10 * units.Gi],
@@ -155,7 +157,7 @@ class VMwareDSUtilDatastoreSelectionTestCase(test.NoDBTestCase):
         datastore_regex = re.compile('.*-good$')
 
         # the current best match is better than all candidates
-        best_match = ds_util.Datastore(ref='ds-100', name='best-ds-good',
+        best_match = ds_obj.Datastore(ref='ds-100', name='best-ds-good',
                               capacity=20 * units.Gi, freespace=19 * units.Gi)
         rec = ds_util._select_datastore(None,
                                         datastores,

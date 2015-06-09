@@ -18,8 +18,10 @@
 WSGI middleware for OpenStack API controllers.
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import routes
+import six
 import stevedore
 import webob.dec
 import webob.exc
@@ -34,7 +36,6 @@ from nova.i18n import _LI
 from nova.i18n import _LW
 from nova.i18n import translate
 from nova import notifications
-from nova.openstack.common import log as logging
 from nova import utils
 from nova import wsgi as base_wsgi
 
@@ -90,7 +91,7 @@ class FaultWrapper(base_wsgi.Middleware):
                                   status, webob.exc.HTTPInternalServerError)()
 
     def _error(self, inner, req):
-        LOG.exception(_LE("Caught error: %s"), unicode(inner))
+        LOG.exception(_LE("Caught error: %s"), six.text_type(inner))
 
         safe = getattr(inner, 'safe', False)
         headers = getattr(inner, 'headers', None)
@@ -285,17 +286,7 @@ class APIRouterV21(base_wsgi.Router):
                     # Check the extension is not in the blacklist
                     if ext.obj.alias not in CONF.osapi_v3.extensions_blacklist:
                         return self._register_extension(ext)
-                    else:
-                        LOG.warning(_LW("Not loading %s because it is "
-                                        "in the blacklist"), ext.obj.alias)
-                        return False
-                else:
-                    LOG.warning(
-                        _LW("Not loading %s because it is not in the "
-                            "whitelist"), ext.obj.alias)
-                    return False
-            else:
-                return False
+            return False
 
         if not CONF.osapi_v3.enabled:
             LOG.info(_LI("V3 API has been disabled by configuration"))
@@ -343,6 +334,8 @@ class APIRouterV21(base_wsgi.Router):
             raise exception.CoreAPIMissing(
                 missing_apis=missing_core_extensions)
 
+        LOG.info(_LI("Loaded extensions: %s"),
+                 sorted(self.loaded_extension_info.get_extensions().keys()))
         super(APIRouterV21, self).__init__(mapper)
 
     def _register_resources_list(self, ext_list, mapper):
@@ -395,8 +388,8 @@ class APIRouterV21(base_wsgi.Router):
                 inherits = self.resources.get(resource.inherits)
                 if not resource.controller:
                     resource.controller = inherits.controller
-            wsgi_resource = wsgi.Resource(resource.controller,
-                                          inherits=inherits)
+            wsgi_resource = wsgi.ResourceV21(resource.controller,
+                                             inherits=inherits)
             self.resources[resource.collection] = wsgi_resource
             kargs = dict(
                 controller=wsgi_resource,

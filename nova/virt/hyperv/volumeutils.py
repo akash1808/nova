@@ -26,10 +26,11 @@ http://www.microsoft.com/en-us/download/details.aspx?id=34750
 import re
 import time
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from six.moves import range
 
 from nova.i18n import _
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.hyperv import basevolumeutils
 from nova.virt.hyperv import vmutils
@@ -86,7 +87,7 @@ class VolumeUtils(basevolumeutils.BaseVolumeUtils):
         if retry_count < 2:
             retry_count = 2
 
-        for attempt in xrange(retry_count):
+        for attempt in range(retry_count):
             try:
                 session_info = self.execute('iscsicli.exe', 'SessionList')
                 if session_info.find(target_iqn) == -1:

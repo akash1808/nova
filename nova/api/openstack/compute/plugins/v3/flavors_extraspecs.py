@@ -26,7 +26,7 @@ from nova import objects
 from nova import utils
 
 ALIAS = 'os-flavor-extra-specs'
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class FlavorExtraSpecsController(wsgi.Controller):
@@ -42,7 +42,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
     # NOTE(gmann): Max length for numeric value is being checked
     # explicitly as json schema cannot have max length check for numeric value
     def _check_extra_specs_value(self, specs):
-        for key, value in specs.iteritems():
+        for key, value in six.iteritems(specs):
             try:
                 if isinstance(value, (six.integer_types, float)):
                     value = six.text_type(value)
@@ -108,8 +108,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
         try:
             flavor = objects.Flavor.get_by_flavor_id(context, flavor_id)
             return {id: flavor.extra_specs[id]}
-        except (exception.FlavorExtraSpecsNotFound,
-                exception.FlavorNotFound) as e:
+        except exception.FlavorNotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
         except KeyError:
             msg = _("Flavor %(flavor_id)s has no extra specs with "
@@ -141,7 +140,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
 
 class FlavorsExtraSpecs(extensions.V3APIExtensionBase):
     """Flavors extra specs support."""
-    name = 'FlavorsExtraSpecs'
+    name = 'FlavorExtraSpecs'
     alias = ALIAS
     version = 1
 

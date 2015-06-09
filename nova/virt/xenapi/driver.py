@@ -25,13 +25,14 @@ A driver for XenServer or Xen Cloud Platform.
 
 import math
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import units
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import units
+import six
 import six.moves.urllib.parse as urlparse
 
 from nova.i18n import _, _LE, _LW
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt import driver
 from nova.virt.xenapi.client import session
@@ -186,8 +187,7 @@ class XenAPIDriver(driver.ComputeDriver):
         return self._vmops.list_instance_uuids()
 
     def spawn(self, context, instance, image_meta, injected_files,
-              admin_password, network_info=None, block_device_info=None,
-              flavor=None):
+              admin_password, network_info=None, block_device_info=None):
         """Create VM instance."""
         self._vmops.spawn(context, instance, image_meta, injected_files,
                           admin_password, network_info, block_device_info)
@@ -272,7 +272,7 @@ class XenAPIDriver(driver.ComputeDriver):
         return self._vmops.migrate_disk_and_power_off(context, instance,
                     dest, flavor, block_device_info)
 
-    def suspend(self, instance):
+    def suspend(self, context, instance):
         """suspend the specified instance."""
         self._vmops.suspend(instance)
 
@@ -351,14 +351,14 @@ class XenAPIDriver(driver.ComputeDriver):
 
         # we only care about VMs that correspond to a nova-managed
         # instance:
-        imap = dict([(inst['name'], inst['uuid']) for inst in instances])
+        imap = {inst['name']: inst['uuid'] for inst in instances}
         bwcounters = []
 
         # get a dictionary of instance names.  values are dictionaries
         # of mac addresses with values that are the bw counters:
         # e.g. {'instance-001' : { 12:34:56:78:90:12 : {'bw_in': 0, ....}}
         all_counters = self._vmops.get_all_bw_counters()
-        for instance_name, counters in all_counters.iteritems():
+        for instance_name, counters in six.iteritems(all_counters):
             if instance_name in imap:
                 # yes these are stats for a nova-managed vm
                 # correlate the stats with the nova instance uuid:
@@ -398,8 +398,7 @@ class XenAPIDriver(driver.ComputeDriver):
             return CONF.my_block_storage_ip
         return self.get_host_ip_addr()
 
-    @staticmethod
-    def get_host_ip_addr():
+    def get_host_ip_addr(self):
         xs_url = urlparse.urlparse(CONF.xenserver.connection_url)
         return xs_url.netloc
 
@@ -453,9 +452,7 @@ class XenAPIDriver(driver.ComputeDriver):
                'hypervisor_type': 'xen',
                'hypervisor_version': hyper_ver,
                'hypervisor_hostname': host_stats['host_hostname'],
-               # Todo(bobba) cpu_info may be in a format not supported by
-               # arch_filter.py - see libvirt/driver.py get_cpu_info
-               'cpu_info': jsonutils.dumps(host_stats['host_cpu_info']),
+               'cpu_info': jsonutils.dumps(host_stats['cpu_model']),
                'disk_available_least': total_disk_gb - allocated_disk_gb,
                'supported_instances': jsonutils.dumps(
                    host_stats['supported_instances']),
@@ -492,7 +489,7 @@ class XenAPIDriver(driver.ComputeDriver):
         """Do required cleanup on dest host after check_can_live_migrate calls
 
         :param context: security context
-        :param disk_over_commit: if true, allow disk over commit
+        :param dest_check_data: result of check_can_live_migrate_destination
         """
         pass
 
@@ -512,7 +509,7 @@ class XenAPIDriver(driver.ComputeDriver):
         return self._vmops.check_can_live_migrate_source(context, instance,
                                                          dest_check_data)
 
-    def get_instance_disk_info(self, instance_name,
+    def get_instance_disk_info(self, instance,
                                block_device_info=None):
         """Used by libvirt for live migration. We rely on xenapi
         checks to do this for us.
@@ -646,9 +643,9 @@ class XenAPIDriver(driver.ComputeDriver):
         """Sets the compute host's ability to accept new instances."""
         return self._host.set_host_enabled(enabled)
 
-    def get_host_uptime(self, host):
+    def get_host_uptime(self):
         """Returns the result of calling "uptime" on the target host."""
-        return self._host.get_host_uptime(host)
+        return self._host.get_host_uptime()
 
     def host_maintenance_mode(self, host, mode):
         """Start/Stop host maintenance window. On start, it triggers

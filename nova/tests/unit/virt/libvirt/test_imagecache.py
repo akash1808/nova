@@ -21,16 +21,17 @@ import os
 import time
 
 import mock
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import importutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import formatters
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 
 from nova import conductor
 from nova import context
 from nova import db
 from nova import objects
-from nova.openstack.common import log as logging
 from nova import test
 from nova.tests.unit import fake_instance
 from nova import utils
@@ -48,7 +49,7 @@ def intercept_log_messages():
         mylog = logging.getLogger('nova')
         stream = cStringIO.StringIO()
         handler = logging.logging.StreamHandler(stream)
-        handler.setFormatter(logging.ContextFormatter())
+        handler.setFormatter(formatters.ContextFormatter())
         mylog.logger.addHandler(handler)
         yield stream
     finally:
@@ -180,7 +181,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
         self.assertNotIn(unexpected, image_cache_manager.originals)
 
         self.assertEqual(1, len(image_cache_manager.back_swap_images))
-        self.assertTrue('swap_1000' in image_cache_manager.back_swap_images)
+        self.assertIn('swap_1000', image_cache_manager.back_swap_images)
 
     def test_list_backing_images_small(self):
         self.stubs.Set(os, 'listdir',
@@ -334,7 +335,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
                                (base_file3, False, True)])
 
     @contextlib.contextmanager
-    def _make_base_file(self, checksum=True):
+    def _make_base_file(self, checksum=True, lock=True):
         """Make a base file for testing."""
 
         with utils.tempdir() as tmpdir:
@@ -347,6 +348,15 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
             base_file = open(fname, 'w')
             base_file.write('data')
             base_file.close()
+
+            if lock:
+                lockdir = os.path.join(tmpdir, 'locks')
+                lockname = os.path.join(lockdir, 'nova-aaa')
+                os.mkdir(lockdir)
+                lock_file = open(lockname, 'w')
+                lock_file.write('data')
+                lock_file.close()
+
             base_file = open(fname, 'r')
 
             if checksum:
@@ -361,9 +371,14 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
             image_cache_manager._remove_base_file(fname)
             info_fname = imagecache.get_info_filename(fname)
 
+            lock_name = 'nova-' + os.path.split(fname)[-1]
+            lock_dir = os.path.join(CONF.instances_path, 'locks')
+            lock_file = os.path.join(lock_dir, lock_name)
+
             # Files are initially too new to delete
             self.assertTrue(os.path.exists(fname))
             self.assertTrue(os.path.exists(info_fname))
+            self.assertTrue(os.path.exists(lock_file))
 
             # Old files get cleaned up though
             os.utime(fname, (-1, time.time() - 3601))
@@ -371,6 +386,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
 
             self.assertFalse(os.path.exists(fname))
             self.assertFalse(os.path.exists(info_fname))
+            self.assertFalse(os.path.exists(lock_file))
 
     def test_remove_base_file_original(self):
         with self._make_base_file() as fname:
@@ -808,7 +824,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
         def fake_get_all_by_filters(context, *args, **kwargs):
             was['called'] = True
             instances = []
-            for x in xrange(2):
+            for x in range(2):
                 instances.append(fake_instance.fake_db_instance(
                                                         image_ref='1',
                                                         uuid=x,
@@ -875,8 +891,8 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
         image_cache_manager._age_and_verify_swap_images(None, '/tmp_age_test')
         self.assertEqual(1, len(expected_exist))
         self.assertEqual(1, len(expected_remove))
-        self.assertTrue('swap_128' in expected_exist)
-        self.assertTrue('swap_256' in expected_remove)
+        self.assertIn('swap_128', expected_exist)
+        self.assertIn('swap_256', expected_remove)
 
 
 class VerifyChecksumTestCase(test.NoDBTestCase):

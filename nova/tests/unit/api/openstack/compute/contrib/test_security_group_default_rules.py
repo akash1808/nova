@@ -12,16 +12,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
 import webob
 
 from nova.api.openstack.compute.contrib import \
     security_group_default_rules as security_group_default_rules_v2
 from nova.api.openstack.compute.plugins.v3 import \
     security_group_default_rules as security_group_default_rules_v21
-from nova.api.openstack import wsgi
 from nova import context
 import nova.db
 from nova import exception
@@ -69,19 +67,19 @@ class TestSecurityGroupDefaultRulesNeutronV21(test.TestCase):
         self.assertRaises(webob.exc.HTTPNotImplemented, self.controller.create,
                           req, {'security_group_default_rule': sgr})
 
-    def test_security_group_default_rules_list_not_implemented_neturon(self):
+    def test_security_group_default_rules_list_not_implemented_neutron(self):
         req = fakes.HTTPRequest.blank(
             '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPNotImplemented, self.controller.index,
                           req)
 
-    def test_security_group_default_rules_show_not_implemented_neturon(self):
+    def test_security_group_default_rules_show_not_implemented_neutron(self):
         req = fakes.HTTPRequest.blank(
             '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPNotImplemented, self.controller.show,
                           req, '602ed77c-a076-4f9b-a617-f93b847b62c5')
 
-    def test_security_group_default_rules_delete_not_implemented_neturon(self):
+    def test_security_group_default_rules_delete_not_implemented_neutron(self):
         req = fakes.HTTPRequest.blank(
             '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPNotImplemented, self.controller.delete,
@@ -100,14 +98,14 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
     def setUp(self):
         super(TestSecurityGroupDefaultRulesV21, self).setUp()
         self.controller = self.controller_cls()
+        self.req = fakes.HTTPRequest.blank(
+            '/v2/fake/os-security-group-default-rules')
 
     def test_create_security_group_default_rule(self):
         sgr = security_group_default_rule_template()
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         sgr_dict = dict(security_group_default_rule=sgr)
-        res_dict = self.controller.create(req, sgr_dict)
+        res_dict = self.controller.create(self.req, sgr_dict)
         security_group_default_rule = res_dict['security_group_default_rule']
         self.assertEqual(security_group_default_rule['ip_protocol'],
                          sgr['ip_protocol'])
@@ -122,36 +120,28 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
         sgr = security_group_default_rule_template()
         del sgr['to_port']
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_no_from_port(self):
         sgr = security_group_default_rule_template()
         del sgr['from_port']
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_no_ip_protocol(self):
         sgr = security_group_default_rule_template()
         del sgr['ip_protocol']
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_no_cidr(self):
         sgr = security_group_default_rule_template()
         del sgr['cidr']
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        res_dict = self.controller.create(req,
+        res_dict = self.controller.create(self.req,
                                           {'security_group_default_rule': sgr})
         security_group_default_rule = res_dict['security_group_default_rule']
         self.assertNotEqual(security_group_default_rule['id'], 0)
@@ -161,33 +151,25 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
     def test_create_security_group_default_rule_with_blank_to_port(self):
         sgr = security_group_default_rule_template(to_port='')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_blank_from_port(self):
         sgr = security_group_default_rule_template(from_port='')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_blank_ip_protocol(self):
         sgr = security_group_default_rule_template(ip_protocol='')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_blank_cidr(self):
         sgr = security_group_default_rule_template(cidr='')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        res_dict = self.controller.create(req,
+        res_dict = self.controller.create(self.req,
                                           {'security_group_default_rule': sgr})
         security_group_default_rule = res_dict['security_group_default_rule']
         self.assertNotEqual(security_group_default_rule['id'], 0)
@@ -197,68 +179,50 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
     def test_create_security_group_default_rule_non_numerical_to_port(self):
         sgr = security_group_default_rule_template(to_port='invalid')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_non_numerical_from_port(self):
         sgr = security_group_default_rule_template(from_port='invalid')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_invalid_ip_protocol(self):
         sgr = security_group_default_rule_template(ip_protocol='invalid')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_invalid_cidr(self):
         sgr = security_group_default_rule_template(cidr='10.10.2222.0/24')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_invalid_to_port(self):
         sgr = security_group_default_rule_template(to_port='666666')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_invalid_from_port(self):
         sgr = security_group_default_rule_template(from_port='666666')
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_create_security_group_default_rule_with_no_body(self):
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest,
-                          self.controller.create, req, None)
+                          self.controller.create, self.req, None)
 
     def test_create_duplicate_security_group_default_rule(self):
         sgr = security_group_default_rule_template()
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        self.controller.create(req, {'security_group_default_rule': sgr})
+        self.controller.create(self.req, {'security_group_default_rule': sgr})
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.create,
-                          req, {'security_group_default_rule': sgr})
+        self.assertRaises(webob.exc.HTTPConflict, self.controller.create,
+                          self.req, {'security_group_default_rule': sgr})
 
     def test_security_group_default_rules_list(self):
         self.test_create_security_group_default_rule()
@@ -269,9 +233,7 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
         ip_range=dict(cidr='10.10.10.0/24'))]
         expected = {'security_group_default_rules': rules}
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        res_dict = self.controller.index(req)
+        res_dict = self.controller.index(self.req)
         self.assertEqual(res_dict, expected)
 
     @mock.patch('nova.db.security_group_default_rule_list',
@@ -279,19 +241,15 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
                     SecurityGroupDefaultRuleNotFound("Rule Not Found")))
     def test_non_existing_security_group_default_rules_list(self,
                                                             mock_sec_grp_rule):
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPNotFound,
-                          self.controller.index, req)
+                          self.controller.index, self.req)
 
     def test_default_security_group_default_rule_show(self):
         sgr = security_group_default_rule_template(id=1)
 
         self.test_create_security_group_default_rule()
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        res_dict = self.controller.show(req, '1')
+        res_dict = self.controller.show(self.req, '1')
 
         security_group_default_rule = res_dict['security_group_default_rule']
 
@@ -309,10 +267,8 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
                     SecurityGroupDefaultRuleNotFound("Rule Not Found")))
     def test_non_existing_security_group_default_rule_show(self,
                                                            mock_sec_grp_rule):
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPNotFound,
-                          self.controller.show, req, '1')
+                          self.controller.show, self.req, '1')
 
     def test_delete_security_group_default_rule(self):
         sgr = security_group_default_rule_template(id=1)
@@ -333,9 +289,7 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
         self.stubs.Set(nova.db, 'security_group_default_rule_get',
                        return_security_group_default_rule)
 
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
-        self.controller.delete(req, '1')
+        self.controller.delete(self.req, '1')
 
         self.assertTrue(self.called)
 
@@ -344,10 +298,8 @@ class TestSecurityGroupDefaultRulesV21(test.TestCase):
                     SecurityGroupDefaultRuleNotFound("Rule Not Found")))
     def test_non_existing_security_group_default_rule_delete(
             self, mock_sec_grp_rule):
-        req = fakes.HTTPRequest.blank(
-            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
         self.assertRaises(webob.exc.HTTPNotFound,
-                          self.controller.delete, req, '1')
+                          self.controller.delete, self.req, '1')
 
     def test_security_group_ensure_default(self):
         sgr = security_group_default_rule_template(id=1)
@@ -371,177 +323,49 @@ class TestSecurityGroupDefaultRulesV2(test.TestCase):
     controller_cls = (security_group_default_rules_v2.
                       SecurityGroupDefaultRulesController)
 
-
-class TestSecurityGroupDefaultRulesXMLDeserializer(test.TestCase):
     def setUp(self):
-        super(TestSecurityGroupDefaultRulesXMLDeserializer, self).setUp()
-        deserializer = security_group_default_rules_v2.\
-            SecurityGroupDefaultRulesXMLDeserializer()
-        self.deserializer = deserializer
+        super(TestSecurityGroupDefaultRulesV2, self).setUp()
+        self.req = fakes.HTTPRequest.blank(
+            '/v2/fake/os-security-group-default-rules', use_admin_context=True)
+        self.non_admin_req = fakes.HTTPRequest.blank(
+            '/v2/fake/os-security-group-default-rules')
 
-    def test_create_request(self):
-        serial_request = """
-<security_group_default_rule>
-  <from_port>22</from_port>
-  <to_port>22</to_port>
-  <ip_protocol>TCP</ip_protocol>
-  <cidr>10.10.10.0/24</cidr>
-</security_group_default_rule>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "security_group_default_rule": {
-                "from_port": "22",
-                "to_port": "22",
-                "ip_protocol": "TCP",
-                "cidr": "10.10.10.0/24"
-            },
-        }
-        self.assertEqual(request['body'], expected)
-
-    def test_create_no_to_port_request(self):
-        serial_request = """
-<security_group_default_rule>
-  <from_port>22</from_port>
-  <ip_protocol>TCP</ip_protocol>
-  <cidr>10.10.10.0/24</cidr>
-</security_group_default_rule>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "security_group_default_rule": {
-            "from_port": "22",
-            "ip_protocol": "TCP",
-            "cidr": "10.10.10.0/24"
-            },
-        }
-        self.assertEqual(request['body'], expected)
-
-    def test_create_no_from_port_request(self):
-        serial_request = """
-<security_group_default_rule>
-  <to_port>22</to_port>
-  <ip_protocol>TCP</ip_protocol>
-  <cidr>10.10.10.0/24</cidr>
-</security_group_default_rule>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "security_group_default_rule": {
-                "to_port": "22",
-                "ip_protocol": "TCP",
-                "cidr": "10.10.10.0/24"
-            },
-        }
-        self.assertEqual(request['body'], expected)
-
-    def test_create_no_ip_protocol_request(self):
-        serial_request = """
-<security_group_default_rule>
-  <from_port>22</from_port>
-  <to_port>22</to_port>
-  <cidr>10.10.10.0/24</cidr>
-</security_group_default_rule>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "security_group_default_rule": {
-                "from_port": "22",
-                "to_port": "22",
-                "cidr": "10.10.10.0/24"
-            },
-        }
-        self.assertEqual(request['body'], expected)
-
-    def test_create_no_cidr_request(self):
-        serial_request = """
-<security_group_default_rule>
-  <from_port>22</from_port>
-  <to_port>22</to_port>
-  <ip_protocol>TCP</ip_protocol>
-</security_group_default_rule>"""
-        request = self.deserializer.deserialize(serial_request)
-        expected = {
-            "security_group_default_rule": {
-                "from_port": "22",
-                "to_port": "22",
-                "ip_protocol": "TCP",
-            },
-        }
-        self.assertEqual(request['body'], expected)
+    def test_create_security_group_default_rules_with_non_admin(self):
+        self.controller = self.controller_cls()
+        sgr = security_group_default_rule_template()
+        sgr_dict = dict(security_group_default_rule=sgr)
+        self.assertRaises(exception.AdminRequired, self.controller.create,
+                          self.non_admin_req, sgr_dict)
 
 
-class TestSecurityGroupDefaultRuleXMLSerializer(test.TestCase):
+class SecurityGroupDefaultRulesPolicyEnforcementV21(test.NoDBTestCase):
+
     def setUp(self):
-        super(TestSecurityGroupDefaultRuleXMLSerializer, self).setUp()
-        self.namespace = wsgi.XMLNS_V11
-        self.rule_serializer =\
-            security_group_default_rules_v2.SecurityGroupDefaultRuleTemplate()
-        self.index_serializer =\
-            security_group_default_rules_v2.SecurityGroupDefaultRulesTemplate()
+        super(SecurityGroupDefaultRulesPolicyEnforcementV21, self).setUp()
+        self.controller = (security_group_default_rules_v21.
+                           SecurityGroupDefaultRulesController())
+        self.req = fakes.HTTPRequest.blank('')
 
-    def _tag(self, elem):
-        tagname = elem.tag
-        self.assertEqual(tagname[0], '{')
-        tmp = tagname.partition('}')
-        namespace = tmp[0][1:]
-        self.assertEqual(namespace, self.namespace)
-        return tmp[2]
+    def _common_policy_check(self, func, *arg, **kwarg):
+        rule_name = "os_compute_api:os-security-groups"
+        rule = {rule_name: "project:non_fake"}
+        self.policy.set_rules(rule)
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized, func, *arg, **kwarg)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." %
+            rule_name, exc.format_message())
 
-    def _verify_security_group_default_rule(self, raw_rule, tree):
-        self.assertEqual(raw_rule['id'], tree.get('id'))
+    def test_create_policy_failed(self):
+        self._common_policy_check(self.controller.create, self.req, {})
 
-        seen = set()
-        expected = set(['ip_protocol', 'from_port', 'to_port', 'ip_range',
-                        'ip_range/cidr'])
+    def test_show_policy_failed(self):
+        self._common_policy_check(
+            self.controller.show, self.req, fakes.FAKE_UUID)
 
-        for child in tree:
-            child_tag = self._tag(child)
-            seen.add(child_tag)
-            if child_tag == 'ip_range':
-                for gr_child in child:
-                    gr_child_tag = self._tag(gr_child)
-                    self.assertIn(gr_child_tag, raw_rule[child_tag])
-                    seen.add('%s/%s' % (child_tag, gr_child_tag))
-                    self.assertEqual(gr_child.text,
-                                     raw_rule[child_tag][gr_child_tag])
-            else:
-                self.assertEqual(child.text, raw_rule[child_tag])
-        self.assertEqual(seen, expected)
+    def test_delete_policy_failed(self):
+        self._common_policy_check(
+            self.controller.delete, self.req, fakes.FAKE_UUID)
 
-    def test_rule_serializer(self):
-        raw_rule = dict(id='123',
-                        ip_protocol='TCP',
-                        from_port='22',
-                        to_port='22',
-                        ip_range=dict(cidr='10.10.10.0/24'))
-        rule = dict(security_group_default_rule=raw_rule)
-        text = self.rule_serializer.serialize(rule)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('security_group_default_rule', self._tag(tree))
-        self._verify_security_group_default_rule(raw_rule, tree)
-
-    def test_index_serializer(self):
-        rules = [dict(id='123',
-                      ip_protocol='TCP',
-                      from_port='22',
-                      to_port='22',
-                      ip_range=dict(cidr='10.10.10.0/24')),
-                 dict(id='234',
-                      ip_protocol='UDP',
-                      from_port='23456',
-                      to_port='234567',
-                      ip_range=dict(cidr='10.12.0.0/18')),
-                 dict(id='345',
-                      ip_protocol='tcp',
-                      from_port='3456',
-                      to_port='4567',
-                      ip_range=dict(cidr='192.168.1.0/32'))]
-
-        rules_dict = dict(security_group_default_rules=rules)
-
-        text = self.index_serializer.serialize(rules_dict)
-
-        tree = etree.fromstring(text)
-        self.assertEqual('security_group_default_rules', self._tag(tree))
-        self.assertEqual(len(rules), len(tree))
-        for idx, child in enumerate(tree):
-            self._verify_security_group_default_rule(rules[idx], child)
+    def test_index_policy_failed(self):
+        self._common_policy_check(self.controller.index, self.req)

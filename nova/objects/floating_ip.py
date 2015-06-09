@@ -21,7 +21,10 @@ from nova.objects import fields
 FLOATING_IP_OPTIONAL_ATTRS = ['fixed_ip']
 
 
-class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@obj_base.NovaObjectRegistry.register
+class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject,
+                 obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added _get_addresses_by_instance_uuid()
     # Version 1.2: FixedIP <= version 1.2
@@ -142,7 +145,7 @@ class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
         return cls._get_addresses_by_instance_uuid(context, instance['uuid'])
 
     @obj_base.remotable
-    def save(self, context):
+    def save(self):
         updates = self.obj_get_changes()
         if 'address' in updates:
             raise exception.ObjectActionError(action='save',
@@ -155,11 +158,12 @@ class FloatingIP(obj_base.NovaPersistentObject, obj_base.NovaObject):
         # relationship to the DB update method
         updates.pop('fixed_ip', None)
 
-        db_floatingip = db.floating_ip_update(context, str(self.address),
+        db_floatingip = db.floating_ip_update(self._context, str(self.address),
                                               updates)
-        self._from_db_object(context, self, db_floatingip)
+        self._from_db_object(self._context, self, db_floatingip)
 
 
+@obj_base.NovaObjectRegistry.register
 class FloatingIPList(obj_base.ObjectListBase, obj_base.NovaObject):
     # Version 1.3: FloatingIP 1.2
     # Version 1.4: FloatingIP 1.3

@@ -11,11 +11,12 @@
 #    under the License.
 
 import mock
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 import requests
 
+from nova import objects
 from nova.scheduler.filters import trusted_filter
 from nova import test
 from nova.tests.unit.scheduler import fakes
@@ -96,11 +97,9 @@ class TestTrustedFilter(test.NoDBTestCase):
         # TrustedFilter's constructor creates the attestation cache, which
         # calls to get a list of all the compute nodes.
         fake_compute_nodes = [
-            {'hypervisor_hostname': 'node1',
-             'service': {'host': 'host1'},
-            }
+            objects.ComputeNode(hypervisor_hostname='node1'),
         ]
-        with mock.patch('nova.db.compute_node_get_all') as mocked:
+        with mock.patch('nova.objects.ComputeNodeList.get_all') as mocked:
             mocked.return_value = fake_compute_nodes
             self.filt_cls = trusted_filter.TrustedFilter()
 
@@ -220,14 +219,10 @@ class TestTrustedFilter(test.NoDBTestCase):
 
     def test_trusted_filter_combine_hosts(self, req_mock):
         fake_compute_nodes = [
-            {'hypervisor_hostname': 'node1',
-             'service': {'host': 'host1'},
-            },
-            {'hypervisor_hostname': 'node2',
-             'service': {'host': 'host2'},
-            },
+            objects.ComputeNode(hypervisor_hostname='node1'),
+            objects.ComputeNode(hypervisor_hostname='node2')
         ]
-        with mock.patch('nova.db.compute_node_get_all') as mocked:
+        with mock.patch('nova.objects.ComputeNodeList.get_all') as mocked:
             mocked.return_value = fake_compute_nodes
             self.filt_cls = trusted_filter.TrustedFilter()
         oat_data = {"hosts": [{"host_name": "node1",
@@ -241,8 +236,12 @@ class TestTrustedFilter(test.NoDBTestCase):
         host = fakes.FakeHostState('host1', 'node1', {})
 
         self.filt_cls.host_passes(host, filter_properties)  # Fill the caches
-        req_mock.assert_called_once_with("POST", "PollHosts",
-                                         ["node1", "node2"])
+        self.assertTrue(req_mock.called)
+        self.assertEqual(1, req_mock.call_count)
+        call_args = list(req_mock.call_args[0])
+
+        expected_call_args = ['POST', 'PollHosts', ['node2', 'node1']]
+        self.assertJsonEqual(call_args, expected_call_args)
 
     def test_trusted_filter_trusted_and_locale_formated_vtime_passes(self,
             req_mock):

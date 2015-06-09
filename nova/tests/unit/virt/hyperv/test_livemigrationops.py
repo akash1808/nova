@@ -14,7 +14,7 @@
 #    under the License.
 
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova.tests.unit import fake_instance
 from nova.tests.unit.virt.hyperv import test_base
@@ -34,7 +34,9 @@ class LiveMigrationOpsTestCase(test_base.HyperVBaseTestCase):
         self._livemigrops._livemigrutils = mock.MagicMock()
 
     @mock.patch('nova.virt.hyperv.vmops.VMOps.copy_vm_console_logs')
-    def _test_live_migration(self, mock_copy_logs, side_effect):
+    @mock.patch('nova.virt.hyperv.vmops.VMOps.copy_vm_dvd_disks')
+    def _test_live_migration(self, mock_get_vm_dvd_paths,
+                             mock_copy_logs, side_effect):
         mock_instance = fake_instance.fake_instance_obj(self.context)
         mock_post = mock.MagicMock()
         mock_recover = mock.MagicMock()
@@ -87,6 +89,7 @@ class LiveMigrationOpsTestCase(test_base.HyperVBaseTestCase):
                                 mock_get_cached_image,
                                 mock_ebs_root_in_block_devices):
         mock_instance = fake_instance.fake_instance_obj(self.context)
+        mock_instance.image_ref = "fake_image_ref"
         mock_ebs_root_in_block_devices.return_value = None
         CONF.set_override('use_cow_images', True)
         self._livemigrops.pre_live_migration(

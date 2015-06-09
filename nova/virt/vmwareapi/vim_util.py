@@ -17,12 +17,12 @@
 The VMware API utility module.
 """
 
-from oslo.config import cfg
-from oslo.vmware import vim_util as vutil
-import suds
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_vmware import vim_util as vutil
+import six
 
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 
 vmware_opts = cfg.IntOpt('maximum_objects', default=100,
                          help='The maximum number of ObjectContent data '
@@ -46,7 +46,7 @@ def object_to_dict(obj, list_depth=1):
     are converted.
     """
     d = {}
-    for k, v in suds.sudsobject.asdict(obj).iteritems():
+    for k, v in six.iteritems(dict(obj)):
         if hasattr(v, '__keylist__'):
             d[k] = object_to_dict(v, list_depth=list_depth)
         elif isinstance(v, list):

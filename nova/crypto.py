@@ -23,24 +23,27 @@ Includes root and intermediate CAs, SSH key_pairs and x509 certificates.
 from __future__ import absolute_import
 
 import base64
+import binascii
 import os
 import re
 import string
 import struct
 
-from oslo.config import cfg
-from oslo.utils import excutils
-from oslo.utils import timeutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import timeutils
+import paramiko
 from pyasn1.codec.der import encoder as der_encoder
 from pyasn1.type import univ
+import six
 
 from nova import context
 from nova import db
 from nova import exception
 from nova.i18n import _, _LE
 from nova.openstack.common import fileutils
-from nova.openstack.common import log as logging
 from nova import paths
 from nova import utils
 
@@ -120,47 +123,54 @@ def ensure_ca_filesystem():
         start = os.getcwd()
         fileutils.ensure_tree(ca_dir)
         os.chdir(ca_dir)
-        utils.execute("sh", genrootca_sh_path)
-        os.chdir(start)
-
-
-def _generate_fingerprint(public_key_file):
-    (out, err) = utils.execute('ssh-keygen', '-q', '-l', '-f', public_key_file)
-    fingerprint = out.split(' ')[1]
-    return fingerprint
+        try:
+            utils.execute("sh", genrootca_sh_path)
+        finally:
+            os.chdir(start)
 
 
 def generate_fingerprint(public_key):
-    with utils.tempdir() as tmpdir:
-        try:
-            pubfile = os.path.join(tmpdir, 'temp.pub')
-            with open(pubfile, 'w') as f:
-                f.write(public_key)
-            return _generate_fingerprint(pubfile)
-        except processutils.ProcessExecutionError:
+    try:
+        parts = public_key.split(' ')
+        ssh_alg = parts[0]
+        pub_data = parts[1].decode('base64')
+        if ssh_alg == 'ssh-rsa':
+            pkey = paramiko.RSAKey(data=pub_data)
+        elif ssh_alg == 'ssh-dss':
+            pkey = paramiko.DSSKey(data=pub_data)
+        elif ssh_alg == 'ecdsa-sha2-nistp256':
+            pkey = paramiko.ECDSAKey(data=pub_data, validate_point=False)
+        else:
             raise exception.InvalidKeypair(
-                reason=_('failed to generate fingerprint'))
+                reason=_('Unknown ssh key type %s') % ssh_alg)
+        raw_fp = binascii.hexlify(pkey.get_fingerprint())
+        return ':'.join(a + b for a, b in zip(raw_fp[::2], raw_fp[1::2]))
+    except (IndexError, UnicodeDecodeError, binascii.Error,
+            paramiko.ssh_exception.SSHException):
+        raise exception.InvalidKeypair(
+            reason=_('failed to generate fingerprint'))
 
 
-def generate_key_pair(bits=None):
-    with utils.tempdir() as tmpdir:
-        keyfile = os.path.join(tmpdir, 'temp')
-        args = ['ssh-keygen', '-q', '-N', '', '-t', 'rsa',
-                '-f', keyfile, '-C', 'Generated-by-Nova']
-        if bits is not None:
-            args.extend(['-b', bits])
-        utils.execute(*args)
-        fingerprint = _generate_fingerprint('%s.pub' % (keyfile))
-        if not os.path.exists(keyfile):
-            raise exception.FileNotFound(keyfile)
-        with open(keyfile) as f:
-            private_key = f.read()
-        public_key_path = keyfile + '.pub'
-        if not os.path.exists(public_key_path):
-            raise exception.FileNotFound(public_key_path)
-        with open(public_key_path) as f:
-            public_key = f.read()
+def generate_x509_fingerprint(pem_key):
+    try:
+        (out, _err) = utils.execute('openssl', 'x509', '-inform', 'PEM',
+                                    '-fingerprint', '-noout',
+                                    process_input=pem_key)
+        fingerprint = string.strip(out.rpartition('=')[2])
+        return fingerprint.lower()
+    except processutils.ProcessExecutionError as ex:
+        raise exception.InvalidKeypair(
+            reason=_('failed to generate X509 fingerprint. '
+                     'Error message: %s') % ex)
 
+
+def generate_key_pair(bits=2048):
+    key = paramiko.RSAKey.generate(bits)
+    keyout = six.BytesIO()
+    key.write_private_key(keyout)
+    private_key = keyout.getvalue()
+    public_key = '%s %s Generated-by-Nova' % (key.get_name(), key.get_base64())
+    fingerprint = generate_fingerprint(public_key)
     return (private_key, public_key, fingerprint)
 
 
@@ -348,6 +358,44 @@ def generate_x509_cert(user_id, project_id, bits=2048):
             'file_name': fname}
     db.certificate_create(context.get_admin_context(), cert)
     return (private_key, signed_csr)
+
+
+def generate_winrm_x509_cert(user_id, bits=2048):
+    """Generate a cert for passwordless auth for user in project."""
+    subject = '/CN=%s' % user_id
+    upn = '%s@localhost' % user_id
+
+    with utils.tempdir() as tmpdir:
+        keyfile = os.path.abspath(os.path.join(tmpdir, 'temp.key'))
+        conffile = os.path.abspath(os.path.join(tmpdir, 'temp.conf'))
+
+        _create_x509_openssl_config(conffile, upn)
+
+        (certificate, _err) = utils.execute(
+             'openssl', 'req', '-x509', '-nodes', '-days', '3650',
+             '-config', conffile, '-newkey', 'rsa:%s' % bits,
+             '-outform', 'PEM', '-keyout', keyfile, '-subj', subject,
+             '-extensions', 'v3_req_client')
+
+        (out, _err) = utils.execute('openssl', 'pkcs12', '-export',
+                                    '-inkey', keyfile, '-password', 'pass:',
+                                    process_input=certificate)
+
+        private_key = out.encode('base64')
+        fingerprint = generate_x509_fingerprint(certificate)
+
+    return (private_key, certificate, fingerprint)
+
+
+def _create_x509_openssl_config(conffile, upn):
+    content = ("distinguished_name  = req_distinguished_name\n"
+               "[req_distinguished_name]\n"
+               "[v3_req_client]\n"
+               "extendedKeyUsage = clientAuth\n"
+               "subjectAltName = otherName:""1.3.6.1.4.1.311.20.2.3;UTF8:%s\n")
+
+    with open(conffile, 'w') as file:
+        file.write(content % upn)
 
 
 def _ensure_project_folder(project_id):

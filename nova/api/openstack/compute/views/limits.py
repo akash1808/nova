@@ -15,7 +15,8 @@
 
 import datetime
 
-from oslo.utils import timeutils
+from oslo_utils import timeutils
+import six
 
 
 class ViewBuilder(object):
@@ -58,10 +59,10 @@ class ViewBuilder(object):
 
         """
         limits = {}
-        for name, value in absolute_limits.iteritems():
+        for name, value in six.iteritems(absolute_limits):
             if name in self.limit_names and value is not None:
-                for name in self.limit_names[name]:
-                    limits[name] = value
+                for limit_name in self.limit_names[name]:
+                    limits[limit_name] = value
         return limits
 
     def _build_rate_limits(self, rate_limits):

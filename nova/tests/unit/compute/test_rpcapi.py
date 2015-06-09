@@ -19,13 +19,12 @@ Unit Tests for nova.compute.rpcapi
 import contextlib
 
 import mock
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+from oslo_serialization import jsonutils
 
 from nova.compute import rpcapi as compute_rpcapi
 from nova import context
 from nova.objects import block_device as objects_block_dev
-from nova.objects import network_request as objects_network_request
 from nova import test
 from nova.tests.unit import fake_block_device
 from nova.tests.unit import fake_instance
@@ -33,7 +32,7 @@ from nova.tests.unit import fake_instance
 CONF = cfg.CONF
 
 
-class ComputeRpcAPITestCase(test.TestCase):
+class ComputeRpcAPITestCase(test.NoDBTestCase):
 
     def setUp(self):
         super(ComputeRpcAPITestCase, self).setUp()
@@ -42,17 +41,14 @@ class ComputeRpcAPITestCase(test.TestCase):
                          'instance_type_id': 1}
         self.fake_instance_obj = fake_instance.fake_instance_obj(self.context,
                                                    **instance_attr)
-        self.fake_instance = jsonutils.to_primitive(self.fake_instance_obj)
-        self.fake_volume_bdm = jsonutils.to_primitive(
-                fake_block_device.FakeDbBlockDeviceDict(
+        self.fake_volume_bdm = objects_block_dev.BlockDeviceMapping(
+                **fake_block_device.FakeDbBlockDeviceDict(
                     {'source_type': 'volume', 'destination_type': 'volume',
-                     'instance_uuid': self.fake_instance['uuid'],
+                     'instance_uuid': self.fake_instance_obj.uuid,
                      'volume_id': 'fake-volume-id'}))
 
-    def test_serialized_instance_has_name(self):
-        self.assertIn('name', self.fake_instance)
-
-    def _test_compute_api(self, method, rpc_method, **kwargs):
+    def _test_compute_api(self, method, rpc_method,
+                          assert_dict=False, **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
 
         rpcapi = kwargs.pop('rpcapi_class', compute_rpcapi.ComputeAPI)()
@@ -60,22 +56,18 @@ class ComputeRpcAPITestCase(test.TestCase):
         self.assertEqual(rpcapi.client.target.topic, CONF.compute_topic)
 
         orig_prepare = rpcapi.client.prepare
-        expected_version = kwargs.pop('version', rpcapi.client.target.version)
+        base_version = rpcapi.client.target.version
+        expected_version = kwargs.pop('version', base_version)
 
         expected_kwargs = kwargs.copy()
-        if ('requested_networks' in expected_kwargs and
-               expected_version == '3.23'):
-            expected_kwargs['requested_networks'] = []
-            for requested_network in kwargs['requested_networks']:
-                expected_kwargs['requested_networks'].append(
-                    (requested_network.network_id,
-                     str(requested_network.address),
-                     requested_network.port_id))
         if 'host_param' in expected_kwargs:
             expected_kwargs['host'] = expected_kwargs.pop('host_param')
         else:
             expected_kwargs.pop('host', None)
-        expected_kwargs.pop('destination', None)
+
+        if assert_dict:
+            expected_kwargs['instance'] = jsonutils.to_primitive(
+                expected_kwargs['instance'])
 
         cast_and_call = ['confirm_resize', 'stop_instance']
         if rpc_method == 'call' and method in cast_and_call:
@@ -85,8 +77,6 @@ class ComputeRpcAPITestCase(test.TestCase):
                 kwargs['do_cast'] = False
         if 'host' in kwargs:
             host = kwargs['host']
-        elif 'destination' in kwargs:
-            host = kwargs['destination']
         elif 'instances' in kwargs:
             host = kwargs['instances'][0]['host']
         else:
@@ -100,7 +90,10 @@ class ComputeRpcAPITestCase(test.TestCase):
             rpc_mock, prepare_mock, csv_mock
         ):
             prepare_mock.return_value = rpcapi.client
-            if 'return_bdm_object' in kwargs:
+            if '_return_value' in kwargs:
+                rpc_mock.return_value = kwargs.pop('_return_value')
+                del expected_kwargs['_return_value']
+            elif 'return_bdm_object' in kwargs:
                 del kwargs['return_bdm_object']
                 rpc_mock.return_value = objects_block_dev.BlockDeviceMapping()
             elif rpc_method == 'call':
@@ -125,37 +118,26 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_add_fixed_ip_to_instance(self):
         self._test_compute_api('add_fixed_ip_to_instance', 'cast',
                 instance=self.fake_instance_obj, network_id='id',
-                version='3.12')
+                version='4.0')
 
     def test_attach_interface(self):
         self._test_compute_api('attach_interface', 'call',
                 instance=self.fake_instance_obj, network_id='id',
-                port_id='id2', version='3.17', requested_ip='192.168.1.50')
+                port_id='id2', version='4.0', requested_ip='192.168.1.50')
 
     def test_attach_volume(self):
         self._test_compute_api('attach_volume', 'cast',
-                instance=self.fake_instance_obj, volume_id='id',
-                mountpoint='mp', bdm=self.fake_volume_bdm, version='3.16')
+                instance=self.fake_instance_obj, bdm=self.fake_volume_bdm,
+                version='4.0')
 
     def test_change_instance_metadata(self):
         self._test_compute_api('change_instance_metadata', 'cast',
-                instance=self.fake_instance_obj, diff={}, version='3.7')
-
-    def test_check_can_live_migrate_destination(self):
-        self._test_compute_api('check_can_live_migrate_destination', 'call',
-                instance=self.fake_instance_obj,
-                destination='dest', block_migration=True,
-                disk_over_commit=True, version='3.32')
-
-    def test_check_can_live_migrate_source(self):
-        self._test_compute_api('check_can_live_migrate_source', 'call',
-                instance=self.fake_instance_obj,
-                dest_check_data={"test": "data"}, version='3.32')
+                instance=self.fake_instance_obj, diff={}, version='4.0')
 
     def test_check_instance_shared_storage(self):
         self._test_compute_api('check_instance_shared_storage', 'call',
                 instance=self.fake_instance_obj, data='foo',
-                version='3.29')
+                version='4.0')
 
     def test_confirm_resize_cast(self):
         self._test_compute_api('confirm_resize', 'cast',
@@ -169,13 +151,13 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_detach_interface(self):
         self._test_compute_api('detach_interface', 'cast',
-                version='3.17', instance=self.fake_instance_obj,
+                version='4.0', instance=self.fake_instance_obj,
                 port_id='fake_id')
 
     def test_detach_volume(self):
         self._test_compute_api('detach_volume', 'cast',
                 instance=self.fake_instance_obj, volume_id='id',
-                version='3.25')
+                version='4.0')
 
     def test_finish_resize(self):
         self._test_compute_api('finish_resize', 'cast',
@@ -191,7 +173,7 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_get_console_output(self):
         self._test_compute_api('get_console_output', 'call',
                 instance=self.fake_instance_obj, tail_length='tl',
-                version='3.28')
+                version='4.0')
 
     def test_get_console_pool_info(self):
         self._test_compute_api('get_console_pool_info', 'call',
@@ -202,36 +184,37 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_get_diagnostics(self):
         self._test_compute_api('get_diagnostics', 'call',
-                instance=self.fake_instance_obj, version='3.18')
+                instance=self.fake_instance_obj, version='4.0')
 
     def test_get_instance_diagnostics(self):
         self._test_compute_api('get_instance_diagnostics', 'call',
-                instance=self.fake_instance, version='3.31')
+                assert_dict=True, instance=self.fake_instance_obj,
+                version='4.0')
 
     def test_get_vnc_console(self):
         self._test_compute_api('get_vnc_console', 'call',
                 instance=self.fake_instance_obj, console_type='type',
-                version='3.2')
+                version='4.0')
 
     def test_get_spice_console(self):
         self._test_compute_api('get_spice_console', 'call',
                 instance=self.fake_instance_obj, console_type='type',
-                version='3.1')
+                version='4.0')
 
     def test_get_rdp_console(self):
         self._test_compute_api('get_rdp_console', 'call',
                 instance=self.fake_instance_obj, console_type='type',
-                version='3.10')
+                version='4.0')
 
     def test_get_serial_console(self):
         self._test_compute_api('get_serial_console', 'call',
-                instance=self.fake_instance, console_type='serial',
-                version='3.34')
+                instance=self.fake_instance_obj, console_type='serial',
+                version='4.0')
 
     def test_validate_console_port(self):
         self._test_compute_api('validate_console_port', 'call',
                 instance=self.fake_instance_obj, port="5900",
-                console_type="novnc", version='3.3')
+                console_type="novnc", version='4.0')
 
     def test_host_maintenance_mode(self):
         self._test_compute_api('host_maintenance_mode', 'call',
@@ -249,12 +232,12 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('live_migration', 'cast',
                 instance=self.fake_instance_obj, dest='dest',
                 block_migration='blockity_block', host='tsoh',
-                migrate_data={}, version='3.26')
+                migrate_data={}, version='4.0')
 
     def test_post_live_migration_at_destination(self):
         self._test_compute_api('post_live_migration_at_destination', 'cast',
                 instance=self.fake_instance_obj,
-                block_migration='block_migration', host='host', version='3.14')
+                block_migration='block_migration', host='host', version='4.0')
 
     def test_pause_instance(self):
         self._test_compute_api('pause_instance', 'cast',
@@ -272,13 +255,13 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_restore_instance(self):
         self._test_compute_api('restore_instance', 'cast',
-                instance=self.fake_instance_obj, version='3.20')
+                instance=self.fake_instance_obj, version='4.0')
 
     def test_pre_live_migration(self):
         self._test_compute_api('pre_live_migration', 'call',
                 instance=self.fake_instance_obj,
                 block_migration='block_migration', disk='disk', host='host',
-                migrate_data=None, version='3.19')
+                migrate_data=None, version='4.0')
 
     def test_prep_resize(self):
         self._test_compute_api('prep_resize', 'cast',
@@ -287,7 +270,7 @@ class ComputeRpcAPITestCase(test.TestCase):
                 reservations=list('fake_res'),
                 request_spec='fake_spec',
                 filter_properties={'fakeprop': 'fakeval'},
-                node='node')
+                node='node', clean_shutdown=True, version='4.0')
 
     def test_reboot_instance(self):
         self.maxDiff = None
@@ -301,13 +284,14 @@ class ComputeRpcAPITestCase(test.TestCase):
                 injected_files='None', image_ref='None', orig_image_ref='None',
                 bdms=[], instance=self.fake_instance_obj, host='new_host',
                 orig_sys_metadata=None, recreate=True, on_shared_storage=True,
-                preserve_ephemeral=True, version='3.21')
+                preserve_ephemeral=True, version='4.0')
 
     def test_reserve_block_device_name(self):
         self._test_compute_api('reserve_block_device_name', 'call',
                 instance=self.fake_instance_obj, device='device',
                 volume_id='id', disk_bus='ide', device_type='cdrom',
-                version='3.35', return_bdm_object=True)
+                version='4.0',
+                _return_value=objects_block_dev.BlockDeviceMapping())
 
     def refresh_provider_fw_rules(self):
         self._test_compute_api('refresh_provider_fw_rules', 'cast',
@@ -315,13 +299,16 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_refresh_security_group_rules(self):
         self._test_compute_api('refresh_security_group_rules', 'cast',
-                rpcapi_class=compute_rpcapi.SecurityGroupAPI,
-                security_group_id='id', host='host')
+                security_group_id='id', host='host', version='4.0')
 
     def test_refresh_security_group_members(self):
         self._test_compute_api('refresh_security_group_members', 'cast',
-                rpcapi_class=compute_rpcapi.SecurityGroupAPI,
-                security_group_id='id', host='host')
+                security_group_id='id', host='host', version='4.0')
+
+    def test_refresh_instance_security_rules(self):
+        self._test_compute_api('refresh_instance_security_rules', 'cast',
+                host='fake_host', instance=self.fake_instance_obj,
+                version='4.0', assert_dict=True)
 
     def test_remove_aggregate_host(self):
         self._test_compute_api('remove_aggregate_host', 'cast',
@@ -331,44 +318,29 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_remove_fixed_ip_from_instance(self):
         self._test_compute_api('remove_fixed_ip_from_instance', 'cast',
                 instance=self.fake_instance_obj, address='addr',
-                version='3.13')
+                version='4.0')
 
     def test_remove_volume_connection(self):
         self._test_compute_api('remove_volume_connection', 'call',
-                instance=self.fake_instance, volume_id='id', host='host',
-                version='3.30')
+                instance=self.fake_instance_obj, volume_id='id', host='host',
+                version='4.0')
 
     def test_rescue_instance(self):
-        self.flags(compute='3.9', group='upgrade_levels')
-        self._test_compute_api('rescue_instance', 'cast',
-            instance=self.fake_instance_obj, rescue_password='pw',
-            version='3.9')
-        self.flags(compute='3.24', group='upgrade_levels')
-        self._test_compute_api('rescue_instance', 'cast',
-            instance=self.fake_instance_obj, rescue_password='pw',
-            rescue_image_ref='fake_image_ref', version='3.24')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('rescue_instance', 'cast',
             instance=self.fake_instance_obj, rescue_password='pw',
             rescue_image_ref='fake_image_ref',
-            clean_shutdown=True, version='3.37')
+            clean_shutdown=True, version='4.0')
 
     def test_reset_network(self):
         self._test_compute_api('reset_network', 'cast',
                 instance=self.fake_instance_obj)
 
     def test_resize_instance(self):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('resize_instance', 'cast',
-                instance=self.fake_instance_obj, migration={'id': 'fake_id'},
-                image='image', instance_type={'id': 1},
-                reservations=list('fake_res'), version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('resize_instance', 'cast',
                 instance=self.fake_instance_obj, migration={'id': 'fake_id'},
                 image='image', instance_type={'id': 1},
                 reservations=list('fake_res'),
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='4.0')
 
     def test_resume_instance(self):
         self._test_compute_api('resume_instance', 'cast',
@@ -379,23 +351,10 @@ class ComputeRpcAPITestCase(test.TestCase):
                 instance=self.fake_instance_obj, migration={'id': 'fake_id'},
                 host='host', reservations=list('fake_res'))
 
-    def test_rollback_live_migration_at_destination(self):
-        self._test_compute_api('rollback_live_migration_at_destination',
-                'cast', instance=self.fake_instance_obj, host='host',
-                destroy_disks=True, migrate_data=None, version='3.32')
-
-    def test_run_instance(self):
-        self._test_compute_api('run_instance', 'cast',
-                instance=self.fake_instance_obj, host='fake_host',
-                request_spec='fake_spec', filter_properties={},
-                requested_networks='networks', injected_files='files',
-                admin_password='pw', is_first_time=True, node='node',
-                legacy_bdm_in_spec=False, version='3.27')
-
     def test_set_admin_password(self):
         self._test_compute_api('set_admin_password', 'call',
                 instance=self.fake_instance_obj, new_pass='pw',
-                version='3.8')
+                version='4.0')
 
     def test_set_host_enabled(self):
         self._test_compute_api('set_host_enabled', 'call',
@@ -418,22 +377,14 @@ class ComputeRpcAPITestCase(test.TestCase):
                 instance=self.fake_instance_obj)
 
     def test_stop_instance_cast(self):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('stop_instance', 'cast',
-                instance=self.fake_instance_obj, version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('stop_instance', 'cast',
                 instance=self.fake_instance_obj,
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='4.0')
 
     def test_stop_instance_call(self):
-        self.flags(compute='3.0', group='upgrade_levels')
-        self._test_compute_api('stop_instance', 'call',
-                instance=self.fake_instance_obj, version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
         self._test_compute_api('stop_instance', 'call',
                 instance=self.fake_instance_obj,
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='4.0')
 
     def test_suspend_instance(self):
         self._test_compute_api('suspend_instance', 'cast',
@@ -442,7 +393,7 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_terminate_instance(self):
         self._test_compute_api('terminate_instance', 'cast',
                 instance=self.fake_instance_obj, bdms=[],
-                reservations=['uuid1', 'uuid2'], version='3.22')
+                reservations=['uuid1', 'uuid2'], version='4.0')
 
     def test_unpause_instance(self):
         self._test_compute_api('unpause_instance', 'cast',
@@ -450,49 +401,39 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_unrescue_instance(self):
         self._test_compute_api('unrescue_instance', 'cast',
-                instance=self.fake_instance_obj, version='3.11')
+                instance=self.fake_instance_obj, version='4.0')
 
     def test_shelve_instance(self):
-        self.flags(compute='3.0', group='upgrade_levels')
         self._test_compute_api('shelve_instance', 'cast',
                 instance=self.fake_instance_obj, image_id='image_id',
-                version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
-        self._test_compute_api('shelve_instance', 'cast',
-                instance=self.fake_instance_obj, image_id='image_id',
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='4.0')
 
     def test_shelve_offload_instance(self):
-        self.flags(compute='3.0', group='upgrade_levels')
         self._test_compute_api('shelve_offload_instance', 'cast',
                 instance=self.fake_instance_obj,
-                version='3.0')
-        self.flags(compute='3.37', group='upgrade_levels')
-        self._test_compute_api('shelve_offload_instance', 'cast',
-                instance=self.fake_instance_obj,
-                clean_shutdown=True, version='3.37')
+                clean_shutdown=True, version='4.0')
 
     def test_unshelve_instance(self):
         self._test_compute_api('unshelve_instance', 'cast',
                 instance=self.fake_instance_obj, host='host', image='image',
                 filter_properties={'fakeprop': 'fakeval'}, node='node',
-                version='3.15')
+                version='4.0')
 
     def test_volume_snapshot_create(self):
         self._test_compute_api('volume_snapshot_create', 'cast',
-                instance=self.fake_instance, volume_id='fake_id',
-                create_info={}, version='3.6')
+                instance=self.fake_instance_obj, volume_id='fake_id',
+                create_info={}, version='4.0')
 
     def test_volume_snapshot_delete(self):
         self._test_compute_api('volume_snapshot_delete', 'cast',
                 instance=self.fake_instance_obj, volume_id='fake_id',
-                snapshot_id='fake_id2', delete_info={}, version='3.6')
+                snapshot_id='fake_id2', delete_info={}, version='4.0')
 
     def test_external_instance_event(self):
         self._test_compute_api('external_instance_event', 'cast',
                                instances=[self.fake_instance_obj],
                                events=['event'],
-                               version='3.23')
+                               version='4.0')
 
     def test_build_and_run_instance(self):
         self._test_compute_api('build_and_run_instance', 'cast',
@@ -501,19 +442,12 @@ class ComputeRpcAPITestCase(test.TestCase):
                 admin_password='passwd', injected_files=None,
                 requested_networks=['network1'], security_groups=None,
                 block_device_mapping=None, node='node', limits=[],
-                version='3.36')
+                version='4.0')
 
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_build_and_run_instance_icehouse_compat(self, is_neutron):
-        self.flags(compute='icehouse', group='upgrade_levels')
-        self._test_compute_api('build_and_run_instance', 'cast',
-                instance=self.fake_instance_obj, host='host', image='image',
-                request_spec={'request': 'spec'}, filter_properties=[],
-                admin_password='passwd', injected_files=None,
-                requested_networks= objects_network_request.NetworkRequestList(
-                    objects=[objects_network_request.NetworkRequest(
-                        network_id="fake_network_id", address="10.0.0.1",
-                        port_id="fake_port_id")]),
-                security_groups=None,
-                block_device_mapping=None, node='node', limits=[],
-                version='3.23')
+    def test_quiesce_instance(self):
+        self._test_compute_api('quiesce_instance', 'call',
+                instance=self.fake_instance_obj, version='4.0')
+
+    def test_unquiesce_instance(self):
+        self._test_compute_api('unquiesce_instance', 'cast',
+                instance=self.fake_instance_obj, mapping=None, version='4.0')

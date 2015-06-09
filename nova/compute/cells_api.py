@@ -16,14 +16,14 @@
 
 """Compute API that proxies via Cells Service."""
 
-from oslo import messaging
+import oslo_messaging as messaging
+from oslo_utils import excutils
 
 from nova import availability_zones
 from nova import block_device
 from nova.cells import rpcapi as cells_rpcapi
 from nova.cells import utils as cells_utils
 from nova.compute import api as compute_api
-from nova.compute import delete_types
 from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
 from nova import objects
@@ -171,16 +171,16 @@ class ComputeCellsAPI(compute_api.API):
         self._cell_type = 'api'
 
     def _cast_to_cells(self, context, instance, method, *args, **kwargs):
-        instance_uuid = instance['uuid']
-        cell_name = instance['cell_name']
+        instance_uuid = instance.uuid
+        cell_name = instance.cell_name
         if not cell_name:
             raise exception.InstanceUnknownCell(instance_uuid=instance_uuid)
         self.cells_rpcapi.cast_compute_api_method(context, cell_name,
                 method, instance_uuid, *args, **kwargs)
 
     def _call_to_cells(self, context, instance, method, *args, **kwargs):
-        instance_uuid = instance['uuid']
-        cell_name = instance['cell_name']
+        instance_uuid = instance.uuid
+        cell_name = instance.cell_name
         if not cell_name:
             raise exception.InstanceUnknownCell(instance_uuid=instance_uuid)
         return self.cells_rpcapi.call_compute_api_method(context, cell_name,
@@ -199,53 +199,47 @@ class ComputeCellsAPI(compute_api.API):
         """
         return super(ComputeCellsAPI, self).create(*args, **kwargs)
 
-    def update(self, context, instance, **kwargs):
-        """Update an instance."""
-        cell_name = instance['cell_name']
-        if cell_name and self._cell_read_only(cell_name):
-            raise exception.InstanceInvalidState(
-                    attr="vm_state",
-                    instance_uuid=instance['uuid'],
-                    state="temporary_readonly",
-                    method='update')
-        rv = super(ComputeCellsAPI, self).update(context,
-                instance, **kwargs)
-        kwargs_copy = kwargs.copy()
-        # We need to skip vm_state/task_state updates as the child
-        # cell is authoritative for these.  The admin API does
-        # support resetting state, but it has been converted to use
-        # Instance.save() with an appropriate kwarg.
-        kwargs_copy.pop('vm_state', None)
-        kwargs_copy.pop('task_state', None)
-        if kwargs_copy:
-            try:
-                self._cast_to_cells(context, instance, 'update',
-                        **kwargs_copy)
-            except exception.InstanceUnknownCell:
-                pass
-        return rv
+    def _create_block_device_mapping(self, *args, **kwargs):
+        """Don't create block device mappings in the API cell.
+
+        The child cell will create it and propagate it up to the parent cell.
+        """
+        pass
 
     def soft_delete(self, context, instance):
-        self._handle_cell_delete(context, instance, delete_types.SOFT_DELETE)
+        self._handle_cell_delete(context, instance, 'soft_delete')
 
     def delete(self, context, instance):
-        self._handle_cell_delete(context, instance, delete_types.DELETE)
+        self._handle_cell_delete(context, instance, 'delete')
 
-    def _handle_cell_delete(self, context, instance, delete_type):
-        if not instance['cell_name']:
+    def _handle_cell_delete(self, context, instance, method_name):
+        if not instance.cell_name:
+            delete_type = method_name == 'soft_delete' and 'soft' or 'hard'
             self.cells_rpcapi.instance_delete_everywhere(context,
                     instance, delete_type)
             bdms = block_device.legacy_mapping(
                 self.db.block_device_mapping_get_all_by_instance(
-                    context, instance['uuid']))
+                    context, instance.uuid))
             # NOTE(danms): If we try to delete an instance with no cell,
             # there isn't anything to salvage, so we can hard-delete here.
-            super(ComputeCellsAPI, self)._local_delete(context, instance, bdms,
-                                                       delete_type,
-                                                       self._do_delete)
+            try:
+                super(ComputeCellsAPI, self)._local_delete(context, instance,
+                                                           bdms, method_name,
+                                                           self._do_delete)
+            except exception.ObjectActionError:
+                # NOTE(alaski): We very likely got here because the host
+                # constraint in instance.destroy() failed.  This likely means
+                # that an update came up from a child cell and cell_name is
+                # set now.  If so try the delete again.
+                with excutils.save_and_reraise_exception() as exc:
+                    instance.refresh()
+                    if instance.cell_name:
+                        exc.reraise = False
+                        self._handle_cell_delete(context, instance,
+                                method_name)
             return
 
-        method = getattr(super(ComputeCellsAPI, self), delete_type)
+        method = getattr(super(ComputeCellsAPI, self), method_name)
         method(context, instance)
 
     @check_instance_cell
@@ -258,7 +252,7 @@ class ComputeCellsAPI(compute_api.API):
     def force_delete(self, context, instance):
         """Force delete a previously deleted (but not reclaimed) instance."""
         super(ComputeCellsAPI, self).force_delete(context, instance)
-        self._cast_to_cells(context, instance, delete_types.FORCE_DELETE)
+        self._cast_to_cells(context, instance, 'force_delete')
 
     @check_instance_cell
     def evacuate(self, context, instance, *args, **kwargs):
@@ -347,8 +341,8 @@ class ComputeCellsAPI(compute_api.API):
     @check_instance_cell
     def get_vnc_console(self, context, instance, console_type):
         """Get a url to a VNC Console."""
-        if not instance['host']:
-            raise exception.InstanceNotReady(instance_id=instance['uuid'])
+        if not instance.host:
+            raise exception.InstanceNotReady(instance_id=instance.uuid)
 
         connect_info = self._call_to_cells(context, instance,
                 'get_vnc_connect_info', console_type)
@@ -356,15 +350,15 @@ class ComputeCellsAPI(compute_api.API):
         self.consoleauth_rpcapi.authorize_console(context,
                 connect_info['token'], console_type, connect_info['host'],
                 connect_info['port'], connect_info['internal_access_path'],
-                instance['uuid'])
+                instance.uuid, access_url=connect_info['access_url'])
         return {'url': connect_info['access_url']}
 
     @wrap_check_policy
     @check_instance_cell
     def get_spice_console(self, context, instance, console_type):
         """Get a url to a SPICE Console."""
-        if not instance['host']:
-            raise exception.InstanceNotReady(instance_id=instance['uuid'])
+        if not instance.host:
+            raise exception.InstanceNotReady(instance_id=instance.uuid)
 
         connect_info = self._call_to_cells(context, instance,
                 'get_spice_connect_info', console_type)
@@ -372,15 +366,15 @@ class ComputeCellsAPI(compute_api.API):
         self.consoleauth_rpcapi.authorize_console(context,
                 connect_info['token'], console_type, connect_info['host'],
                 connect_info['port'], connect_info['internal_access_path'],
-                instance['uuid'])
+                instance.uuid, access_url=connect_info['access_url'])
         return {'url': connect_info['access_url']}
 
     @wrap_check_policy
     @check_instance_cell
     def get_rdp_console(self, context, instance, console_type):
         """Get a url to a RDP Console."""
-        if not instance['host']:
-            raise exception.InstanceNotReady(instance_id=instance['uuid'])
+        if not instance.host:
+            raise exception.InstanceNotReady(instance_id=instance.uuid)
 
         connect_info = self._call_to_cells(context, instance,
                 'get_rdp_connect_info', console_type)
@@ -388,15 +382,15 @@ class ComputeCellsAPI(compute_api.API):
         self.consoleauth_rpcapi.authorize_console(context,
                 connect_info['token'], console_type, connect_info['host'],
                 connect_info['port'], connect_info['internal_access_path'],
-                instance['uuid'])
+                instance.uuid, access_url=connect_info['access_url'])
         return {'url': connect_info['access_url']}
 
     @wrap_check_policy
     @check_instance_cell
     def get_serial_console(self, context, instance, console_type):
         """Get a url to a serial console."""
-        if not instance['host']:
-            raise exception.InstanceNotReady(instance_id=instance['uuid'])
+        if not instance.host:
+            raise exception.InstanceNotReady(instance_id=instance.uuid)
 
         connect_info = self._call_to_cells(context, instance,
                 'get_serial_console_connect_info', console_type)
@@ -404,7 +398,7 @@ class ComputeCellsAPI(compute_api.API):
         self.consoleauth_rpcapi.authorize_console(context,
                 connect_info['token'], console_type, connect_info['host'],
                 connect_info['port'], connect_info['internal_access_path'],
-                instance['uuid'])
+                instance.uuid, access_url=connect_info['access_url'])
         return {'url': connect_info['access_url']}
 
     @check_instance_cell
@@ -469,25 +463,6 @@ class ComputeCellsAPI(compute_api.API):
         return self.cells_rpcapi.get_migrations(context, filters)
 
 
-class ServiceProxy(object):
-    def __init__(self, obj, cell_path):
-        self._obj = obj
-        self._cell_path = cell_path
-
-    @property
-    def id(self):
-        return cells_utils.cell_with_item(self._cell_path, self._obj.id)
-
-    def __getitem__(self, key):
-        if key == 'id':
-            return self.id
-
-        return getattr(self._obj, key)
-
-    def __getattr__(self, key):
-        return getattr(self._obj, key)
-
-
 class HostAPI(compute_api.HostAPI):
     """HostAPI() class for cells.
 
@@ -509,6 +484,24 @@ class HostAPI(compute_api.HostAPI):
         """
         pass
 
+    def set_host_enabled(self, context, host_name, enabled):
+        try:
+            result = super(HostAPI, self).set_host_enabled(context, host_name,
+                    enabled)
+        except exception.CellRoutingInconsistency:
+            raise exception.HostNotFound(host=host_name)
+
+        return result
+
+    def host_power_action(self, context, host_name, action):
+        try:
+            result = super(HostAPI, self).host_power_action(context, host_name,
+                    action)
+        except exception.CellRoutingInconsistency:
+            raise exception.HostNotFound(host=host_name)
+
+        return result
+
     def get_host_uptime(self, context, host_name):
         """Returns the result of calling "uptime" on the target host."""
         return self.cells_rpcapi.get_host_uptime(context, host_name)
@@ -524,51 +517,40 @@ class HostAPI(compute_api.HostAPI):
         services = self.cells_rpcapi.service_get_all(context,
                                                      filters=filters)
         if set_zones:
+            # TODO(sbauza): set_availability_zones returns flat dicts,
+            # we should rather modify the RPC API to amend service_get_all by
+            # adding a set_zones argument
             services = availability_zones.set_availability_zones(context,
                                                                  services)
             if zone_filter is not None:
                 services = [s for s in services
                             if s['availability_zone'] == zone_filter]
-        # NOTE(johannes): Cells adds the cell path as a prefix to the id
-        # to uniquely identify the service amongst all cells. Unfortunately
-        # the object model makes the id an integer. Use a proxy here to
-        # work around this particular problem.
 
-        # Split out the cell path first
-        cell_paths = []
-        for service in services:
-            cell_path, id = cells_utils.split_cell_and_item(service['id'])
-            service['id'] = id
-            cell_paths.append(cell_path)
+            # NOTE(sbauza): As services is a list of flat dicts, we need to
+            # rehydrate the corresponding ServiceProxy objects
+            cell_paths = []
+            for service in services:
+                cell_path, id = cells_utils.split_cell_and_item(service['id'])
+                cell_path, host = cells_utils.split_cell_and_item(
+                    service['host'])
+                service['id'] = id
+                service['host'] = host
+                cell_paths.append(cell_path)
+            services = obj_base.obj_make_list(context,
+                                              objects.ServiceList(),
+                                              objects.Service,
+                                              services)
+            services = [cells_utils.ServiceProxy(s, c)
+                        for s, c in zip(services, cell_paths)]
 
-        # NOTE(danms): Currently cells does not support objects as
-        # return values, so just convert the db-formatted service objects
-        # to new-world objects here
-        services = obj_base.obj_make_list(context,
-                                          objects.ServiceList(),
-                                          objects.Service,
-                                          services)
-
-        # Now wrap it in the proxy with the original cell_path
-        services = [ServiceProxy(s, c) for s, c in zip(services, cell_paths)]
         return services
 
     def service_get_by_compute_host(self, context, host_name):
-        db_service = self.cells_rpcapi.service_get_by_compute_host(context,
-                                                                   host_name)
-        # NOTE(danms): Currently cells does not support objects as
-        # return values, so just convert the db-formatted service objects
-        # to new-world objects here
-
-        # NOTE(dheeraj): Use ServiceProxy here too. See johannes'
-        # note on service_get_all
-        if db_service:
-            cell_path, _id = cells_utils.split_cell_and_item(db_service['id'])
-            db_service['id'] = _id
-            ser_obj = objects.Service._from_db_object(context,
-                                                      objects.Service(),
-                                                      db_service)
-            return ServiceProxy(ser_obj, cell_path)
+        try:
+            return self.cells_rpcapi.service_get_by_compute_host(context,
+                    host_name)
+        except exception.CellRoutingInconsistency:
+            raise exception.ComputeHostNotFound(host=host_name)
 
     def service_update(self, context, host_name, binary, params_to_update):
         """Used to enable/disable a service. For compute services, setting to
@@ -579,21 +561,8 @@ class HostAPI(compute_api.HostAPI):
         :param binary: The name of the executable that the service runs as
         :param params_to_update: eg. {'disabled': True}
         """
-        db_service = self.cells_rpcapi.service_update(
+        return self.cells_rpcapi.service_update(
             context, host_name, binary, params_to_update)
-        # NOTE(danms): Currently cells does not support objects as
-        # return values, so just convert the db-formatted service objects
-        # to new-world objects here
-
-        # NOTE(dheeraj): Use ServiceProxy here too. See johannes'
-        # note on service_get_all
-        if db_service:
-            cell_path, _id = cells_utils.split_cell_and_item(db_service['id'])
-            db_service['id'] = _id
-            ser_obj = objects.Service._from_db_object(context,
-                                                      objects.Service(),
-                                                      db_service)
-            return ServiceProxy(ser_obj, cell_path)
 
     def service_delete(self, context, service_id):
         """Deletes the specified service."""
@@ -631,7 +600,10 @@ class HostAPI(compute_api.HostAPI):
         """Get a compute node from a particular cell by its integer ID.
         compute_id should be in the format of 'path!to!cell@ID'.
         """
-        return self.cells_rpcapi.compute_node_get(context, compute_id)
+        try:
+            return self.cells_rpcapi.compute_node_get(context, compute_id)
+        except exception.CellRoutingInconsistency:
+            raise exception.ComputeHostNotFound(host=compute_id)
 
     def compute_node_get_all(self, context):
         return self.cells_rpcapi.compute_node_get_all(context)

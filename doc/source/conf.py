@@ -34,6 +34,7 @@ extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.ifconfig',
               'sphinx.ext.graphviz',
               'oslosphinx',
+              "ext.support_matrix",
               ]
 
 todo_include_todos = True
@@ -83,9 +84,6 @@ version = version_info.version_string()
 
 # List of documents that shouldn't be included in the build.
 unused_docs = [
-    'api_ext/rst_extension_template',
-    'vmwareapi_readme',
-    'installer',
 ]
 
 # List of directories, relative to source directory, that shouldn't be searched
@@ -195,7 +193,7 @@ man_pages = [
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-#html_static_path = ['_static']
+html_static_path = ['_static']
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.

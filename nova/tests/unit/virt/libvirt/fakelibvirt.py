@@ -12,49 +12,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
-
 import time
 import uuid
 
+import fixtures
+from lxml import etree
+import six
+
 from nova.compute import arch
-from nova.i18n import _
+from nova.virt.libvirt import config as vconfig
 
 # Allow passing None to the various connect methods
 # (i.e. allow the client to rely on default URLs)
 allow_default_uri_connection = True
-
-# string indicating the CPU arch
-node_arch = arch.X86_64  # or 'i686' (or whatever else uname -m might return)
-
-# memory size in kilobytes
-node_kB_mem = 4096
-
-# the number of active CPUs
-node_cpus = 2
-
-# expected CPU frequency
-node_mhz = 800
-
-# the number of NUMA cell, 1 for unusual NUMA topologies or uniform
-# memory access; check capabilities XML for the actual NUMA topology
-node_nodes = 1  # NUMA nodes
-
-# number of CPU sockets per node if nodes > 1, total number of CPU
-# sockets otherwise
-node_sockets = 1
-
-# number of cores per socket
-node_cores = 2
-
-# number of threads per core
-node_threads = 1
-
-# CPU model
-node_cpu_model = "Penryn"
-
-# CPU vendor
-node_cpu_vendor = "Intel"
 
 # Has libvirt connection been used at least once
 connection_used = False
@@ -73,8 +43,11 @@ VIR_DOMAIN_SHUTDOWN = 4
 VIR_DOMAIN_SHUTOFF = 5
 VIR_DOMAIN_CRASHED = 6
 
+# NOTE(mriedem): These values come from include/libvirt/libvirt-domain.h
 VIR_DOMAIN_XML_SECURE = 1
 VIR_DOMAIN_XML_INACTIVE = 2
+VIR_DOMAIN_XML_UPDATE_CPU = 4
+VIR_DOMAIN_XML_MIGRATABLE = 8
 
 VIR_DOMAIN_BLOCK_REBASE_SHALLOW = 1
 VIR_DOMAIN_BLOCK_REBASE_REUSE_EXT = 2
@@ -133,15 +106,19 @@ VIR_FROM_DOMAIN = 200
 VIR_FROM_NWFILTER = 330
 VIR_FROM_REMOTE = 340
 VIR_FROM_RPC = 345
+VIR_FROM_NODEDEV = 666
 VIR_ERR_NO_SUPPORT = 3
 VIR_ERR_XML_DETAIL = 350
 VIR_ERR_NO_DOMAIN = 420
+VIR_ERR_OPERATION_FAILED = 510
 VIR_ERR_OPERATION_INVALID = 55
 VIR_ERR_OPERATION_TIMEOUT = 68
 VIR_ERR_NO_NWFILTER = 620
 VIR_ERR_SYSTEM_ERROR = 900
 VIR_ERR_INTERNAL_ERROR = 950
 VIR_ERR_CONFIG_UNSUPPORTED = 951
+VIR_ERR_NO_NODE_DEVICE = 667
+VIR_ERR_NO_SECRET = 66
 
 # Readonly
 VIR_CONNECT_RO = 1
@@ -157,10 +134,109 @@ VIR_DOMAIN_SNAPSHOT_CREATE_QUIESCE = 64
 
 # blockCommit flags
 VIR_DOMAIN_BLOCK_COMMIT_RELATIVE = 4
+# blockRebase flags
+VIR_DOMAIN_BLOCK_REBASE_RELATIVE = 8
 
 
 VIR_CONNECT_LIST_DOMAINS_ACTIVE = 1
 VIR_CONNECT_LIST_DOMAINS_INACTIVE = 2
+
+# secret type
+VIR_SECRET_USAGE_TYPE_NONE = 0
+VIR_SECRET_USAGE_TYPE_VOLUME = 1
+VIR_SECRET_USAGE_TYPE_CEPH = 2
+VIR_SECRET_USAGE_TYPE_ISCSI = 3
+
+# Libvirt version
+FAKE_LIBVIRT_VERSION = 9011
+
+
+class HostInfo(object):
+    def __init__(self, arch=arch.X86_64, kB_mem=4096,
+                 cpus=2, cpu_mhz=800, cpu_nodes=1,
+                 cpu_sockets=1, cpu_cores=2,
+                 cpu_threads=1, cpu_model="Penryn",
+                 cpu_vendor="Intel", numa_topology='',
+                 cpu_disabled=None):
+        """Create a new Host Info object
+
+        :param arch: (string) indicating the CPU arch
+                     (eg 'i686' or whatever else uname -m might return)
+        :param kB_mem: (int) memory size in KBytes
+        :param cpus: (int) the number of active CPUs
+        :param cpu_mhz: (int) expected CPU frequency
+        :param cpu_nodes: (int) the number of NUMA cell, 1 for unusual
+                          NUMA topologies or uniform
+        :param cpu_sockets: (int) number of CPU sockets per node if nodes > 1,
+                            total number of CPU sockets otherwise
+        :param cpu_cores: (int) number of cores per socket
+        :param cpu_threads: (int) number of threads per core
+        :param cpu_model: CPU model
+        :param cpu_vendor: CPU vendor
+        :param numa_topology: Numa topology
+        :param cpu_disabled: List of disabled cpus
+        """
+
+        self.arch = arch
+        self.kB_mem = kB_mem
+        self.cpus = cpus
+        self.cpu_mhz = cpu_mhz
+        self.cpu_nodes = cpu_nodes
+        self.cpu_cores = cpu_cores
+        self.cpu_threads = cpu_threads
+        self.cpu_sockets = cpu_sockets
+        self.cpu_model = cpu_model
+        self.cpu_vendor = cpu_vendor
+        self.numa_topology = numa_topology
+        self.disabled_cpus_list = cpu_disabled or []
+
+    @classmethod
+    def _gen_numa_topology(self, cpu_nodes, cpu_sockets, cpu_cores,
+                           cpu_threads, kb_mem, numa_mempages_list=None):
+
+        topology = vconfig.LibvirtConfigCapsNUMATopology()
+
+        cpu_count = 0
+        for cell_count in range(cpu_nodes):
+            cell = vconfig.LibvirtConfigCapsNUMACell()
+            cell.id = cell_count
+            cell.memory = kb_mem / cpu_nodes
+            for socket_count in range(cpu_sockets):
+                for cpu_num in range(cpu_cores * cpu_threads):
+                    cpu = vconfig.LibvirtConfigCapsNUMACPU()
+                    cpu.id = cpu_count
+                    cpu.socket_id = cell_count
+                    cpu.core_id = cpu_num // cpu_threads
+                    cpu.siblings = set([cpu_threads *
+                                       (cpu_count // cpu_threads) + thread
+                                        for thread in range(cpu_threads)])
+                    cell.cpus.append(cpu)
+
+                    cpu_count += 1
+            # Set mempages per numa cell. if numa_mempages_list is empty
+            # we will set only the default 4K pages.
+            if numa_mempages_list:
+                mempages = numa_mempages_list[cell_count]
+            else:
+                mempages = vconfig.LibvirtConfigCapsNUMAPages()
+                mempages.size = 4
+                mempages.total = cell.memory / mempages.size
+                mempages = [mempages]
+            cell.mempages = mempages
+            topology.cells.append(cell)
+
+        return topology
+
+    def get_numa_topology(self):
+        return self.numa_topology
+
+
+VIR_DOMAIN_JOB_NONE = 0
+VIR_DOMAIN_JOB_BOUNDED = 1
+VIR_DOMAIN_JOB_UNBOUNDED = 2
+VIR_DOMAIN_JOB_COMPLETED = 3
+VIR_DOMAIN_JOB_FAILED = 4
+VIR_DOMAIN_JOB_CANCELLED = 5
 
 
 def _parse_disk_info(element):
@@ -188,6 +264,31 @@ def _parse_disk_info(element):
         disk_info['target_bus'] = target.get('bus')
 
     return disk_info
+
+
+def disable_event_thread(self):
+    """Disable nova libvirt driver event thread.
+
+    The Nova libvirt driver includes a native thread which monitors
+    the libvirt event channel. In a testing environment this becomes
+    problematic because it means we've got a floating thread calling
+    sleep(1) over the life of the unit test. Seems harmless? It's not,
+    because we sometimes want to test things like retry loops that
+    should have specific sleep paterns. An unlucky firing of the
+    libvirt thread will cause a test failure.
+
+    """
+    # because we are patching a method in a class MonkeyPatch doesn't
+    # auto import correctly. Import explicitly otherwise the patching
+    # may silently fail.
+    import nova.virt.libvirt.host  # noqa
+
+    def evloop(*args, **kwargs):
+        pass
+
+    self.useFixture(fixtures.MonkeyPatch(
+        'nova.virt.libvirt.host.Host._init_events',
+        evloop))
 
 
 class libvirtError(Exception):
@@ -279,6 +380,30 @@ class NWFilter(object):
         self._connection._remove_filter(self)
 
 
+class NodeDevice(object):
+
+    def __init__(self, connection, xml=None):
+        self._connection = connection
+
+        self._xml = xml
+        if xml is not None:
+            self._parse_xml(xml)
+
+    def _parse_xml(self, xml):
+        tree = etree.fromstring(xml)
+        root = tree.find('.')
+        self._name = root.get('name')
+
+    def attach(self):
+        pass
+
+    def dettach(self):
+        pass
+
+    def reset(self):
+        pass
+
+
 class Domain(object):
     def __init__(self, connection, xml, running=False, transient=False):
         self._connection = connection
@@ -325,7 +450,7 @@ class Domain(object):
         os_type = tree.find('./os/type')
         if os_type is not None:
             os['type'] = os_type.text
-            os['arch'] = os_type.get('arch', node_arch)
+            os['arch'] = os_type.get('arch', self._connection.host_info.arch)
 
         os_kernel = tree.find('./os/kernel')
         if os_kernel is not None:
@@ -445,7 +570,7 @@ class Domain(object):
                 long(self._def['memory']),
                 long(self._def['memory']),
                 self._def['vcpu'],
-                123456789L]
+                123456789]
 
     def migrateToURI(self, desturi, flags, dname, bandwidth):
         raise make_libvirtError(
@@ -591,7 +716,7 @@ class Domain(object):
     def vcpus(self):
         vcpus = ([], [])
         for i in range(0, self._def['vcpu']):
-            vcpus[0].append((i, 1, 120405L, i))
+            vcpus[0].append((i, 1, 120405, i))
             vcpus[1].append((True, True, True, True))
         return vcpus
 
@@ -602,6 +727,12 @@ class Domain(object):
         return self._def['memory']
 
     def blockJobInfo(self, disk, flags):
+        return {}
+
+    def jobInfo(self):
+        return []
+
+    def jobStats(self, flags=0):
         return {}
 
 
@@ -615,7 +746,8 @@ class DomainSnapshot(object):
 
 
 class Connection(object):
-    def __init__(self, uri=None, readonly=False, version=9011):
+    def __init__(self, uri=None, readonly=False, version=9011,
+                 hv_version=1001000, host_info=None):
         if not uri or uri == '':
             if allow_default_uri_connection:
                 uri = 'qemu:///session'
@@ -625,9 +757,11 @@ class Connection(object):
 
         uri_whitelist = ['qemu:///system',
                          'qemu:///session',
-                         'xen:///system',
+                         'lxc:///',     # from LibvirtDriver._uri()
+                         'xen:///',     # from LibvirtDriver._uri()
                          'uml:///system',
-                         'test:///default']
+                         'test:///default',
+                         'parallels:///system']
 
         if uri not in uri_whitelist:
             raise make_libvirtError(
@@ -642,15 +776,23 @@ class Connection(object):
         self._running_vms = {}
         self._id_counter = 1  # libvirt reserves 0 for the hypervisor.
         self._nwfilters = {}
+        self._nodedevs = {}
         self._event_callbacks = {}
         self.fakeLibVersion = version
-        self.fakeVersion = version
+        self.fakeVersion = hv_version
+        self.host_info = host_info or HostInfo()
 
     def _add_filter(self, nwfilter):
         self._nwfilters[nwfilter._name] = nwfilter
 
     def _remove_filter(self, nwfilter):
         del self._nwfilters[nwfilter._name]
+
+    def _add_nodedev(self, nodedev):
+        self._nodedevs[nodedev._name] = nodedev
+
+    def _remove_nodedev(self, nodedev):
+        del self._nodedevs[nodedev._name]
 
     def _mark_running(self, dom):
         self._running_vms[self._id_counter] = dom
@@ -663,7 +805,7 @@ class Connection(object):
 
         dom._id = -1
 
-        for (k, v) in self._running_vms.iteritems():
+        for (k, v) in six.iteritems(self._running_vms):
             if v == dom:
                 del self._running_vms[k]
                 self._emit_lifecycle(dom, VIR_DOMAIN_EVENT_STOPPED, 0)
@@ -675,14 +817,14 @@ class Connection(object):
             self._emit_lifecycle(dom, VIR_DOMAIN_EVENT_UNDEFINED, 0)
 
     def getInfo(self):
-        return [node_arch,
-                node_kB_mem,
-                node_cpus,
-                node_mhz,
-                node_nodes,
-                node_sockets,
-                node_cores,
-                node_threads]
+        return [self.host_info.arch,
+                self.host_info.kB_mem,
+                self.host_info.cpus,
+                self.host_info.cpu_mhz,
+                self.host_info.cpu_nodes,
+                self.host_info.cpu_sockets,
+                self.host_info.cpu_cores,
+                self.host_info.cpu_threads]
 
     def numOfDomains(self):
         return len(self._running_vms)
@@ -759,8 +901,22 @@ class Connection(object):
     def registerCloseCallback(self, cb, opaque):
         pass
 
+    def getCPUMap(self):
+        """Return calculated CPU map from HostInfo, by default showing 2
+           online CPUs.
+        """
+        active_cpus = self.host_info.cpus
+        total_cpus = active_cpus + len(self.host_info.disabled_cpus_list)
+        cpu_map = [True if cpu_num not in self.host_info.disabled_cpus_list
+                   else False for cpu_num in range(total_cpus)]
+        return (total_cpus, cpu_map, active_cpus)
+
     def getCapabilities(self):
         """Return spoofed capabilities."""
+        numa_topology = self.host_info.get_numa_topology()
+        if isinstance(numa_topology, vconfig.LibvirtConfigCapsNUMATopology):
+            numa_topology = numa_topology.to_xml()
+
         return '''<capabilities>
   <host>
     <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
@@ -768,7 +924,7 @@ class Connection(object):
       <arch>x86_64</arch>
       <model>Penryn</model>
       <vendor>Intel</vendor>
-      <topology sockets='1' cores='2' threads='1'/>
+      <topology sockets='%(sockets)s' cores='%(cores)s' threads='%(threads)s'/>
       <feature name='xtpr'/>
       <feature name='tm2'/>
       <feature name='est'/>
@@ -789,6 +945,7 @@ class Connection(object):
         <uri_transport>tcp</uri_transport>
       </uri_transports>
     </migration_features>
+    %(topology)s
     <secmodel>
       <model>apparmor</model>
       <doi>0</doi>
@@ -986,7 +1143,10 @@ class Connection(object):
     </features>
   </guest>
 
-</capabilities>'''
+</capabilities>''' % {'sockets': self.host_info.cpu_sockets,
+                      'cores': self.host_info.cpu_cores,
+                      'threads': self.host_info.cpu_threads,
+                      'topology': numa_topology}
 
     def compareCPU(self, xml, flags):
         tree = etree.fromstring(xml)
@@ -999,12 +1159,12 @@ class Connection(object):
 
         model_node = tree.find('./model')
         if model_node is not None:
-            if model_node.text != node_cpu_model:
+            if model_node.text != self.host_info.cpu_model:
                 return VIR_CPU_COMPARE_INCOMPATIBLE
 
         vendor_node = tree.find('./vendor')
         if vendor_node is not None:
-            if vendor_node.text != node_cpu_vendor:
+            if vendor_node.text != self.host_info.cpu_vendor:
                 return VIR_CPU_COMPARE_INCOMPATIBLE
 
         # The rest of the stuff libvirt implements is rather complicated
@@ -1014,10 +1174,10 @@ class Connection(object):
 
     def getCPUStats(self, cpuNum, flag):
         if cpuNum < 2:
-            return {'kernel': 5664160000000L,
-                    'idle': 1592705190000000L,
-                    'user': 26728850000000L,
-                    'iowait': 6121490000000L}
+            return {'kernel': 5664160000000,
+                    'idle': 1592705190000000,
+                    'user': 26728850000000,
+                    'iowait': 6121490000000}
         else:
             raise make_libvirtError(
                     libvirtError,
@@ -1039,6 +1199,16 @@ class Connection(object):
         nwfilter = NWFilter(self, xml)
         self._add_filter(nwfilter)
 
+    def nodeDeviceLookupByName(self, name):
+        try:
+            return self._nodedevs[name]
+        except KeyError:
+            raise make_libvirtError(
+                    libvirtError,
+                    "no nodedev with matching name %s" % name,
+                    error_code=VIR_ERR_NO_NODE_DEVICE,
+                    error_domain=VIR_FROM_NODEDEV)
+
     def listDefinedDomains(self):
         return []
 
@@ -1048,24 +1218,41 @@ class Connection(object):
     def baselineCPU(self, cpu, flag):
         """Add new libvirt API."""
         return """<cpu mode='custom' match='exact'>
-                    <model fallback='allow'>Westmere</model>
+                    <model>Penryn</model>
                     <vendor>Intel</vendor>
+                    <feature name='xtpr'/>
+                    <feature name='tm2'/>
+                    <feature name='est'/>
+                    <feature name='vmx'/>
+                    <feature name='ds_cpl'/>
+                    <feature name='monitor'/>
+                    <feature name='pbe'/>
+                    <feature name='tm'/>
+                    <feature name='ht'/>
+                    <feature name='ss'/>
+                    <feature name='acpi'/>
+                    <feature name='ds'/>
+                    <feature name='vme'/>
                     <feature policy='require' name='aes'/>
                   </cpu>"""
 
+    def secretLookupByUsage(self, usage_type_obj, usage_id):
+        pass
 
-def openAuth(uri, auth, flags):
+    def secretDefineXML(self, xml):
+        pass
+
+
+def openAuth(uri, auth, flags=0):
 
     if type(auth) != list:
-        raise Exception(_("Expected a list for 'auth' parameter"))
+        raise Exception("Expected a list for 'auth' parameter")
 
     if type(auth[0]) != list:
-        raise Exception(
-            _("Expected a function in 'auth[0]' parameter"))
+        raise Exception("Expected a function in 'auth[0]' parameter")
 
     if not callable(auth[1]):
-        raise Exception(
-            _("Expected a function in 'auth[1]' parameter"))
+        raise Exception("Expected a function in 'auth[1]' parameter")
 
     return Connection(uri, (flags == VIR_CONNECT_RO))
 
@@ -1076,8 +1263,8 @@ def virEventRunDefaultImpl():
 
 def virEventRegisterDefaultImpl():
     if connection_used:
-        raise Exception(_("virEventRegisterDefaultImpl() must be \
-            called before connection is used."))
+        raise Exception("virEventRegisterDefaultImpl() must be "
+                        "called before connection is used.")
 
 
 def registerErrorHandler(handler, ctxt):
@@ -1103,6 +1290,16 @@ def make_libvirtError(error_class, msg, error_code=None,
 
 
 virDomain = Domain
-
+virNodeDevice = NodeDevice
 
 virConnect = Connection
+
+
+class FakeLibvirtFixture(fixtures.Fixture):
+    """Performs global setup/stubbing for all libvirt tests.
+    """
+
+    def setUp(self):
+        super(FakeLibvirtFixture, self).setUp()
+
+        disable_event_thread(self)

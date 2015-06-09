@@ -16,10 +16,10 @@
 
 """Tests for the testing base code."""
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
 
-from nova.openstack.common import log as logging
 from nova import rpc
 from nova import test
 from nova.tests import fixtures
@@ -51,6 +51,41 @@ class IsolationTestCase(test.TestCase):
                                                  server=CONF.host),
                                 endpoints=[NeverCalled()])
         server.start()
+
+
+class JsonTestCase(test.TestCase):
+    def test_json_equal(self):
+        expected = {
+            "employees": [
+                {"firstName": "Anna", "lastName": "Smith"},
+                {"firstName": "John", "lastName": "Doe"},
+                {"firstName": "Peter", "lastName": "Jones"}
+            ],
+            "locations": set(['Boston', 'Mumbai', 'Beijing', 'Perth'])
+        }
+        observed = """{
+    "employees": [
+        {
+            "lastName": "Doe",
+            "firstName": "John"
+        },
+        {
+            "lastName": "Smith",
+            "firstName": "Anna"
+        },
+        {
+            "lastName": "Jones",
+            "firstName": "Peter"
+        }
+    ],
+    "locations": [
+        "Perth",
+        "Boston",
+        "Mumbai",
+        "Beijing"
+    ]
+}"""
+        self.assertJsonEqual(expected, observed)
 
 
 class BadLogTestCase(test.TestCase):

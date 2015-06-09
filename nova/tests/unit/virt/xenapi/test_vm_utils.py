@@ -20,12 +20,12 @@ from eventlet import greenthread
 import fixtures
 import mock
 from mox3 import mox
-from oslo.config import cfg
-from oslo.config import fixture as config_fixture
-from oslo.utils import timeutils
-from oslo.utils import units
 from oslo_concurrency import lockutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_config import fixture as config_fixture
+from oslo_utils import timeutils
+from oslo_utils import units
 import six
 
 from nova.compute import flavors
@@ -33,9 +33,9 @@ from nova.compute import power_state
 from nova.compute import vm_mode
 from nova import context
 from nova import exception
-from nova.i18n import _
 from nova import objects
 from nova import test
+from nova.tests.unit import fake_instance
 from nova.tests.unit.objects import test_flavor
 from nova.tests.unit.virt.xenapi import stubs
 from nova.tests.unit.virt.xenapi import test_xenapi
@@ -517,9 +517,9 @@ class ResizeHelpersTestCase(VMUtilsTestBase):
 
     def test_log_progress_if_required(self):
         self.mox.StubOutWithMock(vm_utils.LOG, "debug")
-        vm_utils.LOG.debug(_("Sparse copy in progress, "
-                             "%(complete_pct).2f%% complete. "
-                             "%(left)s bytes left to copy"),
+        vm_utils.LOG.debug("Sparse copy in progress, "
+                           "%(complete_pct).2f%% complete. "
+                           "%(left)s bytes left to copy",
                            {"complete_pct": 50.0, "left": 1})
         current = timeutils.utcnow()
         timeutils.set_time_override(current)
@@ -975,6 +975,15 @@ class UnplugVbdTestCase(VMUtilsTestBase):
         self.assertEqual(11, session.call_xenapi.call_count)
         self.assertEqual(10, mock_sleep.call_count)
 
+    def _test_uplug_vbd_retries_with_neg_val(self):
+        session = _get_fake_session()
+        self.flags(num_vbd_unplug_retries=-1, group='xenserver')
+        vbd_ref = "vbd_ref"
+        vm_ref = 'vm_ref'
+
+        vm_utils.unplug_vbd(session, vbd_ref, vm_ref)
+        self.assertEqual(1, session.call_xenapi.call_count)
+
     @mock.patch.object(greenthread, 'sleep')
     def test_uplug_vbd_retries_on_rejected(self, mock_sleep):
         self._test_uplug_vbd_retries(mock_sleep,
@@ -994,7 +1003,7 @@ class VDIOtherConfigTestCase(VMUtilsTestBase):
     def setUp(self):
         super(VDIOtherConfigTestCase, self).setUp()
 
-        class _FakeSession():
+        class _FakeSession(object):
             def call_xenapi(self, operation, *args, **kwargs):
                 # VDI.add_to_other_config -> VDI_add_to_other_config
                 method = getattr(self, operation.replace('.', '_'), None)
@@ -1578,38 +1587,41 @@ class CreateVmTestCase(VMUtilsTestBase):
 
 
 class DetermineVmModeTestCase(VMUtilsTestBase):
+    def _fake_object(self, updates):
+        return fake_instance.fake_instance_obj(None, **updates)
+
     def test_determine_vm_mode_returns_xen_mode(self):
-        instance = {"vm_mode": "xen"}
+        instance = self._fake_object({"vm_mode": "xen"})
         self.assertEqual(vm_mode.XEN,
             vm_utils.determine_vm_mode(instance, None))
 
     def test_determine_vm_mode_returns_hvm_mode(self):
-        instance = {"vm_mode": "hvm"}
+        instance = self._fake_object({"vm_mode": "hvm"})
         self.assertEqual(vm_mode.HVM,
             vm_utils.determine_vm_mode(instance, None))
 
     def test_determine_vm_mode_returns_xen_for_linux(self):
-        instance = {"vm_mode": None, "os_type": "linux"}
+        instance = self._fake_object({"vm_mode": None, "os_type": "linux"})
         self.assertEqual(vm_mode.XEN,
             vm_utils.determine_vm_mode(instance, None))
 
     def test_determine_vm_mode_returns_hvm_for_windows(self):
-        instance = {"vm_mode": None, "os_type": "windows"}
+        instance = self._fake_object({"vm_mode": None, "os_type": "windows"})
         self.assertEqual(vm_mode.HVM,
             vm_utils.determine_vm_mode(instance, None))
 
     def test_determine_vm_mode_returns_hvm_by_default(self):
-        instance = {"vm_mode": None, "os_type": None}
+        instance = self._fake_object({"vm_mode": None, "os_type": None})
         self.assertEqual(vm_mode.HVM,
             vm_utils.determine_vm_mode(instance, None))
 
     def test_determine_vm_mode_returns_xen_for_VHD(self):
-        instance = {"vm_mode": None, "os_type": None}
+        instance = self._fake_object({"vm_mode": None, "os_type": None})
         self.assertEqual(vm_mode.XEN,
             vm_utils.determine_vm_mode(instance, vm_utils.ImageType.DISK_VHD))
 
     def test_determine_vm_mode_returns_xen_for_DISK(self):
-        instance = {"vm_mode": None, "os_type": None}
+        instance = self._fake_object({"vm_mode": None, "os_type": None})
         self.assertEqual(vm_mode.XEN,
             vm_utils.determine_vm_mode(instance, vm_utils.ImageType.DISK))
 
@@ -1944,6 +1956,23 @@ class ImportMigratedDisksTestCase(VMUtilsTestBase):
         mock_root.assert_called_once_with(session, instance)
         mock_ephemeral.assert_called_once_with(session, instance)
 
+    @mock.patch.object(vm_utils, '_import_migrate_ephemeral_disks')
+    @mock.patch.object(vm_utils, '_import_migrated_root_disk')
+    def test_import_all_migrated_disks_import_root_false(self, mock_root,
+            mock_ephemeral):
+        session = "session"
+        instance = "instance"
+        mock_root.return_value = "root_vdi"
+        mock_ephemeral.return_value = ["a", "b"]
+
+        result = vm_utils.import_all_migrated_disks(session, instance,
+                import_root=False)
+
+        expected = {'root': None, 'ephemerals': ["a", "b"]}
+        self.assertEqual(expected, result)
+        self.assertEqual(0, mock_root.call_count)
+        mock_ephemeral.assert_called_once_with(session, instance)
+
     @mock.patch.object(vm_utils, '_import_migrated_vhds')
     def test_import_migrated_root_disk(self, mock_migrate):
         mock_migrate.return_value = "foo"
@@ -2235,7 +2264,7 @@ class ChildVHDsTestCase(test.NoDBTestCase):
 
         result = vm_utils._child_vhds("session", "sr_ref", ["my-uuid"])
 
-        self.assertEqual(['uuid-child', 'uuid-child-snap'], result)
+        self.assertJsonEqual(['uuid-child', 'uuid-child-snap'], result)
 
     @mock.patch.object(vm_utils, '_get_all_vdis_in_sr')
     def test_child_vhds_only_snapshots(self, mock_get_all):
@@ -2423,6 +2452,6 @@ class VMInfoTests(VMUtilsTestBase):
 
         info = vm_utils.compile_info(self.session, "dummy")
         self.assertEqual(hardware.InstanceInfo(state=power_state.RUNNING,
-                                               max_mem_kb=10L, mem_kb=9L,
+                                               max_mem_kb=10, mem_kb=9,
                                                num_cpu='5', cpu_time_ns=0),
                          info)

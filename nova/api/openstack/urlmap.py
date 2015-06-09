@@ -16,10 +16,10 @@
 import re
 import urllib2
 
+from oslo_log import log as logging
 import paste.urlmap
 
 from nova.api.openstack import wsgi
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ def parse_options_header(value):
         return '', {}
 
     parts = _tokenize(';' + value)
-    name = parts.next()[0]
+    name = next(parts)[0]
     extra = dict(parts)
     return name, extra
 
@@ -131,14 +131,6 @@ class Accept(object):
                     best_match = content_mask
 
         return best_content_type, best_params
-
-    def content_type_params(self, best_content_type):
-        """Find parameters in Accept header for given content type."""
-        for content_type, params in self._content_types:
-            if best_content_type == content_type:
-                return params
-
-        return {}
 
     def _match_mask(self, mask, content_type):
         if '*' not in mask:

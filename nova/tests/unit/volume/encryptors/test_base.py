@@ -15,14 +15,16 @@
 
 import mock
 
-from nova.i18n import _LE
 from nova import keymgr
 from nova import test
 from nova.tests.unit.keymgr import fake
 from nova.volume import encryptors
+from nova.volume.encryptors import cryptsetup
+from nova.volume.encryptors import luks
+from nova.volume.encryptors import nop
 
 
-class VolumeEncryptorTestCase(test.TestCase):
+class VolumeEncryptorTestCase(test.NoDBTestCase):
     def _create(self, device_path):
         pass
 
@@ -40,6 +42,38 @@ class VolumeEncryptorTestCase(test.TestCase):
         }
         self.encryptor = self._create(self.connection_info)
 
+    def test_get_encryptors(self):
+        encryption = {'control_location': 'front-end',
+                      'provider': 'LuksEncryptor'}
+        encryptor = encryptors.get_volume_encryptor(self.connection_info,
+                                                    **encryption)
+        self.assertIsInstance(encryptor,
+                              luks.LuksEncryptor,
+                              "encryptor is not an instance of LuksEncryptor")
+
+        encryption = {'control_location': 'front-end',
+                      'provider': 'CryptsetupEncryptor'}
+        encryptor = encryptors.get_volume_encryptor(self.connection_info,
+                                                    **encryption)
+        self.assertIsInstance(encryptor,
+                              cryptsetup.CryptsetupEncryptor,
+                              "encryptor is not an instance of"
+                              "CryptsetupEncryptor")
+
+        encryption = {'control_location': 'front-end',
+                      'provider': 'NoOpEncryptor'}
+        encryptor = encryptors.get_volume_encryptor(self.connection_info,
+                                                    **encryption)
+        self.assertIsInstance(encryptor,
+                              nop.NoOpEncryptor,
+                              "encryptor is not an instance of NoOpEncryptor")
+
+    def test_get_error_encryptos(self):
+        encryption = {'control_location': 'front-end',
+                      'provider': 'ErrorEncryptor'}
+        self.assertRaises(ValueError, encryptors.get_volume_encryptor,
+                          self.connection_info, **encryption)
+
     @mock.patch('nova.volume.encryptors.LOG')
     def test_error_log(self, log):
         encryption = {'control_location': 'front-end',
@@ -48,7 +82,8 @@ class VolumeEncryptorTestCase(test.TestCase):
         try:
             encryptors.get_volume_encryptor(self.connection_info, **encryption)
         except Exception as e:
-            log.error.assert_called_once_with(_LE("Error instantiating "
-                                                  "%(provider)s: "
-                                                  "%(exception)s"),
-                      {'provider': provider, 'exception': e})
+            log.error.assert_called_once_with("Error instantiating "
+                                              "%(provider)s: "
+                                              "%(exception)s",
+                                              {'provider': provider,
+                                               'exception': e})

@@ -24,10 +24,12 @@ $ sudo apt-get install zookeeper zookeeperd python-zookeeper
 $ sudo pip install evzookeeper
 $ nosetests nova.tests.unit.servicegroup.test_zk_driver
 """
+import os
 
-import eventlet
+import mock
 
 from nova import servicegroup
+from nova.servicegroup.drivers import zk
 from nova import test
 
 
@@ -35,31 +37,65 @@ class ZKServiceGroupTestCase(test.NoDBTestCase):
 
     def setUp(self):
         super(ZKServiceGroupTestCase, self).setUp()
-        servicegroup.API._driver = None
-        from nova.servicegroup.drivers import zk
         self.flags(servicegroup_driver='zk')
         self.flags(address='localhost:2181', group="zookeeper")
         try:
-            zk.ZooKeeperDriver()
+            __import__('evzookeeper')
+            __import__('zookeeper')
         except ImportError:
             self.skipTest("Unable to test due to lack of ZooKeeper")
 
-    def test_join_leave(self):
+    # Need to do this here, as opposed to the setUp() method, otherwise
+    # the decorate will cause an import error...
+    @mock.patch('evzookeeper.ZKSession')
+    def _setup_sg_api(self, zk_sess_mock):
+        self.zk_sess = mock.MagicMock()
+        zk_sess_mock.return_value = self.zk_sess
+        self.flags(servicegroup_driver='zk')
+        self.flags(address='ignored', group="zookeeper")
         self.servicegroup_api = servicegroup.API()
-        service_id = {'topic': 'unittest', 'host': 'serviceA'}
-        self.servicegroup_api.join(service_id['host'], service_id['topic'])
-        self.assertTrue(self.servicegroup_api.service_is_up(service_id))
-        self.servicegroup_api.leave(service_id['host'], service_id['topic'])
-        # make sure zookeeper is updated and watcher is triggered
-        eventlet.sleep(1)
-        self.assertFalse(self.servicegroup_api.service_is_up(service_id))
 
-    def test_stop(self):
+    def test_zookeeper_hierarchy_structure(self):
+        """Test that hierarchy created by join method contains process id."""
+        from zookeeper import NoNodeException
         self.servicegroup_api = servicegroup.API()
-        service_id = {'topic': 'unittest', 'host': 'serviceA'}
-        pulse = self.servicegroup_api.join(service_id['host'],
-                                         service_id['topic'], None)
-        self.assertTrue(self.servicegroup_api.service_is_up(service_id))
-        pulse.stop()
-        eventlet.sleep(1)
-        self.assertFalse(self.servicegroup_api.service_is_up(service_id))
+        service_id = {'topic': 'unittest', 'host': 'serviceC'}
+        # use existing session object
+        session = self.servicegroup_api._driver._session
+        # prepare a path that contains process id
+        pid = os.getpid()
+        path = '/servicegroups/%s/%s/%s' % (service_id['topic'],
+                                              service_id['host'],
+                                              pid)
+        # assert that node doesn't exist yet
+        self.assertRaises(NoNodeException, session.get, path)
+        # join
+        self.servicegroup_api.join(service_id['host'],
+                                   service_id['topic'],
+                                   None)
+        # expected existing "process id" node
+        self.assertTrue(session.get(path))
+
+    def test_lazy_session(self):
+        """Session object (contains zk handle) should be created in
+        lazy manner, because handle cannot be shared by forked processes.
+        """
+        # insied import because this test runs conditionaly (look at setUp)
+        import evzookeeper
+        driver = zk.ZooKeeperDriver()
+        # check that internal private attribute session is empty
+        self.assertIsNone(driver.__dict__['_ZooKeeperDriver__session'])
+        # after first use of property ...
+        driver._session
+        # check that internal private session attribute is ready
+        self.assertIsInstance(driver.__dict__['_ZooKeeperDriver__session'],
+                              evzookeeper.ZKSession)
+
+    @mock.patch('evzookeeper.membership.Membership')
+    def test_join(self, mem_mock):
+        self._setup_sg_api()
+        mem_mock.return_value = mock.sentinel.zk_mem
+        self.servicegroup_api.join('fake-host', 'fake-topic')
+        mem_mock.assert_called_once_with(self.zk_sess,
+                                         '/fake-topic',
+                                         'fake-host')

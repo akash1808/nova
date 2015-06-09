@@ -28,7 +28,7 @@ from nova import exception
 from nova.i18n import _
 
 ALIAS = "os-aggregates"
-authorize = extensions.extension_authorizer('compute', "v3:" + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def _get_context(req):
@@ -209,7 +209,7 @@ class Aggregates(extensions.V3APIExtensionBase):
 
     def get_resources(self):
         resources = [extensions.ResourceExtension(
-                                            self.alias,
+                                            ALIAS,
                                             AggregateController(),
                                             member_actions={'action': 'POST'})]
         return resources

@@ -15,10 +15,11 @@
 
 import datetime
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from nova.api.openstack import compute
 from nova.compute import api as compute_api
+from nova.compute import flavors
 from nova import db
 from nova import objects
 from nova import test
@@ -100,6 +101,7 @@ class DiskConfigTestCaseV21(test.TestCase):
                     'vm_state': '',
                     'auto_disk_config': inst_['auto_disk_config'],
                     'security_groups': inst_['security_groups'],
+                    'instance_type': flavors.get_default_flavor(),
                     })
 
             def fake_instance_get_for_create(context, id_, *args, **kwargs):
@@ -347,8 +349,10 @@ class DiskConfigTestCaseV21(test.TestCase):
         res = req.get_response(self.app)
         self.assertEqual(res.status_int, 400)
         expected_msg = self._get_expected_msg_for_invalid_disk_config()
-        self.assertEqual(expected_msg.format(API_DISK_CONFIG, 'server_test'),
-                         res.body)
+        expected_msg = expected_msg.format(API_DISK_CONFIG, 'server_test')
+
+        self.assertEqual(jsonutils.loads(expected_msg),
+                         jsonutils.loads(res.body))
 
     def _test_rebuild_server_disk_config(self, uuid, disk_config):
         req = fakes.HTTPRequest.blank(

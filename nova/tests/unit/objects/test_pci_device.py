@@ -15,6 +15,8 @@
 
 import copy
 
+from oslo_utils import timeutils
+
 from nova import context
 from nova import db
 from nova.objects import instance
@@ -26,6 +28,7 @@ dev_dict = {
     'address': 'a',
     'product_id': 'p',
     'vendor_id': 'v',
+    'numa_node': 0,
     'status': 'available'}
 
 
@@ -39,6 +42,7 @@ fake_db_dev = {
     'address': 'a',
     'vendor_id': 'v',
     'product_id': 'p',
+    'numa_node': 0,
     'dev_type': 't',
     'status': 'available',
     'dev_id': 'i',
@@ -59,6 +63,7 @@ fake_db_dev_1 = {
     'address': 'a1',
     'vendor_id': 'v1',
     'product_id': 'p1',
+    'numa_node': 1,
     'dev_type': 't',
     'status': 'available',
     'dev_id': 'i',
@@ -75,8 +80,9 @@ class _TestPciDeviceObject(object):
         self.inst.uuid = 'fake-inst-uuid'
         self.inst.pci_devices = pci_device.PciDeviceList()
 
-    def _create_fake_pci_device(self):
-        ctxt = context.get_admin_context()
+    def _create_fake_pci_device(self, ctxt=None):
+        if not ctxt:
+            ctxt = context.get_admin_context()
         self.mox.StubOutWithMock(db, 'pci_device_get_by_addr')
         db.pci_device_get_by_addr(ctxt, 1, 'a').AndReturn(fake_db_dev)
         self.mox.ReplayAll()
@@ -87,7 +93,7 @@ class _TestPciDeviceObject(object):
         self.assertEqual(self.pci_device.product_id, 'p')
         self.assertEqual(self.pci_device.obj_what_changed(),
                          set(['compute_node_id', 'product_id', 'vendor_id',
-                              'status', 'address', 'extra_info']))
+                              'numa_node', 'status', 'address', 'extra_info']))
 
     def test_pci_device_extra_info(self):
         self.dev_dict = copy.copy(dev_dict)
@@ -99,7 +105,8 @@ class _TestPciDeviceObject(object):
         self.assertEqual(set(extra_value.keys()), set(('k1', 'k2')))
         self.assertEqual(self.pci_device.obj_what_changed(),
                          set(['compute_node_id', 'address', 'product_id',
-                              'vendor_id', 'status', 'extra_info']))
+                              'vendor_id', 'numa_node', 'status',
+                              'extra_info']))
 
     def test_update_device(self):
         self.pci_device = pci_device.PciDevice.create(dev_dict)
@@ -142,7 +149,7 @@ class _TestPciDeviceObject(object):
 
     def test_save(self):
         ctxt = context.get_admin_context()
-        self._create_fake_pci_device()
+        self._create_fake_pci_device(ctxt=ctxt)
         return_dev = dict(fake_db_dev, status='available',
                           instance_uuid='fake-uuid-3')
         self.pci_device.status = 'allocated'
@@ -153,7 +160,7 @@ class _TestPciDeviceObject(object):
         db.pci_device_update(ctxt, 1, 'a',
                              expected_updates).AndReturn(return_dev)
         self.mox.ReplayAll()
-        self.pci_device.save(ctxt)
+        self.pci_device.save()
         self.assertEqual(self.pci_device.status, 'available')
         self.assertEqual(self.pci_device.instance_uuid,
                          'fake-uuid-3')
@@ -170,17 +177,18 @@ class _TestPciDeviceObject(object):
         ctxt = context.get_admin_context()
         self.stubs.Set(db, 'pci_device_update', _fake_update)
         self.pci_device = pci_device.PciDevice.create(dev_dict)
-        self.pci_device.save(ctxt)
+        self.pci_device._context = ctxt
+        self.pci_device.save()
         self.assertEqual(self.extra_info, '{}')
 
     def test_save_removed(self):
         ctxt = context.get_admin_context()
-        self._create_fake_pci_device()
+        self._create_fake_pci_device(ctxt=ctxt)
         self.pci_device.status = 'removed'
         self.mox.StubOutWithMock(db, 'pci_device_destroy')
         db.pci_device_destroy(ctxt, 1, 'a')
         self.mox.ReplayAll()
-        self.pci_device.save(ctxt)
+        self.pci_device.save()
         self.assertEqual(self.pci_device.status, 'deleted')
         self.assertRemotes()
 
@@ -190,14 +198,53 @@ class _TestPciDeviceObject(object):
 
         def _fake_update(ctxt, node_id, addr, updates):
             self.called = True
-        ctxt = context.get_admin_context()
         self.stubs.Set(db, 'pci_device_destroy', _fake_destroy)
         self.stubs.Set(db, 'pci_device_update', _fake_update)
         self._create_fake_pci_device()
         self.pci_device.status = 'deleted'
         self.called = False
-        self.pci_device.save(ctxt)
+        self.pci_device.save()
         self.assertEqual(self.called, False)
+
+    def test_update_numa_node(self):
+        self.pci_device = pci_device.PciDevice.create(dev_dict)
+        self.assertEqual(0, self.pci_device.numa_node)
+
+        self.dev_dict = copy.copy(dev_dict)
+        self.dev_dict['numa_node'] = '1'
+        self.pci_device = pci_device.PciDevice.create(self.dev_dict)
+        self.assertEqual(1, self.pci_device.numa_node)
+
+    def test_pci_device_equivalent(self):
+        pci_device1 = pci_device.PciDevice.create(dev_dict)
+        pci_device2 = pci_device.PciDevice.create(dev_dict)
+        self.assertEqual(pci_device1, pci_device2)
+
+    def test_pci_device_equivalent_with_ignore_field(self):
+        pci_device1 = pci_device.PciDevice.create(dev_dict)
+        pci_device2 = pci_device.PciDevice.create(dev_dict)
+        pci_device2.updated_at = timeutils.utcnow()
+        self.assertEqual(pci_device1, pci_device2)
+
+    def test_pci_device_not_equivalent1(self):
+        pci_device1 = pci_device.PciDevice.create(dev_dict)
+        dev_dict2 = copy.copy(dev_dict)
+        dev_dict2['address'] = 'b'
+        pci_device2 = pci_device.PciDevice.create(dev_dict2)
+        self.assertNotEqual(pci_device1, pci_device2)
+
+    def test_pci_device_not_equivalent2(self):
+        pci_device1 = pci_device.PciDevice.create(dev_dict)
+        pci_device2 = pci_device.PciDevice.create(dev_dict)
+        delattr(pci_device2, 'address')
+        self.assertNotEqual(pci_device1, pci_device2)
+
+    def test_pci_device_not_equivalent_with_none(self):
+        pci_device1 = pci_device.PciDevice.create(dev_dict)
+        pci_device2 = pci_device.PciDevice.create(dev_dict)
+        pci_device1.instance_uuid = 'aaa'
+        pci_device2.instance_uuid = None
+        self.assertNotEqual(pci_device1, pci_device2)
 
 
 class TestPciDeviceObject(test_objects._LocalTest,

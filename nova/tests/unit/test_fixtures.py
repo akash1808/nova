@@ -14,16 +14,20 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import logging
 import sys
 
 import fixtures as fx
-from oslo.config import cfg
+import mock
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import uuidutils
 import testtools
 
 from nova.db.sqlalchemy import api as session
-from nova.tests.unit import conf_fixture
+from nova.objects import base as obj_base
 from nova.tests import fixtures
+from nova.tests.unit import conf_fixture
+from nova import utils
 
 CONF = cfg.CONF
 
@@ -148,6 +152,32 @@ class TestTimeout(testtools.TestCase):
         self.assertEqual(timeout.test_timeout, 20)
 
 
+class TestOSAPIFixture(testtools.TestCase):
+    def test_responds_to_version(self):
+        """Ensure the OSAPI server responds to calls sensibly."""
+        self.useFixture(fixtures.OutputStreamCapture())
+        self.useFixture(fixtures.StandardLogging())
+        self.useFixture(conf_fixture.ConfFixture())
+        api = self.useFixture(fixtures.OSAPIFixture()).api
+
+        # request the API root, which provides us the versions of the API
+        resp = api.api_request('/', strip_version=True)
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        # request a bad root url, should be a 404
+        #
+        # NOTE(sdague): this currently fails, as it falls into the 300
+        # dispatcher instead. This is a bug. The test case is left in
+        # here, commented out until we can address it.
+        #
+        # resp = api.api_request('/foo', strip_version=True)
+        # self.assertEqual(resp.status_code, 400, resp.content)
+
+        # request a known bad url, and we should get a 404
+        resp = api.api_request('/foo')
+        self.assertEqual(resp.status_code, 404, resp.content)
+
+
 class TestDatabaseFixture(testtools.TestCase):
     def test_fixture_reset(self):
         # because this sets up reasonable db connection strings
@@ -179,3 +209,103 @@ class TestDatabaseFixture(testtools.TestCase):
         result = conn.execute("select * from instance_types")
         rows = result.fetchall()
         self.assertEqual(len(rows), 5, "Rows %s" % rows)
+
+    def test_api_fixture_reset(self):
+        # This sets up reasonable db connection strings
+        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.Database(database='api'))
+        engine = session.get_api_engine()
+        conn = engine.connect()
+        result = conn.execute("select * from cell_mappings")
+        rows = result.fetchall()
+        self.assertEqual(len(rows), 0, "Rows %s" % rows)
+
+        uuid = uuidutils.generate_uuid()
+        conn.execute("insert into cell_mappings (uuid, name) VALUES "
+                     "('%s', 'fake-cell')" % (uuid,))
+        result = conn.execute("select * from cell_mappings")
+        rows = result.fetchall()
+        self.assertEqual(len(rows), 1, "Rows %s" % rows)
+
+        # reset by invoking the fixture again
+        #
+        # NOTE(sdague): it's important to reestablish the db
+        # connection because otherwise we have a reference to the old
+        # in mem db.
+        self.useFixture(fixtures.Database(database='api'))
+        conn = engine.connect()
+        result = conn.execute("select * from cell_mappings")
+        rows = result.fetchall()
+        self.assertEqual(len(rows), 0, "Rows %s" % rows)
+
+    def test_fixture_cleanup(self):
+        # because this sets up reasonable db connection strings
+        self.useFixture(conf_fixture.ConfFixture())
+        fix = fixtures.Database()
+        self.useFixture(fix)
+
+        # manually do the cleanup that addCleanup will do
+        fix.cleanup()
+
+        # ensure the db contains nothing
+        engine = session.get_engine()
+        conn = engine.connect()
+        schema = "".join(line for line in conn.connection.iterdump())
+        self.assertEqual(schema, "BEGIN TRANSACTION;COMMIT;")
+
+    def test_api_fixture_cleanup(self):
+        # This sets up reasonable db connection strings
+        self.useFixture(conf_fixture.ConfFixture())
+        fix = fixtures.Database(database='api')
+        self.useFixture(fix)
+
+        # No data inserted by migrations so we need to add a row
+        engine = session.get_api_engine()
+        conn = engine.connect()
+        uuid = uuidutils.generate_uuid()
+        conn.execute("insert into cell_mappings (uuid, name) VALUES "
+                     "('%s', 'fake-cell')" % (uuid,))
+        result = conn.execute("select * from cell_mappings")
+        rows = result.fetchall()
+        self.assertEqual(len(rows), 1, "Rows %s" % rows)
+
+        # Manually do the cleanup that addCleanup will do
+        fix.cleanup()
+
+        # Ensure the db contains nothing
+        engine = session.get_api_engine()
+        conn = engine.connect()
+        schema = "".join(line for line in conn.connection.iterdump())
+        self.assertEqual(schema, "BEGIN TRANSACTION;COMMIT;")
+
+
+class TestIndirectionAPIFixture(testtools.TestCase):
+    def test_indirection_api(self):
+        # Should initially be None
+        self.assertIsNone(obj_base.NovaObject.indirection_api)
+
+        # make sure the fixture correctly sets the value
+        fix = fixtures.IndirectionAPIFixture('foo')
+        self.useFixture(fix)
+        self.assertEqual('foo', obj_base.NovaObject.indirection_api)
+
+        # manually do the cleanup that addCleanup will do
+        fix.cleanup()
+
+        # ensure the initial value is restored
+        self.assertIsNone(obj_base.NovaObject.indirection_api)
+
+
+class TestSpawnIsSynchronousFixture(testtools.TestCase):
+    def test_spawn_patch(self):
+        orig_spawn = utils.spawn_n
+
+        fix = fixtures.SpawnIsSynchronousFixture()
+        self.useFixture(fix)
+        self.assertNotEqual(orig_spawn, utils.spawn_n)
+
+    def test_spawn_passes_through(self):
+        self.useFixture(fixtures.SpawnIsSynchronousFixture())
+        tester = mock.MagicMock()
+        utils.spawn_n(tester.function, 'foo', bar='bar')
+        tester.function.assert_called_once_with('foo', bar='bar')

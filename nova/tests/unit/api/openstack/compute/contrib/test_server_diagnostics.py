@@ -12,13 +12,12 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-from lxml import etree
+
 import mock
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from nova.api.openstack import compute
-from nova.api.openstack.compute.contrib import server_diagnostics
-from nova.api.openstack import wsgi
+from nova.api.openstack.compute.plugins.v3 import server_diagnostics
 from nova.compute import api as compute_api
 from nova import exception
 from nova import test
@@ -102,27 +101,19 @@ class ServerDiagnosticsTestV2(ServerDiagnosticsTestV21):
         self.router = compute.APIRouter(init_only=('servers', 'diagnostics'))
 
 
-class TestServerDiagnosticsXMLSerializer(test.NoDBTestCase):
-    namespace = wsgi.XMLNS_V11
+class ServerDiagnosticsEnforcementV21(test.NoDBTestCase):
 
-    def _tag(self, elem):
-        tagname = elem.tag
-        self.assertEqual(tagname[0], '{')
-        tmp = tagname.partition('}')
-        namespace = tmp[0][1:]
-        self.assertEqual(namespace, self.namespace)
-        return tmp[2]
+    def setUp(self):
+        super(ServerDiagnosticsEnforcementV21, self).setUp()
+        self.controller = server_diagnostics.ServerDiagnosticsController()
+        self.req = fakes.HTTPRequest.blank('')
 
-    def test_index_serializer(self):
-        serializer = server_diagnostics.ServerDiagnosticsTemplate()
-        exemplar = dict(diag1='foo', diag2='bar')
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('diagnostics', self._tag(tree))
-        self.assertEqual(len(tree), len(exemplar))
-        for child in tree:
-            tag = self._tag(child)
-            self.assertIn(tag, exemplar)
-            self.assertEqual(child.text, exemplar[tag])
+    def test_get_diagnostics_policy_failed(self):
+        rule_name = "os_compute_api:os-server-diagnostics"
+        self.policy.set_rules({rule_name: "project:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.index, self.req, fakes.FAKE_UUID)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())

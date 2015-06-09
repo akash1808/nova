@@ -12,11 +12,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.utils import timeutils
+import mock
+from oslo_utils import timeutils
 
 from nova import context
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import migration
 from nova.tests.unit import fake_instance
 from nova.tests.unit.objects import test_objects
@@ -41,6 +43,8 @@ def fake_db_migration(**updates):
         'new_instance_type_id': 84,
         'instance_uuid': 'fake-uuid',
         'status': 'migrating',
+        'migration_type': 'resize',
+        'hidden': False,
     }
 
     if updates:
@@ -78,9 +82,9 @@ class _TestMigrationObject(object):
         db.migration_create(ctxt, {'source_compute': 'foo'}).AndReturn(
             fake_migration)
         self.mox.ReplayAll()
-        mig = migration.Migration()
+        mig = migration.Migration(context=ctxt)
         mig.source_compute = 'foo'
-        mig.create(ctxt)
+        mig.create()
         self.assertEqual(fake_migration['dest_compute'], mig.dest_compute)
 
     def test_recreate_fails(self):
@@ -90,9 +94,9 @@ class _TestMigrationObject(object):
         db.migration_create(ctxt, {'source_compute': 'foo'}).AndReturn(
             fake_migration)
         self.mox.ReplayAll()
-        mig = migration.Migration()
+        mig = migration.Migration(context=ctxt)
         mig.source_compute = 'foo'
-        mig.create(ctxt)
+        mig.create()
         self.assertRaises(exception.ObjectActionError, mig.create,
                           self.context)
 
@@ -103,10 +107,10 @@ class _TestMigrationObject(object):
         db.migration_update(ctxt, 123, {'source_compute': 'foo'}
                             ).AndReturn(fake_migration)
         self.mox.ReplayAll()
-        mig = migration.Migration()
+        mig = migration.Migration(context=ctxt)
         mig.id = 123
         mig.source_compute = 'foo'
-        mig.save(ctxt)
+        mig.save()
         self.assertEqual(fake_migration['dest_compute'], mig.dest_compute)
 
     def test_instance(self):
@@ -172,6 +176,36 @@ class _TestMigrationObject(object):
         self.assertEqual(2, len(migrations))
         for index, db_migration in enumerate(db_migrations):
             self.compare_obj(migrations[index], db_migration)
+
+    def test_migrate_old_resize_record(self):
+        db_migration = dict(fake_db_migration(), migration_type=None)
+        with mock.patch('nova.db.migration_get') as fake_get:
+            fake_get.return_value = db_migration
+            mig = objects.Migration.get_by_id(context.get_admin_context(), 1)
+        self.assertTrue(mig.obj_attr_is_set('migration_type'))
+        self.assertEqual('resize', mig.migration_type)
+
+    def test_migrate_old_migration_record(self):
+        db_migration = dict(
+            fake_db_migration(), migration_type=None,
+            old_instance_type_id=1, new_instance_type_id=1)
+        with mock.patch('nova.db.migration_get') as fake_get:
+            fake_get.return_value = db_migration
+            mig = objects.Migration.get_by_id(context.get_admin_context(), 1)
+        self.assertTrue(mig.obj_attr_is_set('migration_type'))
+        self.assertEqual('migration', mig.migration_type)
+
+    def test_migrate_unset_type_resize(self):
+        mig = objects.Migration(old_instance_type_id=1,
+                                new_instance_type_id=2)
+        self.assertEqual('resize', mig.migration_type)
+        self.assertTrue(mig.obj_attr_is_set('migration_type'))
+
+    def test_migrate_unset_type_migration(self):
+        mig = objects.Migration(old_instance_type_id=1,
+                                new_instance_type_id=1)
+        self.assertEqual('migration', mig.migration_type)
+        self.assertTrue(mig.obj_attr_is_set('migration_type'))
 
 
 class TestMigrationObject(test_objects._LocalTest,

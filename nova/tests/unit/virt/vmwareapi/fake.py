@@ -20,36 +20,30 @@ A fake VMware VI API implementation.
 """
 
 import collections
-import pprint
 
-from oslo.serialization import jsonutils
-from oslo.utils import units
-from oslo.vmware import exceptions as vexc
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import units
+from oslo_utils import uuidutils
+from oslo_vmware import exceptions as vexc
+from oslo_vmware.objects import datastore as ds_obj
+import six
 
 from nova import exception
-from nova.i18n import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import uuidutils
 from nova.virt.vmwareapi import constants
-from nova.virt.vmwareapi import ds_util
 
 _CLASSES = ['Datacenter', 'Datastore', 'ResourcePool', 'VirtualMachine',
             'Network', 'HostSystem', 'HostNetworkSystem', 'Task', 'session',
             'files', 'ClusterComputeResource', 'HostStorageSystem']
 
 _FAKE_FILE_SIZE = 1024
+_FAKE_VCENTER_UUID = '497c514c-ef5e-4e7f-8d93-ec921993b93a'
 
 _db_content = {}
 _array_types = {}
 _vim_map = {}
 
 LOG = logging.getLogger(__name__)
-
-
-def log_db_contents(msg=None):
-    """Log DB Contents."""
-    LOG.debug("%(text)s: _db_content => %(content)s",
-              {'text': msg or "", 'content': pprint.pformat(_db_content)})
 
 
 def reset():
@@ -264,7 +258,7 @@ class ManagedObject(object):
         for elem in self.propSet:
             if elem.name == attr:
                 return elem.val
-        msg = _("Property %(attr)s not set for the managed object %(name)s")
+        msg = "Property %(attr)s not set for the managed object %(name)s"
         raise exception.NovaException(msg % {'attr': attr,
                                              'name': self.__class__.__name__})
 
@@ -274,8 +268,8 @@ class ManagedObject(object):
         return prefix + "-" + str(self.__class__._counter)
 
     def __repr__(self):
-        return jsonutils.dumps(dict([(elem.name, elem.val)
-                                for elem in self.propSet]))
+        return jsonutils.dumps({elem.name: elem.val
+                                for elem in self.propSet})
 
 
 class DataObject(object):
@@ -286,6 +280,9 @@ class DataObject(object):
 
     def __repr__(self):
         return str(self.__dict__)
+
+    def __eq__(self, other):
+        return self.__dict__ == other.__dict__
 
 
 class HostInternetScsiHba(DataObject):
@@ -375,6 +372,7 @@ class VirtualLsiLogicController(DataObject):
     def __init__(self, key=0, scsiCtlrUnitNumber=0):
         self.key = key
         self.scsiCtlrUnitNumber = scsiCtlrUnitNumber
+        self.device = []
 
 
 class VirtualLsiLogicSASController(DataObject):
@@ -523,6 +521,8 @@ class VirtualMachine(ManagedObject):
             disk_backing.fileName = filename
             disk_backing.key = -101
             disk.backing = disk_backing
+            disk.capacityInBytes = 1024
+            disk.capacityInKB = 1
 
             controller = VirtualLsiLogicController()
             controller.key = controller_key
@@ -970,9 +970,9 @@ def create_vm(uuid=None, name=None,
         devices = []
 
     if vmPathName is None:
-        vm_path = ds_util.DatastorePath(_db_content['Datastore'].values()[0])
+        vm_path = ds_obj.DatastorePath(_db_content['Datastore'].values()[0])
     else:
-        vm_path = ds_util.DatastorePath.parse(vmPathName)
+        vm_path = ds_obj.DatastorePath.parse(vmPathName)
 
     if res_pool_ref is None:
         res_pool_ref = _db_content['ResourcePool'].keys()[0]
@@ -987,7 +987,7 @@ def create_vm(uuid=None, name=None,
     if vm_path.rel_path == '':
         vm_path = vm_path.join(name, name + '.vmx')
 
-    for key, value in _db_content["Datastore"].iteritems():
+    for key, value in six.iteritems(_db_content["Datastore"]):
         if value.get('summary.name') == vm_path.datastore:
             ds = key
             break
@@ -1052,6 +1052,14 @@ def fake_get_network(*args, **kwargs):
     return {'type': 'fake'}
 
 
+def assertPathExists(test, path):
+    test.assertIn(path, _db_content.get('files'))
+
+
+def assertPathNotExists(test, path):
+    test.assertNotIn(path, _db_content.get('files'))
+
+
 def get_file(file_path):
     """Check if file exists in the db."""
     return file_path in _db_content.get("files")
@@ -1062,8 +1070,8 @@ def fake_upload_image(context, image, instance, **kwargs):
     pass
 
 
-def fake_fetch_image(context, instance, host, dc_name, ds_name, file_path,
-                     cookies=None):
+def fake_fetch_image(context, instance, host, port, dc_name, ds_name,
+                     file_path, cookies=None):
     """Fakes the fetch of an image."""
     ds_file_path = "[" + ds_name + "] " + file_path
     _add_file(ds_file_path)
@@ -1072,10 +1080,10 @@ def fake_fetch_image(context, instance, host, dc_name, ds_name, file_path,
 def _get_vm_mdo(vm_ref):
     """Gets the Virtual Machine with the ref from the db."""
     if _db_content.get("VirtualMachine", None) is None:
-            raise exception.NotFound(_("There is no VM registered"))
+            raise exception.NotFound("There is no VM registered")
     if vm_ref not in _db_content.get("VirtualMachine"):
-        raise exception.NotFound(_("Virtual Machine with ref %s is not "
-                        "there") % vm_ref)
+        raise exception.NotFound("Virtual Machine with ref %s is not "
+                                 "there" % vm_ref)
     return _db_content.get("VirtualMachine")[vm_ref]
 
 
@@ -1144,6 +1152,9 @@ class FakeObjectRetrievalSession(FakeSession):
         self.ind = 0
 
     def _call_method(self, module, method, *args, **kwargs):
+        if (method == 'continue_retrieval' or
+            method == 'cancel_retrieval'):
+            return
         # return fake objects in a circular manner
         self.ind = (self.ind + 1) % len(self.ret)
         return self.ret[self.ind - 1]
@@ -1186,6 +1197,8 @@ class FakeVim(object):
         about_info = DataObject()
         about_info.name = "VMware vCenter Server"
         about_info.version = "5.1.0"
+        about_info.instanceUuid = _FAKE_VCENTER_UUID
+
         service_content.about = about_info
 
         self._service_content = service_content
@@ -1221,9 +1234,8 @@ class FakeVim(object):
         if (self._session is None or self._session not in
                  _db_content['session']):
             LOG.debug("Session is faulty")
-            raise vexc.VimFaultException(
-                               [vexc.NOT_AUTHENTICATED],
-                               _("Session Invalid"))
+            raise vexc.VimFaultException([vexc.NOT_AUTHENTICATED],
+                                         "Session Invalid")
 
     def _session_is_active(self, *args, **kwargs):
         try:
@@ -1333,7 +1345,7 @@ class FakeVim(object):
              source_vm_mdo.get("config.hardware.device").VirtualDevice,
          "instanceUuid": source_vm_mdo.get("summary.config.instanceUuid")}
 
-        if clone_spec.config is not None:
+        if hasattr(clone_spec, 'config'):
             # Impose the config changes specified in the config property
             if (hasattr(clone_spec.config, 'instanceUuid') and
                clone_spec.config.instanceUuid is not None):
@@ -1354,6 +1366,8 @@ class FakeVim(object):
         vm_ref = args[0]
         _get_vm_mdo(vm_ref)
         del _db_content["VirtualMachine"][vm_ref]
+        task_mdo = create_task(method, "success")
+        return task_mdo.obj
 
     def _search_ds(self, method, *args, **kwargs):
         """Searches the datastore for a file."""
@@ -1373,7 +1387,7 @@ class FakeVim(object):
             for file in _db_content.get("files"):
                 if file.find(ds_path) != -1:
                     if not file.endswith(ds_path):
-                        path = file.lstrip(dname).split('/')
+                        path = file.replace(dname, '', 1).split('/')
                         if path:
                             matched_files.add(path[0])
             if not matched_files:
@@ -1412,13 +1426,6 @@ class FakeVim(object):
         task_mdo = create_task(method, "success")
         return task_mdo.obj
 
-    def fake_transfer_file(self, ds_name, file_path):
-        """Fakes fetch image call.
-        Just adds a reference to the db for the file.
-        """
-        ds_file_path = "[" + ds_name + "] " + file_path
-        _add_file(ds_file_path)
-
     def _make_dir(self, method, *args, **kwargs):
         """Creates a directory in the datastore."""
         ds_path = kwargs.get("name")
@@ -1429,11 +1436,11 @@ class FakeVim(object):
     def _set_power_state(self, method, vm_ref, pwr_state="poweredOn"):
         """Sets power state for the VM."""
         if _db_content.get("VirtualMachine", None) is None:
-            raise exception.NotFound(_("No Virtual Machine has been "
-                                       "registered yet"))
+            raise exception.NotFound("No Virtual Machine has been "
+                                     "registered yet")
         if vm_ref not in _db_content.get("VirtualMachine"):
-            raise exception.NotFound(_("Virtual Machine with ref %s is not "
-                                       "there") % vm_ref)
+            raise exception.NotFound("Virtual Machine with ref %s is not "
+                                     "there" % vm_ref)
         vm_mdo = _db_content.get("VirtualMachine").get(vm_ref)
         vm_mdo.set("runtime.powerState", pwr_state)
         task_mdo = create_task(method, "success")
@@ -1490,8 +1497,8 @@ class FakeVim(object):
                         prop_list.append(prop)
                     obj_content = ObjectContent(mdo.obj, prop_list)
                     lst_ret_objs.add_object(obj_content)
-            except Exception as exc:
-                LOG.exception(exc)
+            except Exception:
+                LOG.exception("_retrieve_properties error")
                 continue
         return lst_ret_objs
 
@@ -1594,18 +1601,13 @@ class FakeVim(object):
         elif attr_name == "AddPortGroup":
             return lambda *args, **kwargs: self._add_port_group(attr_name,
                                                 *args, **kwargs)
-        elif attr_name == "RebootHost_Task":
-            return lambda *args, **kwargs: self._just_return_task(attr_name)
-        elif attr_name == "ShutdownHost_Task":
-            return lambda *args, **kwargs: self._just_return_task(attr_name)
-        elif attr_name == "PowerUpHostFromStandBy_Task":
-            return lambda *args, **kwargs: self._just_return_task(attr_name)
-        elif attr_name == "EnterMaintenanceMode_Task":
-            return lambda *args, **kwargs: self._just_return_task(attr_name)
-        elif attr_name == "ExitMaintenanceMode_Task":
+        elif attr_name in ("RebootHost_Task",
+                           "ShutdownHost_Task",
+                           "PowerUpHostFromStandBy_Task",
+                           "EnterMaintenanceMode_Task",
+                           "ExitMaintenanceMode_Task",
+                           "RescanHba"):
             return lambda *args, **kwargs: self._just_return_task(attr_name)
         elif attr_name == "AddInternetScsiSendTargets":
             return lambda *args, **kwargs: self._add_iscsi_send_tgt(attr_name,
                                                 *args, **kwargs)
-        elif attr_name == "RescanHba":
-            return lambda *args, **kwargs: self._just_return_task(attr_name)

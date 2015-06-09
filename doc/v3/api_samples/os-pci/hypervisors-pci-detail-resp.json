@@ -1,7 +1,7 @@
 {
     "hypervisors": [
         {
-            "cpu_info": "?",
+            "cpu_info": "{\"arch\": \"x86_64\", \"model\": \"Nehalem\", \"vendor\": \"Intel\", \"features\": [\"pge\", \"clflush\"], \"topology\": {\"cores\": 1, \"threads\": 1, \"sockets\": 4}}",
             "state": "up",
             "status": "enabled",
             "current_workload": 0,
@@ -20,13 +20,11 @@
             "os-pci:pci_stats": [
                 {
                     "count": 5,
-                    "extra_info": {
-                        "key1": "value1",
-                        "phys_function": "[[\"0x0000\", \"0x04\", \"0x00\", \"0x1\"]]"
-                    },
+                    "key1": "value1",
                     "keya": "valuea",
                     "product_id": "1520",
-                    "vendor_id": "8086"
+                    "vendor_id": "8086",
+                    "numa_node": 1
                 }
             ],
             "running_vms": 0,

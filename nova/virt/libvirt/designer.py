@@ -19,6 +19,8 @@ This module provides helper APIs for populating the config.py
 classes based on common operational needs / policies
 """
 
+import six
+
 from nova.pci import utils as pci_utils
 
 
@@ -142,6 +144,16 @@ def set_vif_host_backend_direct_config(conf, devname):
     conf.model = "virtio"
 
 
+def set_vif_host_backend_vhostuser_config(conf, mode, path):
+    """Populate a LibvirtConfigGuestInterface instance
+    with host backend details for vhostuser socket.
+    """
+    conf.net_type = "vhostuser"
+    conf.vhostuser_type = "unix"
+    conf.vhostuser_mode = mode
+    conf.vhostuser_path = path
+
+
 def set_vif_bandwidth_config(conf, inst_type):
     """Config vif inbound/outbound bandwidth limit. parameters are
     set in instance_type_extra_specs table, key is in  the format
@@ -151,7 +163,7 @@ def set_vif_bandwidth_config(conf, inst_type):
     bandwidth_items = ['vif_inbound_average', 'vif_inbound_peak',
         'vif_inbound_burst', 'vif_outbound_average', 'vif_outbound_peak',
         'vif_outbound_burst']
-    for key, value in inst_type.get('extra_specs', {}).iteritems():
+    for key, value in six.iteritems(inst_type.get('extra_specs', {})):
         scope = key.split(':')
         if len(scope) > 1 and scope[0] == 'quota':
             if scope[1] in bandwidth_items:

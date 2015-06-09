@@ -24,10 +24,11 @@ import time
 if sys.platform == 'win32':
     import wmi
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from six.moves import range
 
 from nova.i18n import _
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.hyperv import basevolumeutils
 from nova.virt.hyperv import vmutils
@@ -78,7 +79,7 @@ class VolumeUtilsV2(basevolumeutils.BaseVolumeUtils):
         if retry_count < 2:
             retry_count = 2
 
-        for attempt in xrange(retry_count):
+        for attempt in range(retry_count):
             target = self._conn_storage.query("SELECT * FROM MSFT_iSCSITarget "
                                               "WHERE NodeAddress='%s' " %
                                               target_iqn)

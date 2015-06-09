@@ -17,18 +17,19 @@
 import functools
 import re
 
-from oslo.utils import timeutils
+from oslo_log import log as logging
+from oslo_utils import timeutils
+from oslo_utils import uuidutils
+import six
 
-from nova import availability_zones
 from nova import context
 from nova import exception
 from nova.i18n import _
+from nova.i18n import _LI
 from nova.network import model as network_model
 from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import log as logging
 from nova.openstack.common import memorycache
-from nova.openstack.common import uuidutils
 
 LOG = logging.getLogger(__name__)
 # NOTE(vish): cache mapping for one week
@@ -166,17 +167,12 @@ def get_ip_info_for_instance(context, instance):
         nw_info = instance.info_cache.network_info
     else:
         # FIXME(comstud): Temporary as we transition to objects.
-        info_cache = instance['info_cache'] or {}
+        info_cache = instance.info_cache or {}
         nw_info = info_cache.get('network_info')
     # Make sure empty response is turned into the model
     if not nw_info:
         nw_info = []
     return get_ip_info_for_instance_from_nw_info(nw_info)
-
-
-def get_availability_zone_by_host(host, conductor_api=None):
-    return availability_zones.get_host_availability_zone(
-        context.get_admin_context(), host, conductor_api)
 
 
 def id_to_ec2_id(instance_id, template='i-%08x'):
@@ -262,7 +258,6 @@ def is_ec2_timestamp_expired(request, expires=None):
     """Checks the timestamp or expiry time included in an EC2 request
     and returns true if the request is expired
     """
-    query_time = None
     timestamp = request.get('Timestamp')
     expiry_time = request.get('Expires')
 
@@ -294,7 +289,7 @@ def is_ec2_timestamp_expired(request, expires=None):
                        timeutils.is_newer_than(query_time, expires)
         return False
     except ValueError:
-        LOG.audit(_("Timestamp is invalid."))
+        LOG.info(_LI("Timestamp is invalid."))
         return True
 
 
@@ -419,7 +414,7 @@ def dict_from_dotted_str(items):
     for key, value in items:
         parts = key.split(".")
         key = str(camelcase_to_underscore(parts[0]))
-        if isinstance(value, str) or isinstance(value, unicode):
+        if isinstance(value, six.string_types):
             # NOTE(vish): Automatically convert strings back
             #             into their respective values
             value = _try_convert(value)
@@ -440,8 +435,8 @@ def dict_from_dotted_str(items):
 
 
 def search_opts_from_filters(filters):
-    return dict((f['name'].replace('-', '_'), f['value']['1'])
-                for f in filters if f['value']['1']) if filters else {}
+    return {f['name'].replace('-', '_'): f['value']['1']
+            for f in filters if f['value']['1']} if filters else {}
 
 
 def regex_from_ec2_regex(ec2_re):
@@ -459,7 +454,7 @@ def regex_from_ec2_regex(ec2_re):
             py_re += '.'
         elif char == '\\':
             try:
-                next_char = iter_ec2_re.next()
+                next_char = next(iter_ec2_re)
             except StopIteration:
                 next_char = ''
             if next_char == '*' or next_char == '?':

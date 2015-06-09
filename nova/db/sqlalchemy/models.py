@@ -19,9 +19,9 @@
 SQLAlchemy models for nova data.
 """
 
-from oslo.config import cfg
-from oslo.db.sqlalchemy import models
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_db.sqlalchemy import models
+from oslo_utils import timeutils
 from sqlalchemy import (Column, Index, Integer, BigInteger, Enum, String,
                         schema, Unicode)
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
@@ -43,6 +43,35 @@ class NovaBase(models.SoftDeleteMixin,
                models.TimestampMixin,
                models.ModelBase):
     metadata = None
+
+    def __copy__(self):
+        """Implement a safe copy.copy().
+
+        SQLAlchemy-mapped objects travel with an object
+        called an InstanceState, which is pegged to that object
+        specifically and tracks everything about that object.  It's
+        critical within all attribute operations, including gets
+        and deferred loading.   This object definitely cannot be
+        shared among two instances, and must be handled.
+
+        The copy routine here makes use of session.merge() which
+        already essentially implements a "copy" style of operation,
+        which produces a new instance with a new InstanceState and copies
+        all the data along mapped attributes without using any SQL.
+
+        The mode we are using here has the caveat that the given object
+        must be "clean", e.g. that it has no database-loaded state
+        that has been updated and not flushed.   This is a good thing,
+        as creating a copy of an object including non-flushed, pending
+        database state is probably not a good idea; neither represents
+        what the actual row looks like, and only one should be flushed.
+
+        """
+        session = orm.Session()
+
+        copy = session.merge(self, load=False)
+        session.expunge(copy)
+        return copy
 
     def save(self, session=None):
         from nova.db.sqlalchemy import api
@@ -79,17 +108,11 @@ class ComputeNode(BASE, NovaBase):
     __tablename__ = 'compute_nodes'
     __table_args__ = (
         schema.UniqueConstraint(
-            'host', 'hypervisor_hostname',
-            name="uniq_compute_nodes0host0hypervisor_hostname"),
+            'host', 'hypervisor_hostname', 'deleted',
+            name="uniq_compute_nodes0host0hypervisor_hostname0deleted"),
     )
     id = Column(Integer, primary_key=True)
-    service_id = Column(Integer, ForeignKey('services.id'), nullable=False)
-    service = orm.relationship(Service,
-                           backref=orm.backref('compute_node'),
-                           foreign_keys=service_id,
-                           primaryjoin='and_('
-                                'ComputeNode.service_id == Service.id,'
-                                'ComputeNode.deleted == 0)')
+    service_id = Column(Integer, nullable=True)
 
     # FIXME(sbauza: Host field is nullable because some old Juno compute nodes
     # can still report stats from an old ResourceTracker without setting this
@@ -166,7 +189,8 @@ class Instance(BASE, NovaBase):
     __tablename__ = 'instances'
     __table_args__ = (
         Index('uuid', 'uuid', unique=True),
-        Index('project_id', 'project_id'),
+        Index('instances_project_id_deleted_idx',
+              'project_id', 'deleted'),
         Index('instances_reservation_id_idx',
               'reservation_id'),
         Index('instances_terminated_at_launched_at_idx',
@@ -333,6 +357,8 @@ class InstanceExtra(BASE, NovaBase):
                            nullable=False)
     numa_topology = orm.deferred(Column(Text))
     pci_requests = orm.deferred(Column(Text))
+    flavor = orm.deferred(Column(Text))
+    vcpu_model = orm.deferred(Column(Text))
     instance = orm.relationship(Instance,
                             backref=orm.backref('extra',
                                                 uselist=False),
@@ -369,47 +395,6 @@ class InstanceTypes(BASE, NovaBase):
     vcpu_weight = Column(Integer)
     disabled = Column(Boolean, default=False)
     is_public = Column(Boolean, default=True)
-
-
-class Volume(BASE, NovaBase):
-    """Represents a block storage device that can be attached to a VM."""
-    __tablename__ = 'volumes'
-    __table_args__ = (
-        Index('volumes_instance_uuid_idx', 'instance_uuid'),
-    )
-    id = Column(String(36), primary_key=True, nullable=False)
-    deleted = Column(String(36), default="")
-
-    @property
-    def name(self):
-        return CONF.volume_name_template % self.id
-
-    ec2_id = Column(String(255))
-    user_id = Column(String(255))
-    project_id = Column(String(255))
-
-    snapshot_id = Column(String(36))
-
-    host = Column(String(255))
-    size = Column(Integer)
-    availability_zone = Column(String(255))
-    instance_uuid = Column(String(36))
-    mountpoint = Column(String(255))
-    attach_time = Column(DateTime)
-    status = Column(String(255))  # TODO(vish): enum?
-    attach_status = Column(String(255))  # TODO(vish): enum
-
-    scheduled_at = Column(DateTime)
-    launched_at = Column(DateTime)
-    terminated_at = Column(DateTime)
-
-    display_name = Column(String(255))
-    display_description = Column(String(255))
-
-    provider_location = Column(String(256))
-    provider_auth = Column(String(256))
-
-    volume_type_id = Column(Integer)
 
 
 class Quota(BASE, NovaBase):
@@ -613,25 +598,6 @@ class BlockDeviceMapping(BASE, NovaBase):
     connection_info = Column(MediumText())
 
 
-class IscsiTarget(BASE, NovaBase):
-    """Represents an iscsi target for a given host."""
-    __tablename__ = 'iscsi_targets'
-    __table_args__ = (
-        Index('iscsi_targets_volume_id_fkey', 'volume_id'),
-        Index('iscsi_targets_host_volume_id_deleted_idx', 'host', 'volume_id',
-              'deleted')
-    )
-    id = Column(Integer, primary_key=True, nullable=False)
-    target_num = Column(Integer)
-    host = Column(String(255))
-    volume_id = Column(String(36), ForeignKey('volumes.id'))
-    volume = orm.relationship(Volume,
-                          backref=orm.backref('iscsi_target', uselist=False),
-                          foreign_keys=volume_id,
-                          primaryjoin='and_(IscsiTarget.volume_id==Volume.id,'
-                                           'IscsiTarget.deleted==0)')
-
-
 class SecurityGroupInstanceAssociation(BASE, NovaBase):
     __tablename__ = 'security_group_instance_association'
     __table_args__ = (
@@ -725,7 +691,7 @@ class ProviderFirewallRule(BASE, NovaBase):
 
 
 class KeyPair(BASE, NovaBase):
-    """Represents a public key pair for ssh."""
+    """Represents a public key pair for ssh / WinRM."""
     __tablename__ = 'key_pairs'
     __table_args__ = (
         schema.UniqueConstraint("user_id", "name", "deleted",
@@ -733,12 +699,14 @@ class KeyPair(BASE, NovaBase):
     )
     id = Column(Integer, primary_key=True, nullable=False)
 
-    name = Column(String(255))
+    name = Column(String(255), nullable=False)
 
     user_id = Column(String(255))
 
     fingerprint = Column(String(255))
     public_key = Column(MediumText())
+    type = Column(Enum('ssh', 'x509', name='keypair_types'),
+                  nullable=False, server_default='ssh')
 
 
 class Migration(BASE, NovaBase):
@@ -765,6 +733,10 @@ class Migration(BASE, NovaBase):
     instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
     # TODO(_cerberus_): enum
     status = Column(String(255))
+    migration_type = Column(Enum('migration', 'resize', 'live-migration',
+                                 'evacuate'),
+                            nullable=True)
+    hidden = Column(Boolean, default=False)
 
     instance = orm.relationship("Instance", foreign_keys=instance_uuid,
                             primaryjoin='and_(Migration.instance_uuid == '
@@ -830,7 +802,7 @@ class VirtualInterface(BASE, NovaBase):
     __table_args__ = (
         schema.UniqueConstraint("address", "deleted",
                         name="uniq_virtual_interfaces0address0deleted"),
-        Index('network_id', 'network_id'),
+        Index('virtual_interfaces_network_id_idx', 'network_id'),
         Index('virtual_interfaces_instance_uuid_fkey', 'instance_uuid'),
     )
     id = Column(Integer, primary_key=True, nullable=False)
@@ -857,7 +829,9 @@ class FixedIp(BASE, NovaBase):
         Index('fixed_ips_address_reserved_network_id_deleted_idx',
               'address', 'reserved', 'network_id', 'deleted'),
         Index('fixed_ips_deleted_allocated_idx', 'address', 'deleted',
-              'allocated')
+              'allocated'),
+        Index('fixed_ips_deleted_allocated_updated_at_idx', 'deleted',
+              'allocated', 'updated_at')
     )
     id = Column(Integer, primary_key=True)
     address = Column(types.IPAddress())
@@ -931,7 +905,7 @@ class DNSDomain(BASE, NovaBase):
     """Represents a DNS domain with availability zone or project info."""
     __tablename__ = 'dns_domains'
     __table_args__ = (
-        Index('project_id', 'project_id'),
+        Index('dns_domains_project_id_idx', 'project_id'),
         Index('dns_domains_domain_deleted_idx', 'domain', 'deleted'),
     )
     deleted = Column(Boolean, default=False)
@@ -1132,7 +1106,7 @@ class Aggregate(BASE, NovaBase):
 
     @property
     def metadetails(self):
-        return dict([(m.key, m.value) for m in self._metadata])
+        return {m.key: m.value for m in self._metadata}
 
     @property
     def availability_zone(self):
@@ -1413,6 +1387,9 @@ class PciDevice(BASE, NovaBase):
     extra_info = Column(Text)
 
     instance_uuid = Column(String(36))
+
+    numa_node = Column(Integer, nullable=True)
+
     instance = orm.relationship(Instance, backref="pci_devices",
                             foreign_keys=instance_uuid,
                             primaryjoin='and_('

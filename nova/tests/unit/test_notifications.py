@@ -18,7 +18,9 @@
 import copy
 
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_context import context as o_context
+from oslo_context import fixture as o_fixture
 
 from nova.compute import flavors
 from nova.compute import task_states
@@ -40,6 +42,7 @@ class NotificationsTestCase(test.TestCase):
 
     def setUp(self):
         super(NotificationsTestCase, self).setUp()
+        self.fixture = self.useFixture(o_fixture.ClearRequestContext())
 
         self.net_info = fake_network.fake_get_instance_nw_info(self.stubs, 1,
                                                                1)
@@ -68,7 +71,6 @@ class NotificationsTestCase(test.TestCase):
 
     def _wrapped_create(self, params=None):
         instance_type = flavors.get_flavor_by_name('m1.tiny')
-        sys_meta = flavors.save_flavor_info({}, instance_type)
         inst = objects.Instance(image_ref=1,
                                 user_id=self.user_id,
                                 project_id=self.project_id,
@@ -80,10 +82,12 @@ class NotificationsTestCase(test.TestCase):
                                 display_name='test_instance',
                                 hostname='test_instance_hostname',
                                 node='test_instance_node',
-                                system_metadata=sys_meta)
+                                system_metadata={})
         inst._context = self.context
         if params:
             inst.update(params)
+        with mock.patch.object(inst, 'save'):
+            inst.set_flavor(instance_type)
         inst.create()
         return inst
 
@@ -110,6 +114,73 @@ class NotificationsTestCase(test.TestCase):
         self.assertEqual(n.payload['url'], 'http://example.com/foo')
         self.assertEqual(n.payload['status'], 500)
         self.assertIsNotNone(n.payload['exception'])
+
+    def test_send_api_fault_fresh_context(self):
+        self.flags(notify_api_faults=True)
+        exception = None
+        try:
+            # Get a real exception with a call stack.
+            raise test.TestingException("junk")
+        except test.TestingException as e:
+            exception = e
+
+        ctxt = context.RequestContext(overwrite=True)
+        notifications.send_api_fault("http://example.com/foo", 500, exception)
+
+        self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
+        n = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(n.priority, 'ERROR')
+        self.assertEqual(n.event_type, 'api.fault')
+        self.assertEqual(n.payload['url'], 'http://example.com/foo')
+        self.assertEqual(n.payload['status'], 500)
+        self.assertIsNotNone(n.payload['exception'])
+        self.assertEqual(ctxt, n.context)
+
+    def test_send_api_fault_fake_context(self):
+        self.flags(notify_api_faults=True)
+        exception = None
+        try:
+            # Get a real exception with a call stack.
+            raise test.TestingException("junk")
+        except test.TestingException as e:
+            exception = e
+
+        ctxt = o_context.get_current()
+        self.assertIsNotNone(ctxt)
+        notifications.send_api_fault("http://example.com/foo", 500, exception)
+
+        self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
+        n = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(n.priority, 'ERROR')
+        self.assertEqual(n.event_type, 'api.fault')
+        self.assertEqual(n.payload['url'], 'http://example.com/foo')
+        self.assertEqual(n.payload['status'], 500)
+        self.assertIsNotNone(n.payload['exception'])
+        self.assertIsNotNone(n.context)
+        self.assertEqual(ctxt, n.context)
+
+    def test_send_api_fault_admin_context(self):
+        self.flags(notify_api_faults=True)
+        exception = None
+        try:
+            # Get a real exception with a call stack.
+            raise test.TestingException("junk")
+        except test.TestingException as e:
+            exception = e
+
+        self.fixture._remove_cached_context()
+        self.assertIsNone(o_context.get_current())
+        notifications.send_api_fault("http://example.com/foo", 500, exception)
+
+        self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
+        n = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(n.priority, 'ERROR')
+        self.assertEqual(n.event_type, 'api.fault')
+        self.assertEqual(n.payload['url'], 'http://example.com/foo')
+        self.assertEqual(n.payload['status'], 500)
+        self.assertIsNotNone(n.payload['exception'])
+        self.assertIsNotNone(n.context)
+        self.assertTrue(n.context.is_admin)
 
     def test_notif_disabled(self):
 
@@ -179,6 +250,9 @@ class NotificationsTestCase(test.TestCase):
         notifications.send_update(self.context, old, self.instance)
 
         self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
+        # service name should default to 'compute'
+        notif = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual('compute.testhost', notif.publisher_id)
 
     def test_send_on_task_change(self):
 

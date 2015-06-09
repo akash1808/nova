@@ -13,8 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import six
+
 from nova.api.openstack.compute.contrib import used_limits as used_limits_v2
-from nova.api.openstack.compute import limits
 from nova.api.openstack.compute.plugins.v3 import used_limits as \
     used_limits_v21
 from nova.api.openstack import extensions
@@ -33,7 +34,7 @@ class FakeRequest(object):
 
 
 class UsedLimitsTestCaseV21(test.NoDBTestCase):
-    used_limit_extension = "compute_extension:v3:os-used-limits:used_limits"
+    used_limit_extension = "os_compute_api:os-used-limits"
     include_server_group_quotas = True
 
     def setUp(self):
@@ -67,7 +68,7 @@ class UsedLimitsTestCaseV21(test.NoDBTestCase):
         }
         limits = {}
         expected_abs_limits = []
-        for display_name, q in quota_map.iteritems():
+        for display_name, q in six.iteritems(quota_map):
             limits[q] = {'limit': len(display_name),
                          'in_use': len(display_name) / 2,
                          'reserved': len(display_name) / 3}
@@ -271,36 +272,3 @@ class UsedLimitsTestCaseV2(UsedLimitsTestCaseV21):
 class UsedLimitsTestCaseV2WithoutServerGroupQuotas(UsedLimitsTestCaseV2):
     used_limit_extension = "compute_extension:used_limits_for_admin"
     include_server_group_quotas = False
-
-
-class UsedLimitsTestCaseXml(test.NoDBTestCase):
-    def setUp(self):
-        """Run before each test."""
-        super(UsedLimitsTestCaseXml, self).setUp()
-        self.ext_mgr = self.mox.CreateMock(extensions.ExtensionManager)
-        self.controller = used_limits_v2.UsedLimitsController(self.ext_mgr)
-        self.fake_context = nova.context.RequestContext('fake', 'fake')
-
-    def test_used_limits_xmlns(self):
-        fake_req = FakeRequest(self.fake_context)
-        obj = {
-            "limits": {
-                "rate": [],
-                "absolute": {},
-            },
-        }
-        res = wsgi.ResponseObject(obj, xml=limits.LimitsTemplate)
-        res.preserialize('xml')
-
-        def stub_get_project_quotas(context, project_id, usages=True):
-            return {}
-
-        self.ext_mgr.is_loaded('os-used-limits-for-admin').AndReturn(False)
-        self.stubs.Set(quota.QUOTAS, "get_project_quotas",
-                       stub_get_project_quotas)
-        self.ext_mgr.is_loaded('os-server-group-quotas').AndReturn(False)
-        self.mox.ReplayAll()
-
-        self.controller.index(fake_req, res)
-        response = res.serialize(None, 'xml')
-        self.assertIn(used_limits_v2.XMLNS, response.body)

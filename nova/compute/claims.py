@@ -17,14 +17,15 @@
 Claim objects for use with resource tracking.
 """
 
-from oslo.serialization import jsonutils
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 
 from nova import context
 from nova import exception
 from nova.i18n import _
+from nova.i18n import _LI
 from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import log as logging
 from nova.virt import hardware
 
 
@@ -147,14 +148,11 @@ class Claim(NopClaim):
         memory_mb_limit = limits.get('memory_mb')
         disk_gb_limit = limits.get('disk_gb')
         numa_topology_limit = limits.get('numa_topology')
-        if numa_topology_limit:
-            numa_topology_limit = hardware.VirtNUMALimitTopology.from_json(
-                numa_topology_limit)
 
         msg = _("Attempting claim: memory %(memory_mb)d MB, disk %(disk_gb)d "
                 "GB")
         params = {'memory_mb': self.memory_mb, 'disk_gb': self.disk_gb}
-        LOG.audit(msg % params, instance=self.instance)
+        LOG.info(msg % params, instance=self.instance)
 
         reasons = [self._test_memory(resources, memory_mb_limit),
                    self._test_disk(resources, disk_gb_limit),
@@ -166,7 +164,7 @@ class Claim(NopClaim):
             raise exception.ComputeResourcesUnavailable(reason=
                     "; ".join(reasons))
 
-        LOG.audit(_('Claim successful'), instance=self.instance)
+        LOG.info(_LI('Claim successful'), instance=self.instance)
 
     def _test_memory(self, resources, limit):
         type_ = _("memory")
@@ -206,12 +204,27 @@ class Claim(NopClaim):
         if host_topology:
             host_topology = objects.NUMATopology.obj_from_db_obj(
                     host_topology)
+            pci_requests = objects.InstancePCIRequests.get_by_instance_uuid(
+                                        self.context, self.instance['uuid'])
+
+            pci_stats = None
+            if pci_requests.requests:
+                pci_stats = self.tracker.pci_tracker.stats
+
             instance_topology = (
                     hardware.numa_fit_instance_to_host(
                         host_topology, requested_topology,
-                        limits_topology=limit))
+                        limits=limit,
+                        pci_requests=pci_requests.requests,
+                        pci_stats=pci_stats))
+
             if requested_topology and not instance_topology:
-                return (_("Requested instance NUMA topology cannot fit "
+                if pci_requests.requests:
+                    return (_("Requested instance NUMA topology together with"
+                              " requested PCI devices cannot fit the given"
+                              " host NUMA topology"))
+                else:
+                    return (_("Requested instance NUMA topology cannot fit "
                           "the given host NUMA topology"))
             elif instance_topology:
                 self.claimed_numa_topology = instance_topology
@@ -220,22 +233,22 @@ class Claim(NopClaim):
         """Test if the given type of resource needed for a claim can be safely
         allocated.
         """
-        LOG.audit(_('Total %(type)s: %(total)d %(unit)s, used: %(used).02f '
+        LOG.info(_LI('Total %(type)s: %(total)d %(unit)s, used: %(used).02f '
                     '%(unit)s'),
                   {'type': type_, 'total': total, 'unit': unit, 'used': used},
                   instance=self.instance)
 
         if limit is None:
             # treat resource as unlimited:
-            LOG.audit(_('%(type)s limit not specified, defaulting to '
+            LOG.info(_LI('%(type)s limit not specified, defaulting to '
                         'unlimited'), {'type': type_}, instance=self.instance)
             return
 
         free = limit - used
 
         # Oversubscribed resource policy info:
-        LOG.audit(_('%(type)s limit: %(limit).02f %(unit)s, free: %(free).02f '
-                    '%(unit)s'),
+        LOG.info(_LI('%(type)s limit: %(limit).02f %(unit)s, '
+                     'free: %(free).02f %(unit)s'),
                   {'type': type_, 'limit': limit, 'free': free, 'unit': unit},
                   instance=self.instance)
 

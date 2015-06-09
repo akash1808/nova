@@ -15,6 +15,7 @@
 #    under the License.
 
 import base64
+import collections
 import contextlib
 import copy
 import datetime
@@ -23,13 +24,15 @@ import uuid
 import iso8601
 import mock
 from mox3 import mox
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
+from six.moves import range
 import six.moves.urllib.parse as urlparse
 import testtools
 import webob
 
+from nova.api.openstack import common
 from nova.api.openstack import compute
 from nova.api.openstack.compute import plugins
 from nova.api.openstack.compute.plugins.v3 import disk_config
@@ -42,7 +45,6 @@ from nova.api.openstack.compute.schemas.v3 import servers as servers_schema
 from nova.api.openstack.compute import views
 from nova.api.openstack import extensions
 from nova.compute import api as compute_api
-from nova.compute import delete_types
 from nova.compute import flavors
 from nova.compute import task_states
 from nova.compute import vm_states
@@ -50,7 +52,6 @@ from nova import context
 from nova import db
 from nova.db.sqlalchemy import models
 from nova import exception
-from nova.i18n import _
 from nova.image import glance
 from nova.network import manager
 from nova.network.neutronv2 import api as neutron_api
@@ -230,6 +231,24 @@ class ServersControllerTest(ControllerTest):
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
         self.assertEqual([(None, None, port, None)], res.as_tuples())
+
+    def test_requested_networks_with_duplicate_networks(self):
+        # duplicate networks are allowed only for nova neutron v2.0
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        requested_networks = [{'uuid': network}, {'uuid': network}]
+        self.assertRaises(
+            webob.exc.HTTPBadRequest,
+            self.controller._get_requested_networks,
+            requested_networks)
+
+    def test_requested_networks_with_neutronv2_and_duplicate_networks(self):
+        # duplicate networks are allowed only for nova neutron v2.0
+        self.flags(network_api_class='nova.network.neutronv2.api.API')
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        requested_networks = [{'uuid': network}, {'uuid': network}]
+        res = self.controller._get_requested_networks(requested_networks)
+        self.assertEqual([(network, None, None, None),
+                          (network, None, None, None)], res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_conflict_on_fixed_ip(self):
         self.flags(network_api_class='nova.network.neutronv2.api.API')
@@ -459,30 +478,23 @@ class ServersControllerTest(ControllerTest):
         expected = {
             'addresses': {
                 'private': [
-                    {'version': 4, 'addr': '192.168.0.3',
-                     'OS-EXT-IPS:type': 'fixed',
-                     'OS-EXT-IPS-MAC:mac_addr': 'bb:bb:bb:bb:bb:bb'},
-                    {'version': 4, 'addr': '192.168.0.4',
-                     'OS-EXT-IPS:type': 'fixed',
-                     'OS-EXT-IPS-MAC:mac_addr': 'bb:bb:bb:bb:bb:bb'},
+                    {'version': 4, 'addr': '192.168.0.3'},
+                    {'version': 4, 'addr': '192.168.0.4'},
                 ],
                 'public': [
-                    {'version': 4, 'addr': '172.19.0.1',
-                     'OS-EXT-IPS:type': 'fixed',
-                     'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    {'version': 4, 'addr': '172.19.0.2',
-                     'OS-EXT-IPS:type': 'fixed',
-                     'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    {'version': 4, 'addr': '1.2.3.4',
-                     'OS-EXT-IPS:type': 'fixed',
-                     'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                    {'version': 6, 'addr': 'b33f::fdee:ddff:fecc:bbaa',
-                     'OS-EXT-IPS:type': 'fixed',
-                     'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                    {'version': 4, 'addr': '172.19.0.1'},
+                    {'version': 4, 'addr': '172.19.0.2'},
+                    {'version': 4, 'addr': '1.2.3.4'},
+                    {'version': 6, 'addr': 'b33f::fdee:ddff:fecc:bbaa'},
                 ],
             },
         }
         self.assertThat(res_dict, matchers.DictMatches(expected))
+        # Make sure we kept the addresses in order
+        self.assertIsInstance(res_dict['addresses'], collections.OrderedDict)
+        labels = [vif['network']['label'] for vif in nw_cache]
+        for index, label in enumerate(res_dict['addresses'].keys()):
+            self.assertEqual(label, labels[index])
 
     def test_get_server_addresses_nonexistent_network(self):
         url = '/v3/servers/%s/ips/network_0' % FAKE_UUID
@@ -569,7 +581,7 @@ class ServersControllerTest(ControllerTest):
 
         servers = res_dict['servers']
         self.assertEqual([s['id'] for s in servers],
-                [fakes.get_fake_uuid(i) for i in xrange(len(servers))])
+                [fakes.get_fake_uuid(i) for i in range(len(servers))])
 
         servers_links = res_dict['servers_links']
         self.assertEqual(servers_links[0]['rel'], 'next')
@@ -601,7 +613,7 @@ class ServersControllerTest(ControllerTest):
 
         servers = res['servers']
         self.assertEqual([s['id'] for s in servers],
-                [fakes.get_fake_uuid(i) for i in xrange(len(servers))])
+                [fakes.get_fake_uuid(i) for i in range(len(servers))])
 
         servers_links = res['servers_links']
         self.assertEqual(servers_links[0]['rel'], 'next')
@@ -625,7 +637,7 @@ class ServersControllerTest(ControllerTest):
 
         servers = res['servers']
         self.assertEqual([s['id'] for s in servers],
-                [fakes.get_fake_uuid(i) for i in xrange(len(servers))])
+                [fakes.get_fake_uuid(i) for i in range(len(servers))])
 
         servers_links = res['servers_links']
         self.assertEqual(servers_links[0]['rel'], 'next')
@@ -737,27 +749,6 @@ class ServersControllerTest(ControllerTest):
         servers = self.controller.index(req)['servers']
         self.assertEqual(len(servers), 1)
 
-    def test_tenant_id_filter_implies_all_tenants(self):
-        def fake_get_all(context, filters=None, limit=None, marker=None,
-                         columns_to_join=None, use_slave=False,
-                         expected_attrs=None, sort_keys=None, sort_dirs=None):
-            self.assertNotEqual(filters, None)
-            # The project_id assertion checks that the project_id
-            # filter is set to that specified in the request url and
-            # not that of the context, verifying that the all_tenants
-            # flag was enabled
-            self.assertEqual(filters['project_id'], 'newfake')
-            self.assertFalse(filters.get('tenant_id'))
-            return [fakes.stub_instance(100)]
-
-        self.stubs.Set(db, 'instance_get_all_by_filters_sort',
-                       fake_get_all)
-
-        req = fakes.HTTPRequestV3.blank('/servers?tenant_id=newfake',
-                                      use_admin_context=True)
-        servers = self.controller.index(req)['servers']
-        self.assertEqual(len(servers), 1)
-
     def test_all_tenants_param_normal(self):
         def fake_get_all(context, filters=None, limit=None, marker=None,
                          columns_to_join=None, use_slave=False,
@@ -861,12 +852,11 @@ class ServersControllerTest(ControllerTest):
                        fake_get_all)
 
         rules = {
-            "compute:get_all_tenants":
+            "os_compute_api:servers:index":
                 common_policy.parse_rule("project_id:fake"),
-            "compute:get_all":
-                common_policy.parse_rule("project_id:fake"),
+            "os_compute_api:servers:index:get_all_tenants":
+                common_policy.parse_rule("project_id:fake")
         }
-
         policy.set_rules(rules)
 
         req = fakes.HTTPRequestV3.blank('/servers?all_tenants=1')
@@ -880,9 +870,9 @@ class ServersControllerTest(ControllerTest):
             return [fakes.stub_instance(100)]
 
         rules = {
-            "compute:get_all_tenants":
+            "os_compute_api:servers:index:get_all_tenants":
                 common_policy.parse_rule("project_id:non_fake"),
-            "compute:get_all":
+            "os_compute_api:servers:get_all":
                 common_policy.parse_rule("project_id:fake"),
         }
 
@@ -1032,6 +1022,55 @@ class ServersControllerTest(ControllerTest):
         servers = self.controller.detail(req)['servers']
         self.assertEqual(len(servers), 1)
         self.assertEqual(servers[0]['id'], server_uuid)
+
+    @mock.patch.object(compute_api.API, 'get_all')
+    def test_get_servers_deleted_filter_str_to_bool(self, mock_get_all):
+        server_uuid = str(uuid.uuid4())
+
+        db_list = [fakes.stub_instance(100, uuid=server_uuid,
+                                       vm_state='deleted')]
+        mock_get_all.return_value = instance_obj._make_instance_list(
+            context, objects.InstanceList(), db_list, FIELDS)
+
+        req = fakes.HTTPRequestV3.blank('/servers?deleted=true',
+                                        use_admin_context=True)
+
+        servers = self.controller.detail(req)['servers']
+        self.assertEqual(1, len(servers))
+        self.assertEqual(server_uuid, servers[0]['id'])
+
+        # Assert that 'deleted' filter value is converted to boolean
+        # while calling get_all() method.
+        expected_search_opts = {'deleted': True, 'project_id': 'fake'}
+        mock_get_all.assert_called_once_with(
+            mock.ANY, search_opts=expected_search_opts,
+            limit=mock.ANY, expected_attrs=mock.ANY,
+            marker=mock.ANY, want_objects=mock.ANY,
+            sort_keys=mock.ANY, sort_dirs=mock.ANY)
+
+    @mock.patch.object(compute_api.API, 'get_all')
+    def test_get_servers_deleted_filter_invalid_str(self, mock_get_all):
+        server_uuid = str(uuid.uuid4())
+
+        db_list = [fakes.stub_instance(100, uuid=server_uuid)]
+        mock_get_all.return_value = instance_obj._make_instance_list(
+            context, objects.InstanceList(), db_list, FIELDS)
+
+        req = fakes.HTTPRequest.blank('/fake/servers?deleted=abc',
+                                      use_admin_context=True)
+
+        servers = self.controller.detail(req)['servers']
+        self.assertEqual(1, len(servers))
+        self.assertEqual(server_uuid, servers[0]['id'])
+
+        # Assert that invalid 'deleted' filter value is converted to boolean
+        # False while calling get_all() method.
+        expected_search_opts = {'deleted': False, 'project_id': 'fake'}
+        mock_get_all.assert_called_once_with(
+            mock.ANY, search_opts=expected_search_opts,
+            limit=mock.ANY, expected_attrs=mock.ANY,
+            marker=mock.ANY, want_objects=mock.ANY,
+            sort_keys=mock.ANY, sort_dirs=mock.ANY)
 
     def test_get_servers_allows_name(self):
         server_uuid = str(uuid.uuid4())
@@ -1245,7 +1284,7 @@ class ServersControllerTest(ControllerTest):
         def return_servers_with_host(context, *args, **kwargs):
             return [fakes.stub_instance(i + 1, 'fake', 'fake', host=i % 2,
                                         uuid=fakes.get_fake_uuid(i))
-                    for i in xrange(5)]
+                    for i in range(5)]
 
         self.stubs.Set(db, 'instance_get_all_by_filters_sort',
                        return_servers_with_host)
@@ -1321,9 +1360,9 @@ class ServersControllerDeleteTest(ControllerTest):
 
     def test_delete_locked_server(self):
         req = self._create_delete_request(FAKE_UUID)
-        self.stubs.Set(compute_api.API, delete_types.SOFT_DELETE,
+        self.stubs.Set(compute_api.API, 'soft_delete',
                        fakes.fake_actions_to_locked_server)
-        self.stubs.Set(compute_api.API, delete_types.DELETE,
+        self.stubs.Set(compute_api.API, 'delete',
                        fakes.fake_actions_to_locked_server)
 
         self.assertRaises(webob.exc.HTTPConflict, self.controller.delete,
@@ -1544,7 +1583,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
 
     def test_start_policy_failed(self):
         rules = {
-            "compute:v3:servers:start":
+            "os_compute_api:servers:start":
                 common_policy.parse_rule("project_id:non_fake")
         }
         policy.set_rules(rules)
@@ -1553,7 +1592,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         exc = self.assertRaises(exception.PolicyNotAuthorized,
                                 self.controller._start_server,
                                 req, FAKE_UUID, body)
-        self.assertIn("compute:v3:servers:start", exc.format_message())
+        self.assertIn("os_compute_api:servers:start", exc.format_message())
 
     def test_start_not_ready(self):
         self.stubs.Set(compute_api.API, 'start', fake_start_stop_not_ready)
@@ -1588,7 +1627,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
 
     def test_stop_policy_failed(self):
         rules = {
-            "compute:v3:servers:stop":
+            "os_compute_api:servers:stop":
                 common_policy.parse_rule("project_id:non_fake")
         }
         policy.set_rules(rules)
@@ -1597,7 +1636,7 @@ class ServersControllerRebuildInstanceTest(ControllerTest):
         exc = self.assertRaises(exception.PolicyNotAuthorized,
                                 self.controller._stop_server,
                                 req, FAKE_UUID, body)
-        self.assertIn("compute:v3:servers:stop", exc.format_message())
+        self.assertIn("os_compute_api:servers:stop", exc.format_message())
 
     def test_stop_not_ready(self):
         self.stubs.Set(compute_api.API, 'stop', fake_start_stop_not_ready)
@@ -1685,31 +1724,27 @@ class ServersControllerUpdateTest(ControllerTest):
         self.assertRaises(exception.ValidationError, self.controller.update,
                           req, FAKE_UUID, body=body)
 
-    def test_update_server_admin_password_ignored(self):
+    def test_update_server_admin_password_extra_arg(self):
         inst_dict = dict(name='server_test', admin_password='bacon')
         body = dict(server=inst_dict)
-
-        def server_update(context, id, params):
-            filtered_dict = {
-                'display_name': 'server_test',
-            }
-            self.assertEqual(params, filtered_dict)
-            filtered_dict['uuid'] = id
-            return filtered_dict
-
-        self.stubs.Set(db, 'instance_update', server_update)
-        # FIXME (comstud)
-        #        self.stubs.Set(db, 'instance_get',
-        #                return_server_with_attributes(name='server_test'))
 
         req = fakes.HTTPRequest.blank('/fake/servers/%s' % FAKE_UUID)
         req.method = 'PUT'
         req.content_type = "application/json"
         req.body = jsonutils.dumps(body)
-        res_dict = self.controller.update(req, FAKE_UUID, body=body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          req, FAKE_UUID, body=body)
 
-        self.assertEqual(res_dict['server']['id'], FAKE_UUID)
-        self.assertEqual(res_dict['server']['name'], 'server_test')
+    def test_update_server_host_id(self):
+        inst_dict = dict(host_id='123')
+        body = dict(server=inst_dict)
+
+        req = fakes.HTTPRequest.blank('/fake/servers/%s' % FAKE_UUID)
+        req.method = 'PUT'
+        req.content_type = "application/json"
+        req.body = jsonutils.dumps(body)
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          req, FAKE_UUID, body=body)
 
     def test_update_server_not_found(self):
         def fake_get(*args, **kwargs):
@@ -1783,7 +1818,7 @@ class ServerStatusTest(test.TestCase):
         req = fakes.HTTPRequestV3.blank('/servers/1234/action')
         self.assertRaises(exception.PolicyNotAuthorized,
                 self.controller._action_reboot, req, '1234',
-                {'reboot': {'type': 'HARD'}})
+                body={'reboot': {'type': 'HARD'}})
 
     def test_rebuild(self):
         response = self._get_with_state(vm_states.ACTIVE,
@@ -1885,8 +1920,6 @@ class ServersControllerCreateTest(test.TestCase):
                 "task_state": "",
                 "vm_state": "",
                 "root_device_name": inst.get('root_device_name', 'vda'),
-                "extra": {"pci_requests": None,
-                          "numa_topology": None},
             })
 
             self.instance_cache_by_id[instance['id']] = instance
@@ -1904,11 +1937,6 @@ class ServersControllerCreateTest(test.TestCase):
             instance.update(values)
             return instance
 
-        def server_update(context, instance_uuid, params, update_cells=True):
-            inst = self.instance_cache_by_uuid[instance_uuid]
-            inst.update(params)
-            return inst
-
         def server_update_and_get_original(
                 context, instance_uuid, params, update_cells=False,
                 columns_to_join=None):
@@ -1921,9 +1949,6 @@ class ServersControllerCreateTest(test.TestCase):
 
         def project_get_networks(context, user_id):
             return dict(id='1', host='localhost')
-
-        def queue_get_for(context, *args):
-            return 'network_topic'
 
         fakes.stub_out_rate_limiting(self.stubs)
         fakes.stub_out_key_pair_funcs(self.stubs)
@@ -2319,6 +2344,31 @@ class ServersControllerCreateTest(test.TestCase):
         self._check_admin_password_missing(server)
         self.assertEqual(FAKE_UUID, server['id'])
 
+    @mock.patch('nova.virt.hardware.numa_get_constraints')
+    def _test_create_instance_numa_topology_wrong(self, exc,
+                                                  numa_constraints_mock):
+        numa_constraints_mock.side_effect = exc(**{'name': None,
+                                                   'cpunum': 0,
+                                                   'cpumax': 0,
+                                                   'cpuset': None,
+                                                   'memsize': 0,
+                                                   'memtotal': 0})
+        image_href = 'http://localhost/v2/images/%s' % self.image_uuid
+        self.body['server']['imageRef'] = image_href
+        self.req.body = jsonutils.dumps(self.body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.create, self.req, body=self.body)
+
+    def test_create_instance_numa_topology_wrong(self):
+        for exc in [exception.ImageNUMATopologyIncomplete,
+                    exception.ImageNUMATopologyForbidden,
+                    exception.ImageNUMATopologyAsymmetric,
+                    exception.ImageNUMATopologyCPUOutOfRange,
+                    exception.ImageNUMATopologyCPUDuplicates,
+                    exception.ImageNUMATopologyCPUsUnassigned,
+                    exception.ImageNUMATopologyMemoryOutOfRange]:
+            self._test_create_instance_numa_topology_wrong(exc)
+
     def test_create_instance_too_much_metadata(self):
         self.flags(quota_metadata_items=1)
         image_href = 'http://localhost/v2/images/%s' % self.image_uuid
@@ -2500,18 +2550,18 @@ class ServersControllerCreateTest(test.TestCase):
             self.assertEqual(e.explanation, expected_msg)
 
     def test_create_instance_above_quota_instances(self):
-        msg = _('Quota exceeded for instances: Requested 1, but'
-                ' already used 10 of 10 instances')
+        msg = ('Quota exceeded for instances: Requested 1, but'
+               ' already used 10 of 10 instances')
         self._do_test_create_instance_above_quota('instances', 0, 10, msg)
 
     def test_create_instance_above_quota_ram(self):
-        msg = _('Quota exceeded for ram: Requested 4096, but'
-                ' already used 8192 of 10240 ram')
+        msg = ('Quota exceeded for ram: Requested 4096, but'
+               ' already used 8192 of 10240 ram')
         self._do_test_create_instance_above_quota('ram', 2048, 10 * 1024, msg)
 
     def test_create_instance_above_quota_cores(self):
-        msg = _('Quota exceeded for cores: Requested 2, but'
-                ' already used 9 of 10 cores')
+        msg = ('Quota exceeded for cores: Requested 2, but'
+               ' already used 9 of 10 cores')
         self._do_test_create_instance_above_quota('cores', 1, 10, msg)
 
     def test_create_instance_above_quota_server_group_members(self):
@@ -2608,22 +2658,34 @@ class ServersControllerCreateTest(test.TestCase):
         self.body['server']['max_count'] = 2
 
         def fake_create(*args, **kwargs):
-            msg = _("Unable to launch multiple instances with"
-                    " a single configured port ID. Please launch your"
-                    " instance one by one with different ports.")
+            msg = ("Unable to launch multiple instances with"
+                   " a single configured port ID. Please launch your"
+                   " instance one by one with different ports.")
             raise exception.MultiplePortsNotApplicable(reason=msg)
 
         self.stubs.Set(compute_api.API, 'create', fake_create)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self._test_create_extra, params)
 
-    def test_create_instance_with_neturonv2_not_found_network(self):
+    def test_create_instance_with_neutronv2_not_found_network(self):
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network}]
         params = {'networks': requested_networks}
 
         def fake_create(*args, **kwargs):
             raise exception.NetworkNotFound(network_id=network)
+
+        self.stubs.Set(compute_api.API, 'create', fake_create)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._test_create_extra, params)
+
+    def test_create_instance_with_neturonv2_network_duplicated(self):
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        requested_networks = [{'uuid': network}, {'uuid': network}]
+        params = {'networks': requested_networks}
+
+        def fake_create(*args, **kwargs):
+            raise exception.NetworkDuplicated(network_id=network)
 
         self.stubs.Set(compute_api.API, 'create', fake_create)
         self.assertRaises(webob.exc.HTTPBadRequest,
@@ -2760,12 +2822,14 @@ class ServersViewBuilderTest(test.TestCase):
         super(ServersViewBuilderTest, self).setUp()
         CONF.set_override('host', 'localhost', group='glance')
         self.flags(use_ipv6=True)
+        nw_cache_info = self._generate_nw_cache_info()
         db_inst = fakes.stub_instance(
             id=1,
             image_ref="5",
             uuid="deadbeef-feed-edee-beef-d0ea7beefedd",
             display_name="test_server",
-            include_fake_metadata=False)
+            include_fake_metadata=False,
+            nw_cache=nw_cache_info)
 
         privates = ['172.19.0.1']
         publics = ['192.168.0.3']
@@ -2788,6 +2852,39 @@ class ServersViewBuilderTest(test.TestCase):
                     self.request.context,
                     expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS,
                     **db_inst)
+
+    def _generate_nw_cache_info(self):
+        fixed_ipv4 = ('192.168.1.100', '192.168.2.100', '192.168.3.100')
+        fixed_ipv6 = ('2001:db8:0:1::1',)
+
+        def _ip(ip):
+            return {'address': ip, 'type': 'fixed'}
+
+        nw_cache = [
+            {'address': 'aa:aa:aa:aa:aa:aa',
+             'id': 1,
+             'network': {'bridge': 'br0',
+                         'id': 1,
+                         'label': 'test1',
+                         'subnets': [{'cidr': '192.168.1.0/24',
+                                      'ips': [_ip(fixed_ipv4[0])]},
+                                      {'cidr': 'b33f::/64',
+                                       'ips': [_ip(fixed_ipv6[0])]}]}},
+            {'address': 'bb:bb:bb:bb:bb:bb',
+             'id': 2,
+             'network': {'bridge': 'br0',
+                         'id': 1,
+                         'label': 'test1',
+                         'subnets': [{'cidr': '192.168.2.0/24',
+                                      'ips': [_ip(fixed_ipv4[1])]}]}},
+            {'address': 'cc:cc:cc:cc:cc:cc',
+             'id': 3,
+             'network': {'bridge': 'br0',
+                         'id': 2,
+                         'label': 'test2',
+                         'subnets': [{'cidr': '192.168.3.0/24',
+                                      'ips': [_ip(fixed_ipv4[2])]}]}}]
+        return nw_cache
 
     def test_get_flavor_valid_instance_type(self):
         flavor_bookmark = "http://localhost/flavors/1"
@@ -2883,7 +2980,15 @@ class ServersViewBuilderTest(test.TestCase):
                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
                         {'version': 6, 'addr': '2001:db8:0:1::1',
                          'OS-EXT-IPS:type': 'fixed',
-                         'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'}
+                         'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                        {'version': 4, 'addr': '192.168.2.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'bb:bb:bb:bb:bb:bb'}
+                    ],
+                    'test2': [
+                        {'version': 4, 'addr': '192.168.3.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'cc:cc:cc:cc:cc:cc'},
                     ]
                 },
                 "metadata": {},
@@ -2947,7 +3052,15 @@ class ServersViewBuilderTest(test.TestCase):
                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
                         {'version': 6, 'addr': '2001:db8:0:1::1',
                          'OS-EXT-IPS:type': 'fixed',
-                         'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'}
+                         'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                        {'version': 4, 'addr': '192.168.2.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'bb:bb:bb:bb:bb:bb'}
+                    ],
+                    'test2': [
+                        {'version': 4, 'addr': '192.168.3.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'cc:cc:cc:cc:cc:cc'},
                     ]
                 },
                 "metadata": {},
@@ -3099,7 +3212,15 @@ class ServersViewBuilderTest(test.TestCase):
                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
                         {'version': 6, 'addr': '2001:db8:0:1::1',
                          'OS-EXT-IPS:type': 'fixed',
-                         'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'}
+                         'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                        {'version': 4, 'addr': '192.168.2.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'bb:bb:bb:bb:bb:bb'}
+                    ],
+                    'test2': [
+                        {'version': 4, 'addr': '192.168.3.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'cc:cc:cc:cc:cc:cc'},
                     ]
                 },
                 "metadata": {},
@@ -3167,6 +3288,14 @@ class ServersViewBuilderTest(test.TestCase):
                         {'version': 6, 'addr': '2001:db8:0:1::1',
                          'OS-EXT-IPS:type': 'fixed',
                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                        {'version': 4, 'addr': '192.168.2.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'bb:bb:bb:bb:bb:bb'}
+                    ],
+                    'test2': [
+                        {'version': 4, 'addr': '192.168.3.100',
+                         'OS-EXT-IPS:type': 'fixed',
+                         'OS-EXT-IPS-MAC:mac_addr': 'cc:cc:cc:cc:cc:cc'},
                     ]
                 },
                 "metadata": {"Open": "Stack"},
@@ -3232,18 +3361,15 @@ class ServersAllExtensionsTestCase(test.TestCase):
     def test_update_missing_server(self):
         # Test update with malformed body.
 
-        def fake_update(*args, **kwargs):
-            raise test.TestingException("Should not reach the compute API.")
-
-        self.stubs.Set(compute_api.API, 'update', fake_update)
-
         req = fakes.HTTPRequestV3.blank('/servers/1')
         req.method = 'PUT'
         req.content_type = 'application/json'
         body = {'foo': {'a': 'b'}}
 
         req.body = jsonutils.dumps(body)
-        res = req.get_response(self.app)
+        with mock.patch('nova.objects.Instance.save') as mock_save:
+            res = req.get_response(self.app)
+            self.assertFalse(mock_save.called)
         self.assertEqual(400, res.status_int)
 
 
@@ -3392,3 +3518,260 @@ class TestServersExtensionSchema(test.NoDBTestCase):
 
         actual_schema = self._test_load_extension_schema('resize')
         self.assertEqual(expected_schema, actual_schema)
+
+
+# TODO(alex_xu): There isn't specified file for ips extension. Most of
+# unittest related to ips extension is in this file. So put the ips policy
+# enforcement tests at here until there is specified file for ips extension.
+class IPsPolicyEnforcementV21(test.NoDBTestCase):
+
+    def setUp(self):
+        super(IPsPolicyEnforcementV21, self).setUp()
+        self.controller = ips.IPsController()
+        self.req = fakes.HTTPRequest.blank('')
+
+    def test_index_policy_failed(self):
+        rule_name = "os_compute_api:ips:index"
+        self.policy.set_rules({rule_name: "project:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.index, self.req, fakes.FAKE_UUID)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+    def test_show_policy_failed(self):
+        rule_name = "os_compute_api:ips:show"
+        self.policy.set_rules({rule_name: "project:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.show, self.req, fakes.FAKE_UUID, fakes.FAKE_UUID)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+
+class ServersPolicyEnforcementV21(test.NoDBTestCase):
+
+    def setUp(self):
+        super(ServersPolicyEnforcementV21, self).setUp()
+        ext_info = plugins.LoadedExtensionInfo()
+        ext_info.extensions.update({'os-networks': 'fake'})
+        self.controller = servers.ServersController(extension_info=ext_info)
+        self.req = fakes.HTTPRequest.blank('')
+        self.image_uuid = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
+
+    def _common_policy_check(self, rules, rule_name, func, *arg, **kwarg):
+        self.policy.set_rules(rules)
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized, func, *arg, **kwarg)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+    @mock.patch.object(servers.ServersController, '_get_instance')
+    def test_start_policy_failed(self, _get_instance_mock):
+        _get_instance_mock.return_value = None
+        rule_name = "os_compute_api:servers:start"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller._start_server,
+            self.req, FAKE_UUID, body={})
+
+    @mock.patch.object(servers.ServersController, '_get_instance')
+    def test_stop_policy_failed(self, _get_instance_mock):
+        _get_instance_mock.return_value = None
+        rule_name = "os_compute_api:servers:stop"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller._stop_server,
+            self.req, FAKE_UUID, body={})
+
+    def test_index_policy_failed(self):
+        rule_name = "os_compute_api:servers:index"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller.index, self.req)
+
+    def test_detail_policy_failed(self):
+        rule_name = "os_compute_api:servers:detail"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller.detail, self.req)
+
+    def test_detail_get_tenants_policy_failed(self):
+        req = fakes.HTTPRequest.blank('')
+        req.GET["all_tenants"] = "True"
+        rule_name = "os_compute_api:servers:detail:get_all_tenants"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller._get_servers, req, True)
+
+    def test_index_get_tenants_policy_failed(self):
+        req = fakes.HTTPRequest.blank('')
+        req.GET["all_tenants"] = "True"
+        rule_name = "os_compute_api:servers:index:get_all_tenants"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller._get_servers, req, False)
+
+    @mock.patch.object(common, 'get_instance')
+    def test_show_policy_failed(self, get_instance_mock):
+        get_instance_mock.return_value = None
+        rule_name = "os_compute_api:servers:show"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller.show, self.req, FAKE_UUID)
+
+    def test_delete_policy_failed(self):
+        rule_name = "os_compute_api:servers:delete"
+        rule = {rule_name: "project:non_fake"}
+        self._common_policy_check(
+            rule, rule_name, self.controller.delete, self.req, FAKE_UUID)
+
+    def test_update_policy_failed(self):
+        rule_name = "os_compute_api:servers:update"
+        rule = {rule_name: "project:non_fake"}
+        body = {'server': {'name': 'server_test'}}
+        self._common_policy_check(
+            rule, rule_name, self.controller.update, self.req,
+            FAKE_UUID, body=body)
+
+    def test_confirm_resize_policy_failed(self):
+        rule_name = "os_compute_api:servers:confirm_resize"
+        rule = {rule_name: "project:non_fake"}
+        body = {'server': {'name': 'server_test'}}
+        self._common_policy_check(
+            rule, rule_name, self.controller._action_confirm_resize,
+            self.req, FAKE_UUID, body=body)
+
+    def test_revert_resize_policy_failed(self):
+        rule_name = "os_compute_api:servers:revert_resize"
+        rule = {rule_name: "project:non_fake"}
+        body = {'server': {'name': 'server_test'}}
+        self._common_policy_check(
+            rule, rule_name, self.controller._action_revert_resize,
+            self.req, FAKE_UUID, body=body)
+
+    def test_reboot_policy_failed(self):
+        rule_name = "os_compute_api:servers:reboot"
+        rule = {rule_name: "project:non_fake"}
+        body = {'reboot': {'type': 'HARD'}}
+        self._common_policy_check(
+            rule, rule_name, self.controller._action_reboot,
+            self.req, FAKE_UUID, body=body)
+
+    def test_resize_policy_failed(self):
+        rule_name = "os_compute_api:servers:resize"
+        rule = {rule_name: "project:non_fake"}
+        flavor_id = 1
+        self._common_policy_check(
+            rule, rule_name, self.controller._resize, self.req,
+            FAKE_UUID, flavor_id)
+
+    def test_create_image_policy_failed(self):
+        rule_name = "os_compute_api:servers:create_image"
+        rule = {rule_name: "project:non_fake"}
+        body = {
+            'createImage': {
+                'name': 'Snapshot 1',
+            },
+        }
+        self._common_policy_check(
+            rule, rule_name, self.controller._action_create_image,
+            self.req, FAKE_UUID, body=body)
+
+    @mock.patch.object(compute_api.API, 'is_volume_backed_instance',
+                       return_value=True)
+    @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(servers.ServersController, '_get_server')
+    def test_create_vol_backed_img_snapshotting_policy_blocks_project(self,
+                                                         mock_is_vol_back,
+                                                         mock_get_uuidi,
+                                                         mock_get_server):
+        """Don't permit a snapshot of a volume backed instance if configured
+        not to based on project
+        """
+        rule_name = "os_compute_api:servers:create_image:allow_volume_backed"
+        rules = {
+                rule_name: "project:non_fake",
+                "os_compute_api:servers:create_image": "",
+        }
+        body = {
+            'createImage': {
+                'name': 'Snapshot 1',
+            },
+        }
+        self._common_policy_check(
+            rules, rule_name, self.controller._action_create_image,
+            self.req, FAKE_UUID, body=body)
+
+    @mock.patch.object(compute_api.API, 'is_volume_backed_instance',
+                       return_value=True)
+    @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(servers.ServersController, '_get_server')
+    def test_create_vol_backed_img_snapshotting_policy_blocks_role(self,
+                                                         mock_is_vol_back,
+                                                         mock_get_uuidi,
+                                                         mock_get_server):
+        """Don't permit a snapshot of a volume backed instance if configured
+        not to based on role
+        """
+        rule_name = "os_compute_api:servers:create_image:allow_volume_backed"
+        rules = {
+                rule_name: "role:non_fake",
+                "os_compute_api:servers:create_image": "",
+        }
+        body = {
+            'createImage': {
+                'name': 'Snapshot 1',
+            },
+        }
+        self._common_policy_check(
+            rules, rule_name, self.controller._action_create_image,
+            self.req, FAKE_UUID, body=body)
+
+    def _create_policy_check(self, rules, rule_name):
+        flavor_ref = 'http://localhost/123/flavors/3'
+        body = {
+            'server': {
+                'name': 'server_test',
+                'imageRef': self.image_uuid,
+                'flavorRef': flavor_ref,
+                'availability_zone': "zone1:host1:node1",
+                'block_device_mapping': [{'device_name': "/dev/sda1"}],
+                'networks': [{'uuid': 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'}],
+                'metadata': {
+                    'hello': 'world',
+                    'open': 'stack',
+                },
+            },
+        }
+        self._common_policy_check(
+            rules, rule_name, self.controller.create, self.req, body=body)
+
+    def test_create_policy_failed(self):
+        rule_name = "os_compute_api:servers:create"
+        rules = {rule_name: "project:non_fake"}
+        self._create_policy_check(rules, rule_name)
+
+    def test_create_forced_host_policy_failed(self):
+        rule_name = "os_compute_api:servers:create:forced_host"
+        rule = {"os_compute_api:servers:create": "@",
+                rule_name: "project:non_fake"}
+        self._create_policy_check(rule, rule_name)
+
+    def test_create_attach_volume_policy_failed(self):
+        rule_name = "os_compute_api:servers:create:attach_volume"
+        rules = {"os_compute_api:servers:create": "@",
+                 "os_compute_api:servers:create:forced_host": "@",
+                 rule_name: "project:non_fake"}
+        self._create_policy_check(rules, rule_name)
+
+    def test_create_attach_attach_network_policy_failed(self):
+        rule_name = "os_compute_api:servers:create:attach_network"
+        rules = {"os_compute_api:servers:create": "@",
+                 "os_compute_api:servers:create:forced_host": "@",
+                 "os_compute_api:servers:create:attach_volume": "@",
+                 rule_name: "project:non_fake"}
+        self._create_policy_check(rules, rule_name)

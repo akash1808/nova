@@ -19,16 +19,16 @@ import traceback
 import fixtures
 import mock
 import netaddr
-from oslo.serialization import jsonutils
-from oslo.utils import importutils
-from oslo.utils import timeutils
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
+from oslo_utils import timeutils
 import six
 
 from nova.compute import manager
 from nova.console import type as ctype
 from nova import exception
 from nova import objects
-from nova.openstack.common import log as logging
 from nova import test
 from nova.tests.unit import fake_block_device
 from nova.tests.unit.image import fake as fake_image
@@ -108,6 +108,8 @@ class _FakeDriverBackendTestCase(object):
             'nova.virt.libvirt.firewall.libvirt',
             fakelibvirt))
 
+        fakelibvirt.disable_event_thread(self)
+
         self.flags(rescue_image_id="2",
                    rescue_kernel_id="3",
                    rescue_ramdisk_id=None,
@@ -138,7 +140,7 @@ class _FakeDriverBackendTestCase(object):
                        'extend', fake_extend)
 
         self.stubs.Set(nova.virt.libvirt.driver.LibvirtDriver,
-                       '_delete_instance_files',
+                       'delete_instance_files',
                        fake_delete_instance_files)
 
         # Like the existing fakelibvirt.migrateToURI, do nothing,
@@ -187,7 +189,7 @@ class VirtDriverLoaderTestCase(_FakeDriverBackendTestCase, test.TestCase):
         }
 
     def test_load_new_drivers(self):
-        for cls, driver in self.new_drivers.iteritems():
+        for cls, driver in six.iteritems(self.new_drivers):
             self.flags(compute_driver=cls)
             # NOTE(sdague) the try block is to make it easier to debug a
             # failure by knowing which driver broke
@@ -315,8 +317,10 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_rescue(self):
+        image_meta = {}
         instance_ref, network_info = self._get_running_instance()
-        self.connection.rescue(self.ctxt, instance_ref, network_info, None, '')
+        self.connection.rescue(self.ctxt, instance_ref, network_info,
+                               image_meta, '')
 
     @catch_notimplementederror
     def test_unrescue_unrescued_instance(self):
@@ -325,8 +329,10 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_unrescue_rescued_instance(self):
+        image_meta = {}
         instance_ref, network_info = self._get_running_instance()
-        self.connection.rescue(self.ctxt, instance_ref, network_info, None, '')
+        self.connection.rescue(self.ctxt, instance_ref, network_info,
+                               image_meta, '')
         self.connection.unrescue(instance_ref, network_info)
 
     @catch_notimplementederror
@@ -394,7 +400,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_suspend(self):
         instance_ref, network_info = self._get_running_instance()
-        self.connection.suspend(instance_ref)
+        self.connection.suspend(self.ctxt, instance_ref)
 
     @catch_notimplementederror
     def test_resume_unsuspended_instance(self):
@@ -404,7 +410,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_resume_suspended_instance(self):
         instance_ref, network_info = self._get_running_instance()
-        self.connection.suspend(instance_ref)
+        self.connection.suspend(self.ctxt, instance_ref)
         self.connection.resume(self.ctxt, instance_ref, network_info)
 
     @catch_notimplementederror
@@ -538,7 +544,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     @catch_notimplementederror
     def test_block_stats(self):
         instance_ref, network_info = self._get_running_instance()
-        stats = self.connection.block_stats(instance_ref['name'], 'someid')
+        stats = self.connection.block_stats(instance_ref, 'someid')
         self.assertEqual(len(stats), 5)
 
     @catch_notimplementederror
@@ -664,7 +670,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_get_host_uptime(self):
-        self.connection.get_host_uptime('a useless argument?')
+        self.connection.get_host_uptime()
 
     @catch_notimplementederror
     def test_host_power_action_reboot(self):
@@ -760,7 +766,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     def test_get_instance_disk_info(self):
         # This should be implemented by any driver that supports live migrate.
         instance_ref, network_info = self._get_running_instance()
-        self.connection.get_instance_disk_info(instance_ref['name'],
+        self.connection.get_instance_disk_info(instance_ref,
                                                block_device_info={})
 
 
@@ -840,7 +846,7 @@ class LibvirtConnTestCase(_VirtDriverTestCase, test.TestCase):
                                return_value=service_mock):
             self.connection._set_host_enabled(True)
             self.assertFalse(service_mock.disabled)
-            self.assertEqual(service_mock.disabled_reason, 'None')
+            self.assertIsNone(service_mock.disabled_reason)
 
     def test_set_host_enabled_when_manually_disabled(self):
         self.mox.UnsetStubs()

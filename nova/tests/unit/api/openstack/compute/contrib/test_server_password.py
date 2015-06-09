@@ -13,13 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-import webob
+from oslo_config import cfg
 
 from nova.api.metadata import password
+from nova.api.openstack.compute.contrib import server_password \
+    as server_password_v2
+from nova.api.openstack.compute.plugins.v3 import server_password \
+    as server_password_v21
 from nova import compute
+from nova import exception
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_instance
@@ -29,8 +31,10 @@ CONF = cfg.CONF
 CONF.import_opt('osapi_compute_ext_list', 'nova.api.openstack.compute.contrib')
 
 
-class ServerPasswordTestV21(test.TestCase):
+class ServerPasswordTestV21(test.NoDBTestCase):
     content_type = 'application/json'
+    server_password = server_password_v21
+    delete_call = 'self.controller.clear'
 
     def setUp(self):
         super(ServerPasswordTestV21, self).setUp()
@@ -43,7 +47,8 @@ class ServerPasswordTestV21(test.TestCase):
                 system_metadata={},
                 expected_attrs=['system_metadata']))
         self.password = 'fakepass'
-        self.fakes_wsgi_app = fakes.wsgi_app_v21
+        self.controller = self.server_password.ServerPasswordController()
+        self.fake_req = fakes.HTTPRequest.blank('')
 
         def fake_extract_password(instance):
             return self.password
@@ -55,50 +60,44 @@ class ServerPasswordTestV21(test.TestCase):
         self.stubs.Set(password, 'extract_password', fake_extract_password)
         self.stubs.Set(password, 'convert_password', fake_convert_password)
 
-    def _make_request(self, url, method='GET'):
-        req = webob.Request.blank(url)
-        req.headers['Accept'] = self.content_type
-        req.method = method
-        res = req.get_response(
-                self.fakes_wsgi_app(init_only=('servers',
-                                               'os-server-password')))
-        return res
-
-    def _get_pass(self, body):
-        return jsonutils.loads(body).get('password')
-
     def test_get_password(self):
-        url = '/v2/fake/servers/fake/os-server-password'
-        res = self._make_request(url)
-
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(self._get_pass(res.body), 'fakepass')
+        res = self.controller.index(self.fake_req, 'fake')
+        self.assertEqual(res['password'], 'fakepass')
 
     def test_reset_password(self):
-        url = '/v2/fake/servers/fake/os-server-password'
-        res = self._make_request(url, 'DELETE')
-        self.assertEqual(res.status_int, 204)
+        eval(self.delete_call)(self.fake_req, 'fake')
+        self.assertEqual(eval(self.delete_call).wsgi_code, 204)
 
-        res = self._make_request(url)
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(self._get_pass(res.body), '')
+        res = self.controller.index(self.fake_req, 'fake')
+        self.assertEqual(res['password'], '')
 
 
 class ServerPasswordTestV2(ServerPasswordTestV21):
+    server_password = server_password_v2
+    delete_call = 'self.controller.delete'
+
+
+class ServerPasswordPolicyEnforcementV21(test.NoDBTestCase):
 
     def setUp(self):
-        super(ServerPasswordTestV2, self).setUp()
-        self.flags(
-            osapi_compute_extension=[
-                'nova.api.openstack.compute.contrib.select_extensions'],
-            osapi_compute_ext_list=['Server_password'])
-        self.fakes_wsgi_app = fakes.wsgi_app
+        super(ServerPasswordPolicyEnforcementV21, self).setUp()
+        self.controller = server_password_v21.ServerPasswordController()
+        self.req = fakes.HTTPRequest.blank('')
 
+    def _test_policy_failed(self, method, rule_name):
+        self.policy.set_rules({rule_name: "project:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            method, self.req, fakes.FAKE_UUID)
 
-@test.skipXmlTest("Nova v2 XML support is disabled")
-class ServerPasswordXmlTestV2(ServerPasswordTestV2):
-    content_type = 'application/xml'
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
 
-    def _get_pass(self, body):
-        # NOTE(vish): first element is password
-        return etree.XML(body).text or ''
+    def test_get_password_policy_failed(self):
+        rule_name = "os_compute_api:os-server-password"
+        self._test_policy_failed(self.controller.index, rule_name)
+
+    def test_clear_password_policy_failed(self):
+        rule_name = "os_compute_api:os-server-password"
+        self._test_policy_failed(self.controller.clear, rule_name)

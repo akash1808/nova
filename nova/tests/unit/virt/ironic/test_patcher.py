@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova import context as nova_context
 from nova import test
@@ -45,20 +45,48 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
         self._expected_cleanup_patch = []
 
     def test_create_generic(self):
-        node = ironic_utils.get_test_node(driver='fake')
-        patcher_obj = patcher.create(node)
-        self.assertIsInstance(patcher_obj, patcher.GenericDriverFields)
-
-    def test_create_pxe(self):
         node = ironic_utils.get_test_node(driver='pxe_fake')
         patcher_obj = patcher.create(node)
-        self.assertIsInstance(patcher_obj, patcher.PXEDriverFields)
+        self.assertIsInstance(patcher_obj, patcher.GenericDriverFields)
 
     def test_generic_get_deploy_patch(self):
         node = ironic_utils.get_test_node(driver='fake')
         patch = patcher.create(node).get_deploy_patch(
                 self.instance, self.image_meta, self.flavor)
         self.assertEqual(sorted(self._expected_deploy_patch), sorted(patch))
+
+    def test_generic_get_deploy_patch_capabilities(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['capabilities:boot_mode'] = 'bios'
+        expected = [{'path': '/instance_info/capabilities',
+                     'value': '{"boot_mode": "bios"}',
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+                self.instance, self.image_meta, self.flavor)
+        self.assertEqual(sorted(expected), sorted(patch))
+
+    def test_generic_get_deploy_patch_capabilities_op(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['capabilities:boot_mode'] = '<in> bios'
+        expected = [{'path': '/instance_info/capabilities',
+                     'value': '{"boot_mode": "<in> bios"}',
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+                self.instance, self.image_meta, self.flavor)
+        self.assertEqual(sorted(expected), sorted(patch))
+
+    def test_generic_get_deploy_patch_capabilities_nested_key(self):
+        node = ironic_utils.get_test_node(driver='fake')
+        self.flavor['extra_specs']['capabilities:key1:key2'] = '<in> bios'
+        expected = [{'path': '/instance_info/capabilities',
+                     'value': '{"key1:key2": "<in> bios"}',
+                     'op': 'add'}]
+        expected += self._expected_deploy_patch
+        patch = patcher.create(node).get_deploy_patch(
+                self.instance, self.image_meta, self.flavor)
+        self.assertEqual(sorted(expected), sorted(patch))
 
     def test_generic_get_deploy_patch_ephemeral(self):
         CONF.set_override('default_ephemeral_format', 'testfmt')
@@ -91,49 +119,4 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
         node = ironic_utils.get_test_node(driver='fake')
         patch = patcher.create(node).get_cleanup_patch(self.instance, None,
                                                        self.flavor)
-        self.assertEqual(self._expected_cleanup_patch, patch)
-
-    def test_pxe_get_deploy_patch(self):
-        node = ironic_utils.get_test_node(driver='pxe_fake')
-        extra_specs = self.flavor['extra_specs']
-        expected = [{'path': '/driver_info/pxe_deploy_kernel',
-                     'value': extra_specs['baremetal:deploy_kernel_id'],
-                     'op': 'add'},
-                    {'path': '/driver_info/pxe_deploy_ramdisk',
-                     'value': extra_specs['baremetal:deploy_ramdisk_id'],
-                     'op': 'add'}]
-        expected += self._expected_deploy_patch
-        patch = patcher.create(node).get_deploy_patch(
-                self.instance, self.image_meta, self.flavor)
-        self.assertEqual(sorted(expected), sorted(patch))
-
-    def test_pxe_get_deploy_patch_no_flavor_kernel_ramdisk_ids(self):
-        flavor = ironic_utils.get_test_flavor(extra_specs={})
-        node = ironic_utils.get_test_node(driver='pxe_fake')
-        patch = patcher.create(node).get_deploy_patch(
-                self.instance, self.image_meta, flavor)
-        # If there's no extra_specs patch should be exactly like a
-        # generic patch
-        self.assertEqual(sorted(self._expected_deploy_patch), sorted(patch))
-
-    def test_pxe_get_cleanup_patch(self):
-        driver_info = {'pxe_deploy_kernel': 'fake-kernel-id',
-                       'pxe_deploy_ramdisk': 'fake-ramdisk-id'}
-        node = ironic_utils.get_test_node(driver='pxe_fake',
-                                          driver_info=driver_info)
-        patch = patcher.create(node).get_cleanup_patch(self.instance, None,
-                                                       self.flavor)
-        expected = [{'path': '/driver_info/pxe_deploy_kernel',
-                     'op': 'remove'},
-                    {'path': '/driver_info/pxe_deploy_ramdisk',
-                     'op': 'remove'}]
-        self.assertEqual(sorted(expected), sorted(patch))
-
-    def test_pxe_get_cleanup_patch_no_flavor_kernel_ramdisk_ids(self):
-        self.flavor = ironic_utils.get_test_flavor(extra_specs={})
-        node = ironic_utils.get_test_node(driver='pxe_fake')
-        patch = patcher.create(node).get_cleanup_patch(self.instance, None,
-                                                       self.flavor)
-        # If there's no extra_specs patch should be exactly like a
-        # generic patch
         self.assertEqual(self._expected_cleanup_patch, patch)

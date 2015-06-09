@@ -16,11 +16,12 @@
 Tests For Cells RPCAPI
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
 import six
 
 from nova.cells import rpcapi as cells_rpcapi
 from nova import exception
+from nova import objects
 from nova import test
 from nova.tests.unit import fake_instance
 
@@ -125,17 +126,20 @@ class CellsAPITestCase(test.NoDBTestCase):
     def test_build_instances(self):
         call_info = self._stub_rpc_method('cast', None)
 
+        instances = [objects.Instance(id=1),
+                     objects.Instance(id=2)]
+
         self.cells_rpcapi.build_instances(
-                self.fake_context, instances=['1', '2'],
+                self.fake_context, instances=instances,
                 image={'fake': 'image'}, arg1=1, arg2=2, arg3=3)
 
-        expected_args = {'build_inst_kwargs': {'instances': ['1', '2'],
+        expected_args = {'build_inst_kwargs': {'instances': instances,
                                                'image': {'fake': 'image'},
                                                'arg1': 1,
                                                'arg2': 2,
                                                'arg3': 3}}
         self._check_result(call_info, 'build_instances',
-                expected_args, version='1.30')
+                expected_args, version='1.34')
 
     def test_get_capacities(self):
         capacity_info = {"capacity": "info"}
@@ -662,12 +666,14 @@ class CellsAPITestCase(test.NoDBTestCase):
                                           dict(cow='moo'),
                                           'fake-hint',
                                           'fake-flavor',
-                                          'fake-reservations')
+                                          'fake-reservations',
+                                          clean_shutdown=True)
         expected_args = {'instance': 'fake-instance',
                          'flavor': 'fake-flavor',
-                         'extra_instance_updates': dict(cow='moo')}
+                         'extra_instance_updates': dict(cow='moo'),
+                         'clean_shutdown': True}
         self._check_result(call_info, 'resize_instance',
-                           expected_args, version='1.20')
+                           expected_args, version='1.33')
 
     def test_live_migrate_instance(self):
         call_info = self._stub_rpc_method('cast', None)

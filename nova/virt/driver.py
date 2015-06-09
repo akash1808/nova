@@ -22,11 +22,11 @@ Driver base-classes:
 
 import sys
 
-from oslo.config import cfg
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
 
 from nova.i18n import _, _LE, _LI
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt import event as virtevent
 
@@ -34,13 +34,14 @@ driver_opts = [
     cfg.StrOpt('compute_driver',
                help='Driver to use for controlling virtualization. Options '
                     'include: libvirt.LibvirtDriver, xenapi.XenAPIDriver, '
-                    'fake.FakeDriver, baremetal.BareMetalDriver, '
+                    'fake.FakeDriver, ironic.IronicDriver, '
                     'vmwareapi.VMwareVCDriver, hyperv.HyperVDriver'),
     cfg.StrOpt('default_ephemeral_format',
                help='The default format an ephemeral_volume will be '
                     'formatted with on creation.'),
     cfg.StrOpt('preallocate_images',
                default='none',
+               choices=('none', 'space'),
                help='VM image preallocation mode: '
                     '"none" => no storage provisioning is done up front, '
                     '"space" => storage is fully allocated at instance start'),
@@ -136,7 +137,8 @@ class ComputeDriver(object):
     capabilities = {
         "has_imagecache": False,
         "supports_recreate": False,
-        }
+        "supports_migrate_to_same_host": False
+    }
 
     def __init__(self, virtapi):
         self.virtapi = virtapi
@@ -268,8 +270,7 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def spawn(self, context, instance, image_meta, injected_files,
-              admin_password, network_info=None, block_device_info=None,
-              flavor=None):
+              admin_password, network_info=None, block_device_info=None):
         """Create a new instance/VM/domain on the virtualization platform.
 
         Once this successfully completes, the instance should be
@@ -291,7 +292,6 @@ class ComputeDriver(object):
            :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
         :param block_device_info: Information about block devices to be
                                   attached to the instance.
-        :param flavor: The flavor for the instance to be spawned.
         """
         raise NotImplementedError()
 
@@ -566,12 +566,12 @@ class ComputeDriver(object):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
-    def suspend(self, instance):
+    def suspend(self, context, instance):
         """suspend the specified instance.
 
+        :param context: the context for the suspend
         :param instance: nova.objects.instance.Instance
         """
-        # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def resume(self, context, instance, network_info, block_device_info=None):
@@ -818,12 +818,11 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def get_instance_disk_info(self, instance_name,
+    def get_instance_disk_info(self, instance,
                                block_device_info=None):
         """Retrieve information about actual disk sizes of an instance.
 
-        :param instance_name:
-            name of a nova instance as returned by list_instances()
+        :param instance: nova.objects.Instance
         :param block_device_info:
             Optional; Can be used to filter out devices which are
             actually volumes.
@@ -964,7 +963,7 @@ class ComputeDriver(object):
         """Set the root password on the specified instance.
 
         :param instance: nova.objects.instance.Instance
-        :param new_password: the new password
+        :param new_pass: the new password
         """
         raise NotImplementedError()
 
@@ -1027,7 +1026,7 @@ class ComputeDriver(object):
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
-    def get_host_uptime(self, host):
+    def get_host_uptime(self):
         """Returns the result of calling "uptime" on the target host."""
         # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
@@ -1069,9 +1068,9 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def block_stats(self, instance_name, disk_id):
+    def block_stats(self, instance, disk_id):
         """Return performance counters associated with the given disk_id on the
-        given instance_name.  These are returned as [rd_req, rd_bytes, wr_req,
+        given instance.  These are returned as [rd_req, rd_bytes, wr_req,
         wr_bytes, errs], where rd indicates read, wr indicates write, req is
         the total number of I/O requests made, bytes is the total number of
         bytes transferred, and errs is the number of requests held up due to a
@@ -1155,7 +1154,7 @@ class ComputeDriver(object):
         related to other calls into the driver. The prime example is to clean
         the cache and remove images which are no longer of interest.
 
-        :param instances: nova.objects.instance.InstanceList
+        :param all_instances: nova.objects.instance.InstanceList
         """
         pass
 

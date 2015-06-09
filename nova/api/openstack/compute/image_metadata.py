@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import six
 from webob import exc
 
 from nova.api.openstack import common
@@ -37,14 +38,12 @@ class Controller(object):
             msg = _("Image not found.")
             raise exc.HTTPNotFound(explanation=msg)
 
-    @wsgi.serializers(xml=common.MetadataTemplate)
     def index(self, req, image_id):
         """Returns the list of metadata for a given instance."""
         context = req.environ['nova.context']
         metadata = self._get_image(context, image_id)['properties']
         return dict(metadata=metadata)
 
-    @wsgi.serializers(xml=common.MetaItemTemplate)
     def show(self, req, image_id, id):
         context = req.environ['nova.context']
         metadata = self._get_image(context, image_id)['properties']
@@ -53,13 +52,11 @@ class Controller(object):
         else:
             raise exc.HTTPNotFound()
 
-    @wsgi.serializers(xml=common.MetadataTemplate)
-    @wsgi.deserializers(xml=common.MetadataDeserializer)
     def create(self, req, image_id, body):
         context = req.environ['nova.context']
         image = self._get_image(context, image_id)
         if 'metadata' in body:
-            for key, value in body['metadata'].iteritems():
+            for key, value in six.iteritems(body['metadata']):
                 image['properties'][key] = value
         common.check_img_metadata_properties_quota(context,
                                                    image['properties'])
@@ -70,8 +67,6 @@ class Controller(object):
             raise exc.HTTPForbidden(explanation=e.format_message())
         return dict(metadata=image['properties'])
 
-    @wsgi.serializers(xml=common.MetaItemTemplate)
-    @wsgi.deserializers(xml=common.MetaItemDeserializer)
     def update(self, req, image_id, id, body):
         context = req.environ['nova.context']
 
@@ -99,8 +94,6 @@ class Controller(object):
             raise exc.HTTPForbidden(explanation=e.format_message())
         return dict(meta=meta)
 
-    @wsgi.serializers(xml=common.MetadataTemplate)
-    @wsgi.deserializers(xml=common.MetadataDeserializer)
     def update_all(self, req, image_id, body):
         context = req.environ['nova.context']
         image = self._get_image(context, image_id)

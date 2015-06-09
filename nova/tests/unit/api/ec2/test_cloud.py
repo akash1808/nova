@@ -27,15 +27,19 @@ import tempfile
 import fixtures
 import iso8601
 import mock
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
+from oslo_utils import uuidutils
 
 from nova.api.ec2 import cloud
 from nova.api.ec2 import ec2utils
 from nova.api.ec2 import inst_state
 from nova.api.metadata import password
+from nova import availability_zones
 from nova.compute import api as compute_api
 from nova.compute import flavors
+from nova.compute import manager as compute_manager
 from nova.compute import power_state
 from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import utils as compute_utils
@@ -47,12 +51,10 @@ from nova.image import s3
 from nova.network import api as network_api
 from nova.network import base_api as base_network_api
 from nova.network import model
-from nova.network import neutronv2
+from nova.network.neutronv2 import api as neutronapi
 from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import log as logging
 from nova.openstack.common import policy as common_policy
-from nova.openstack.common import uuidutils
 from nova import policy
 from nova import test
 from nova.tests.unit.api.openstack.compute.contrib import (
@@ -140,6 +142,7 @@ class CloudTestCase(test.TestCase):
         super(CloudTestCase, self).setUp()
         self.useFixture(test.SampleNetworks())
         ec2utils.reset_cache()
+        availability_zones.reset_cache()
         self.flags(compute_driver='nova.virt.fake.FakeDriver',
                    volume_api_class='nova.tests.unit.fake_volume.API')
         self.useFixture(fixtures.FakeLogger('boto'))
@@ -199,6 +202,12 @@ class CloudTestCase(test.TestCase):
                                               is_admin=True)
         self.volume_api = volume.API()
 
+        self.stubs.Set(compute_manager.ComputeManager,
+                       '_update_scheduler_instance_info', dumb)
+        self.stubs.Set(compute_manager.ComputeManager,
+                       '_delete_scheduler_instance_info', dumb)
+        self.stubs.Set(compute_manager.ComputeManager,
+                       '_sync_scheduler_instance_info', dumb)
         self.useFixture(cast_as_call.CastAsCall(self.stubs))
 
         # make sure we can map ami-00000001/2 to a uuid in FakeImageService
@@ -575,16 +584,16 @@ class CloudTestCase(test.TestCase):
             'user_id': self.context.user_id,
             'name': 'test'
         }
-        sec = db.security_group_create(self.context,
-                                       {'project_id': 'someuser',
-                                        'user_id': 'someuser',
-                                        'description': '',
-                                        'name': 'somegroup1'})
-        sec = db.security_group_create(self.context,
-                                       {'project_id': 'someuser',
-                                        'user_id': 'someuser',
-                                        'description': '',
-                                        'name': 'othergroup2'})
+        db.security_group_create(self.context,
+                                 {'project_id': 'someuser',
+                                 'user_id': 'someuser',
+                                 'description': '',
+                                 'name': 'somegroup1'})
+        db.security_group_create(self.context,
+                                 {'project_id': 'someuser',
+                                  'user_id': 'someuser',
+                                  'description': '',
+                                  'name': 'othergroup2'})
         sec = db.security_group_create(self.context, kwargs)
         authz = self.cloud.authorize_security_group_ingress
         kwargs = {'ip_permissions': [{'to_port': 81, 'from_port': 81,
@@ -757,7 +766,7 @@ class CloudTestCase(test.TestCase):
             expected_rules[0]['toPort'] = 65535
         self.assertTrue(expected_rules == actual_rules)
         describe = self.cloud.describe_security_groups
-        groups = describe(self.context, group_name=['test'])
+        describe(self.context, group_name=['test'])
 
         db.security_group_destroy(self.context, sec['id'])
 
@@ -1008,15 +1017,15 @@ class CloudTestCase(test.TestCase):
                        fake_change_instance_metadata)
 
         utc = iso8601.iso8601.Utc()
-
+        flavor = flavors.get_flavor(1)
         # Create some test images
         sys_meta = flavors.save_flavor_info(
-            {}, flavors.get_flavor(1))
+            {}, flavor)
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         inst1_kwargs = {
                 'reservation_id': 'a',
                 'image_ref': image_uuid,
-                'instance_type_id': 1,
+                'instance_type_id': flavor.id,
                 'host': 'host1',
                 'vm_state': 'active',
                 'launched_at': timeutils.utcnow(),
@@ -1029,7 +1038,7 @@ class CloudTestCase(test.TestCase):
         inst2_kwargs = {
                 'reservation_id': 'b',
                 'image_ref': image_uuid,
-                'instance_type_id': 1,
+                'instance_type_id': flavor.id,
                 'host': 'host2',
                 'vm_state': 'active',
                 'launched_at': timeutils.utcnow(),
@@ -1075,7 +1084,7 @@ class CloudTestCase(test.TestCase):
                               'instanceId': 'i-00000001',
                               'instanceState': {'code': 16,
                                                 'name': 'running'},
-                              'instanceType': u'm1.medium',
+                              'instanceType': flavor.name,
                               'ipAddress': '1.2.3.4',
                               'keyName': 'None (None, host1)',
                               'launchTime':
@@ -1106,7 +1115,7 @@ class CloudTestCase(test.TestCase):
                                'instanceId': 'i-00000002',
                                'instanceState': {'code': 16,
                                                  'name': 'running'},
-                               'instanceType': u'm1.medium',
+                               'instanceType': flavor.name,
                                'ipAddress': '1.2.3.4',
                                'keyName': u'None (None, host2)',
                                'launchTime':
@@ -1130,33 +1139,36 @@ class CloudTestCase(test.TestCase):
 
         # No filter
         result = self.cloud.describe_instances(self.context)
-        self.assertEqual(result, {'reservationSet': [inst1_ret, inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet':
+                                      [inst1_ret, inst2_ret]})
 
         # Key search
         # Both should have tags with key 'foo' and value 'bar'
         filters = {'filter': [{'name': 'tag:foo',
                                'value': ['bar']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst1_ret, inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet':
+                                      [inst1_ret, inst2_ret]})
 
         # Both should have tags with key 'foo'
         filters = {'filter': [{'name': 'tag-key',
                                'value': ['foo']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst1_ret, inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet':
+                                          [inst1_ret, inst2_ret]})
 
         # Value search
         # Only inst2 should have tags with key 'baz' and value 'quux'
         filters = {'filter': [{'name': 'tag:baz',
                                'value': ['quux']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet': [inst2_ret]})
 
         # Only inst2 should have tags with value 'quux'
         filters = {'filter': [{'name': 'tag-value',
                                'value': ['quux']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet': [inst2_ret]})
 
         # Multiple values
         # Both should have tags with key 'baz' and values in the set
@@ -1164,7 +1176,8 @@ class CloudTestCase(test.TestCase):
         filters = {'filter': [{'name': 'tag:baz',
                                'value': ['quux', 'wibble']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst1_ret, inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet':
+                                      [inst1_ret, inst2_ret]})
 
         # Both should have tags with key 'baz' or tags with value 'bar'
         filters = {'filter': [{'name': 'tag-key',
@@ -1172,7 +1185,8 @@ class CloudTestCase(test.TestCase):
                               {'name': 'tag-value',
                                'value': ['bar']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst1_ret, inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet':
+                                      [inst1_ret, inst2_ret]})
 
         # Confirm deletion of tags
         # Check for format 'tag:'
@@ -1180,17 +1194,17 @@ class CloudTestCase(test.TestCase):
         filters = {'filter': [{'name': 'tag:foo',
                               'value': ['bar']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet': [inst2_ret]})
 
         # Check for format 'tag-'
         filters = {'filter': [{'name': 'tag-key',
                               'value': ['foo']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet': [inst2_ret]})
         filters = {'filter': [{'name': 'tag-value',
                               'value': ['bar']}]}
         result = self.cloud.describe_instances(self.context, **filters)
-        self.assertEqual(result, {'reservationSet': [inst2_ret]})
+        self.assertJsonEqual(result, {'reservationSet': [inst2_ret]})
 
         # destroy the test instances
         db.instance_destroy(self.context, inst1['uuid'])
@@ -1913,27 +1927,35 @@ class CloudTestCase(test.TestCase):
         good_names = ('a', 'a' * 255, string.ascii_letters + ' -_')
         bad_names = ('', 'a' * 256, '*', '/')
 
-        for key_name in good_names:
-            result = self.cloud.create_key_pair(self.context,
+        with mock.patch.object(self.cloud.keypair_api,
+                '_generate_key_pair') as mock_generate_key_pair:
+            mock_generate_key_pair.return_value = (
+                "private_key", "public_key", "fingerprint")
+            for key_name in good_names:
+                result = self.cloud.create_key_pair(self.context,
                                                 key_name)
-            self.assertEqual(result['keyName'], key_name)
+                self.assertEqual(result['keyName'], key_name)
 
-        for key_name in bad_names:
-            self.assertRaises(exception.InvalidKeypair,
+            for key_name in bad_names:
+                self.assertRaises(exception.InvalidKeypair,
                               self.cloud.create_key_pair,
                               self.context,
                               key_name)
 
     def test_create_key_pair_quota_limit(self):
-        self.flags(quota_key_pairs=10)
-        for i in range(0, 10):
-            key_name = 'key_%i' % i
-            result = self.cloud.create_key_pair(self.context,
+        with mock.patch.object(self.cloud.keypair_api,
+                '_generate_key_pair') as mock_generate_key_pair:
+            mock_generate_key_pair.return_value = (
+                "private_key", "public_key", "fingerprint")
+            self.flags(quota_key_pairs=10)
+            for i in range(0, 10):
+                key_name = 'key_%i' % i
+                result = self.cloud.create_key_pair(self.context,
                                                 key_name)
-            self.assertEqual(result['keyName'], key_name)
+                self.assertEqual(result['keyName'], key_name)
 
-        # 11'th group should fail
-        self.assertRaises(exception.KeypairLimitExceeded,
+            # 11'th group should fail
+            self.assertRaises(exception.KeypairLimitExceeded,
                           self.cloud.create_key_pair,
                           self.context,
                           'foo')
@@ -3150,8 +3172,8 @@ class CloudTestCaseNeutronProxy(test.NoDBTestCase):
         super(CloudTestCaseNeutronProxy, self).setUp()
         cfg.CONF.set_override('security_group_api', 'neutron')
         self.cloud = cloud.CloudController()
-        self.original_client = neutronv2.get_client
-        neutronv2.get_client = test_neutron.get_client
+        self.original_client = neutronapi.get_client
+        neutronapi.get_client = test_neutron.get_client
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id,
@@ -3159,7 +3181,7 @@ class CloudTestCaseNeutronProxy(test.NoDBTestCase):
                                               is_admin=True)
 
     def tearDown(self):
-        neutronv2.get_client = self.original_client
+        neutronapi.get_client = self.original_client
         test_neutron.get_client()._reset()
         super(CloudTestCaseNeutronProxy, self).tearDown()
 
@@ -3208,9 +3230,13 @@ class CloudTestCaseNeutronProxy(test.NoDBTestCase):
         self.assertTrue(delete(self.context, 'testgrp'))
 
 
-class FormatMappingTestCase(test.TestCase):
+class FormatMappingTestCase(test.NoDBTestCase):
 
     def test_format_mapping(self):
+        id_to_ec2_snap_id_map = {
+            '993b31ac-452e-4fed-b745-7718385f1811': 'snap-00000001',
+            'b409a2de-1c79-46bf-aa7e-ebdb4bf427ef': 'snap-00000002',
+        }
         properties = {'block_device_mapping':
                 [{'guest_format': None, 'boot_index': 0,
                   'no_device': None, 'volume_id': None,
@@ -3242,7 +3268,6 @@ class FormatMappingTestCase(test.TestCase):
                   'rootDeviceType': 'instance-store',
                   'rootDeviceName': '/dev/vda',
                   'imageType': 'machine', 'name': 'xb'}
-        cloud._format_mappings(properties, result)
         expected = {'architecture': None,
                     'blockDeviceMapping':
                     [{'ebs': {'snapshotId': 'snap-00000002'}}],
@@ -3256,4 +3281,9 @@ class FormatMappingTestCase(test.TestCase):
                     'name': 'xb',
                     'rootDeviceName': '/dev/vda',
                     'rootDeviceType': 'instance-store'}
+
+        with mock.patch.object(ec2utils, 'id_to_ec2_snap_id',
+                               lambda id: id_to_ec2_snap_id_map[id]):
+            cloud._format_mappings(properties, result)
+
         self.assertEqual(expected, result)

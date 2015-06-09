@@ -13,20 +13,44 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
+
 from nova.compute import api as compute_api
-from nova.compute import manager as compute_manager
-from nova import context
 from nova import db
-from nova import objects
 from nova.tests.functional.v3 import test_servers
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_block_device
 from nova.tests.unit import fake_instance
-from nova.volume import cinder
+
+CONF = cfg.CONF
+CONF.import_opt('osapi_compute_extension',
+                'nova.api.openstack.compute.extensions')
 
 
 class ExtendedVolumesSampleJsonTests(test_servers.ServersSampleBase):
     extension_name = "os-extended-volumes"
+    extra_extensions_to_load = ["os-access-ips"]
+    # TODO(park): Overriding '_api_version' till all functional tests
+    # are merged between v2 and v2.1. After that base class variable
+    # itself can be changed to 'v2'
+    _api_version = 'v2'
+
+    def _get_flags(self):
+        f = super(ExtendedVolumesSampleJsonTests, self)._get_flags()
+        f['osapi_compute_extension'] = CONF.osapi_compute_extension[:]
+        f['osapi_compute_extension'].append(
+            'nova.api.openstack.compute.contrib.extended_volumes.'
+                      'Extended_volumes')
+        f['osapi_compute_extension'].append(
+            'nova.api.openstack.compute.contrib.keypairs.'
+                      'Keypairs')
+        f['osapi_compute_extension'].append(
+            'nova.api.openstack.compute.contrib.extended_ips_mac.'
+                      'Extended_ips_mac')
+        f['osapi_compute_extension'].append(
+            'nova.api.openstack.compute.contrib.extended_ips.'
+                      'Extended_ips')
+        return f
 
     def _stub_compute_api_get_instance_bdms(self, server_id):
 
@@ -65,6 +89,8 @@ class ExtendedVolumesSampleJsonTests(test_servers.ServersSampleBase):
         response = self._do_get('servers/%s' % uuid)
         subs = self._get_regexes()
         subs['hostid'] = '[a-f0-9]+'
+        subs['access_ip_v4'] = '1.2.3.4'
+        subs['access_ip_v6'] = '80fe::'
         self._verify_response('server-get-resp', subs, response, 200)
 
     def test_detail(self):
@@ -75,77 +101,6 @@ class ExtendedVolumesSampleJsonTests(test_servers.ServersSampleBase):
         subs = self._get_regexes()
         subs['id'] = uuid
         subs['hostid'] = '[a-f0-9]+'
+        subs['access_ip_v4'] = '1.2.3.4'
+        subs['access_ip_v6'] = '80fe::'
         self._verify_response('servers-detail-resp', subs, response, 200)
-
-    def test_attach_volume(self):
-        bdm = objects.BlockDeviceMapping()
-        device_name = '/dev/vdd'
-        bdm['device_name'] = device_name
-        self.stubs.Set(cinder.API, 'get', fakes.stub_volume_get)
-        self.stubs.Set(cinder.API, 'check_attach', lambda *a, **k: None)
-        self.stubs.Set(cinder.API, 'reserve_volume', lambda *a, **k: None)
-        self.stubs.Set(compute_manager.ComputeManager,
-                       "reserve_block_device_name",
-                       lambda *a, **k: bdm)
-        self.stubs.Set(compute_manager.ComputeManager,
-                       'attach_volume',
-                       lambda *a, **k: None)
-
-        volume = fakes.stub_volume_get(None, context.get_admin_context(),
-                                       'a26887c6-c47b-4654-abb5-dfadf7d3f803')
-        subs = {
-            'volume_id': volume['id'],
-            'device': device_name,
-            'disk_bus': 'ide',
-            'device_type': 'cdrom'
-        }
-        server_id = self._post_server()
-        response = self._do_post('servers/%s/action'
-                                 % server_id,
-                                 'attach-volume-req', subs)
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.content, '')
-
-    def test_detach_volume(self):
-        server_id = self._post_server()
-        attach_id = "a26887c6-c47b-4654-abb5-dfadf7d3f803"
-        self._stub_compute_api_get_instance_bdms(server_id)
-        self._stub_compute_api_get()
-        self.stubs.Set(cinder.API, 'get', fakes.stub_volume_get)
-        self.stubs.Set(compute_api.API, 'detach_volume', lambda *a, **k: None)
-        subs = {
-            'volume_id': attach_id,
-        }
-        response = self._do_post('servers/%s/action'
-                                 % server_id, 'detach-volume-req', subs)
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.content, '')
-
-    def test_swap_volume(self):
-        server_id = self._post_server()
-        old_volume_id = "a26887c6-c47b-4654-abb5-dfadf7d3f803"
-        old_new_volume = 'a26887c6-c47b-4654-abb5-dfadf7d3f805'
-        self._stub_compute_api_get_instance_bdms(server_id)
-
-        def stub_volume_get(self, context, volume_id):
-            if volume_id == old_volume_id:
-                return fakes.stub_volume(volume_id, instance_uuid=server_id)
-            else:
-                return fakes.stub_volume(volume_id, instance_uuid=None,
-                                         attach_status='detached')
-
-        self.stubs.Set(cinder.API, 'get', stub_volume_get)
-        self.stubs.Set(cinder.API, 'begin_detaching', lambda *a, **k: None)
-        self.stubs.Set(cinder.API, 'check_attach', lambda *a, **k: None)
-        self.stubs.Set(cinder.API, 'check_detach', lambda *a, **k: None)
-        self.stubs.Set(cinder.API, 'reserve_volume', lambda *a, **k: None)
-        self.stubs.Set(compute_manager.ComputeManager, 'swap_volume',
-                       lambda *a, **k: None)
-        subs = {
-            'old_volume_id': old_volume_id,
-            'new_volume_id': old_new_volume
-        }
-        response = self._do_post('servers/%s/action' % server_id,
-                                 'swap-volume-req', subs)
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.content, '')

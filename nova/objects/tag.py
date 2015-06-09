@@ -16,6 +16,7 @@ from nova.objects import base
 from nova.objects import fields
 
 
+@base.NovaObjectRegistry.register
 class Tag(base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'
@@ -28,21 +29,22 @@ class Tag(base.NovaObject):
     @staticmethod
     def _from_db_object(context, tag, db_tag):
         for key in tag.fields:
-            tag[key] = db_tag[key]
+            setattr(tag, key, db_tag[key])
         tag.obj_reset_changes()
         tag._context = context
         return tag
 
     @base.remotable
-    def create(self, context):
-        db_tag = db.instance_tag_add(context, self.resource_id, self.tag)
-        self._from_db_object(context, self, db_tag)
+    def create(self):
+        db_tag = db.instance_tag_add(self._context, self.resource_id, self.tag)
+        self._from_db_object(self._context, self, db_tag)
 
     @base.remotable_classmethod
     def destroy(cls, context, resource_id, name):
         db.instance_tag_delete(context, resource_id, name)
 
 
+@base.NovaObjectRegistry.register
 class TagList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'

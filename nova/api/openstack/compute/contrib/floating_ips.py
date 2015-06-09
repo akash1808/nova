@@ -15,49 +15,24 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import netaddr
+from oslo_log import log as logging
+from oslo_utils import uuidutils
 import webob
 
 from nova.api.openstack import common
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova import compute
 from nova.compute import utils as compute_utils
 from nova import exception
 from nova.i18n import _
 from nova.i18n import _LW
 from nova import network
-from nova.openstack.common import log as logging
-from nova.openstack.common import uuidutils
 
 
 LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute', 'floating_ips')
-
-
-def make_float_ip(elem):
-    elem.set('id')
-    elem.set('ip')
-    elem.set('pool')
-    elem.set('fixed_ip')
-    elem.set('instance_id')
-
-
-class FloatingIPTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('floating_ip',
-                                       selector='floating_ip')
-        make_float_ip(root)
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class FloatingIPsTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('floating_ips')
-        elem = xmlutil.SubTemplateElement(root, 'floating_ip',
-                                          selector='floating_ips')
-        make_float_ip(elem)
-        return xmlutil.MasterTemplate(root, 1)
 
 
 def _translate_floating_ip_view(floating_ip):
@@ -86,8 +61,7 @@ def get_instance_by_floating_ip_addr(self, context, address):
     snagiibfa = self.network_api.get_instance_id_by_floating_address
     instance_id = snagiibfa(context, address)
     if instance_id:
-        return common.get_instance(self.compute_api, context, instance_id,
-                                   want_objects=True)
+        return common.get_instance(self.compute_api, context, instance_id)
 
 
 def disassociate_floating_ip(self, context, instance, address):
@@ -108,7 +82,6 @@ class FloatingIPController(object):
         self.network_api = network.API()
         super(FloatingIPController, self).__init__()
 
-    @wsgi.serializers(xml=FloatingIPTemplate)
     def show(self, req, id):
         """Return data about the given floating ip."""
         context = req.environ['nova.context']
@@ -122,7 +95,6 @@ class FloatingIPController(object):
 
         return _translate_floating_ip_view(floating_ip)
 
-    @wsgi.serializers(xml=FloatingIPsTemplate)
     def index(self, req):
         """Return a list of floating ips allocated to a project."""
         context = req.environ['nova.context']
@@ -132,7 +104,6 @@ class FloatingIPController(object):
 
         return _translate_floating_ips_view(floating_ips)
 
-    @wsgi.serializers(xml=FloatingIPTemplate)
     def create(self, req, body=None):
         context = req.environ['nova.context']
         authorize(context)
@@ -207,10 +178,12 @@ class FloatingIPActionController(wsgi.Controller):
             msg = _("Address not specified")
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         cached_nwinfo = compute_utils.get_nw_info_for_instance(instance)
         if not cached_nwinfo:
+            LOG.warning(
+                _LW('Info cache is %r during associate') % instance.info_cache,
+                instance=instance)
             msg = _('No nw_info cache associated with instance')
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
@@ -231,10 +204,19 @@ class FloatingIPActionController(wsgi.Controller):
                     raise webob.exc.HTTPBadRequest(explanation=msg)
 
         if not fixed_address:
-            fixed_address = fixed_ips[0]['address']
+            try:
+                fixed_address = next(ip['address'] for ip in fixed_ips
+                                     if netaddr.valid_ipv4(ip['address']))
+            except StopIteration:
+                msg = _('Unable to associate floating ip %(address)s '
+                        'to any fixed IPs for instance %(id)s. '
+                        'Instance has no fixed IPv4 addresses to '
+                        'associate.') % (
+                        {'address': address, 'id': id})
+                raise webob.exc.HTTPBadRequest(explanation=msg)
             if len(fixed_ips) > 1:
-                LOG.warning(_LW('multiple fixed_ips exist, using the first: '
-                                '%s'), fixed_address)
+                LOG.warning(_LW('multiple fixed_ips exist, using the first '
+                                'IPv4 fixed_ip: %s'), fixed_address)
 
         try:
             self.network_api.associate_floating_ip(context, instance,
@@ -292,8 +274,8 @@ class FloatingIPActionController(wsgi.Controller):
         if (instance and
             floating_ip.get('fixed_ip_id') and
             (uuidutils.is_uuid_like(id) and
-             [instance['uuid'] == id] or
-             [instance['id'] == id])[0]):
+             [instance.uuid == id] or
+             [instance.id == id])[0]):
             try:
                 disassociate_floating_ip(self, context, instance, address)
             except exception.FloatingIpNotAssociated:
@@ -303,7 +285,7 @@ class FloatingIPActionController(wsgi.Controller):
         else:
             msg = _("Floating ip %(address)s is not associated with instance "
                     "%(id)s.") % {'address': address, 'id': id}
-            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
+            raise webob.exc.HTTPConflict(explanation=msg)
 
 
 class Floating_ips(extensions.ExtensionDescriptor):

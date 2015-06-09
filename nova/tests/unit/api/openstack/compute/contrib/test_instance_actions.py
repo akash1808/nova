@@ -16,7 +16,7 @@
 import copy
 import uuid
 
-from lxml import etree
+import six
 from webob import exc
 
 from nova.api.openstack.compute.contrib import instance_actions \
@@ -27,6 +27,7 @@ from nova.compute import api as compute_api
 from nova import db
 from nova.db.sqlalchemy import models
 from nova import exception
+from nova import objects
 from nova.openstack.common import policy as common_policy
 from nova import policy
 from nova import test
@@ -82,7 +83,7 @@ class InstanceActionsPolicyTestV21(test.NoDBTestCase):
 
     def _set_policy_rules(self):
         rules = {'compute:get': common_policy.parse_rule(''),
-                 'compute_extension:v3:os-instance-actions':
+                 'os_compute_api:os-instance-actions':
                      common_policy.parse_rule('project_id:%(project_id)s')}
         policy.set_rules(rules)
 
@@ -138,10 +139,11 @@ class InstanceActionsTestV21(test.NoDBTestCase):
 
         def fake_get(self, context, instance_uuid, expected_attrs=None,
                      want_objects=False):
-            return {'uuid': instance_uuid}
+            return objects.Instance(uuid=instance_uuid)
 
         def fake_instance_get_by_uuid(context, instance_id, use_slave=False):
-            return {'name': 'fake', 'project_id': context.project_id}
+            return fake_instance.fake_instance_obj(None,
+                **{'name': 'fake', 'project_id': context.project_id})
 
         self.stubs.Set(compute_api.API, 'get', fake_get)
         self.stubs.Set(db, 'instance_get_by_uuid', fake_instance_get_by_uuid)
@@ -153,16 +155,16 @@ class InstanceActionsTestV21(test.NoDBTestCase):
 
     def _set_policy_rules(self):
         rules = {'compute:get': common_policy.parse_rule(''),
-                 'compute_extension:v3:os-instance-actions':
+                 'os_compute_api:os-instance-actions':
                      common_policy.parse_rule(''),
-                 'compute_extension:v3:os-instance-actions:events':
+                 'os_compute_api:os-instance-actions:events':
                      common_policy.parse_rule('is_admin:True')}
         policy.set_rules(rules)
 
     def test_list_actions(self):
         def fake_get_actions(context, uuid):
             actions = []
-            for act in self.fake_actions[uuid].itervalues():
+            for act in six.itervalues(self.fake_actions[uuid]):
                 action = models.InstanceAction()
                 action.update(act)
                 actions.append(action)
@@ -255,73 +257,3 @@ class InstanceActionsTestV2(InstanceActionsTestV21):
                  'compute_extension:instance_actions:events':
                      common_policy.parse_rule('is_admin:True')}
         policy.set_rules(rules)
-
-
-class InstanceActionsSerializerTestV2(test.NoDBTestCase):
-    def setUp(self):
-        super(InstanceActionsSerializerTestV2, self).setUp()
-        self.fake_actions = copy.deepcopy(fake_server_actions.FAKE_ACTIONS)
-        self.fake_events = copy.deepcopy(fake_server_actions.FAKE_EVENTS)
-
-    def _verify_instance_action_attachment(self, attach, tree):
-        for key in attach.keys():
-            if key != 'events':
-                self.assertEqual(attach[key], tree.get(key),
-                                 '%s did not match' % key)
-
-    def _verify_instance_action_event_attachment(self, attach, tree):
-        for key in attach.keys():
-            self.assertEqual(attach[key], tree.get(key),
-                             '%s did not match' % key)
-
-    def test_instance_action_serializer(self):
-        serializer = instance_actions_v2.InstanceActionTemplate()
-        action = self.fake_actions[FAKE_UUID][FAKE_REQUEST_ID]
-        text = serializer.serialize({'instanceAction': action})
-        tree = etree.fromstring(text)
-
-        action = format_action(action)
-        self.assertEqual('instanceAction', tree.tag)
-        self._verify_instance_action_attachment(action, tree)
-        found_events = False
-        for child in tree:
-            if child.tag == 'events':
-                found_events = True
-        self.assertFalse(found_events)
-
-    def test_instance_action_events_serializer(self):
-        serializer = instance_actions_v2.InstanceActionTemplate()
-        action = self.fake_actions[FAKE_UUID][FAKE_REQUEST_ID]
-        event = self.fake_events[action['id']][0]
-        action['events'] = [dict(event), dict(event)]
-        text = serializer.serialize({'instanceAction': action})
-        tree = etree.fromstring(text)
-
-        action = format_action(action)
-        self.assertEqual('instanceAction', tree.tag)
-        self._verify_instance_action_attachment(action, tree)
-
-        event = format_event(event)
-        found_events = False
-        for child in tree:
-            if child.tag == 'events':
-                found_events = True
-                for key in event:
-                    self.assertEqual(event[key], child.get(key))
-        self.assertTrue(found_events)
-
-    def test_instance_actions_serializer(self):
-        serializer = instance_actions_v2.InstanceActionsTemplate()
-        action_list = self.fake_actions[FAKE_UUID].values()
-        text = serializer.serialize({'instanceActions': action_list})
-        tree = etree.fromstring(text)
-
-        action_list = [format_action(action) for action in action_list]
-        self.assertEqual('instanceActions', tree.tag)
-        self.assertEqual(len(action_list), len(tree))
-        for idx, child in enumerate(tree):
-            self.assertEqual('instanceAction', child.tag)
-            request_id = child.get('request_id')
-            self._verify_instance_action_attachment(
-                                    self.fake_actions[FAKE_UUID][request_id],
-                                    child)

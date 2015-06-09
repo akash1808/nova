@@ -13,13 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.utils import strutils
+from oslo_utils import strutils
 import six.moves.urllib.parse as urlparse
 import webob
 
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 import nova.context
 from nova import exception
 from nova.i18n import _
@@ -38,19 +37,6 @@ EXTENDED_QUOTAS = {'server_groups': 'os-server-group-quotas',
 authorize_update = extensions.extension_authorizer('compute', 'quotas:update')
 authorize_show = extensions.extension_authorizer('compute', 'quotas:show')
 authorize_delete = extensions.extension_authorizer('compute', 'quotas:delete')
-
-
-class QuotaTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('quota_set', selector='quota_set')
-        root.set('id')
-
-        for resource in QUOTAS.resources:
-            if resource not in EXTENDED_QUOTAS:
-                elem = xmlutil.SubTemplateElement(root, resource)
-                elem.text = resource
-
-        return xmlutil.MasterTemplate(root, 1)
 
 
 class QuotaSetsController(wsgi.Controller):
@@ -111,9 +97,8 @@ class QuotaSetsController(wsgi.Controller):
         if usages:
             return values
         else:
-            return dict((k, v['limit']) for k, v in values.items())
+            return {k: v['limit'] for k, v in values.items()}
 
-    @wsgi.serializers(xml=QuotaTemplate)
     def show(self, req, id):
         context = req.environ['nova.context']
         authorize_show(context)
@@ -128,7 +113,6 @@ class QuotaSetsController(wsgi.Controller):
         except exception.Forbidden:
             raise webob.exc.HTTPForbidden()
 
-    @wsgi.serializers(xml=QuotaTemplate)
     def update(self, req, id, body):
         context = req.environ['nova.context']
         authorize_update(context)
@@ -163,6 +147,9 @@ class QuotaSetsController(wsgi.Controller):
             raise webob.exc.HTTPBadRequest(explanation=msg)
         quota_set = body['quota_set']
 
+        # NOTE(dims): Pass #1 - In this loop for quota_set.items(), we figure
+        # out if we have bad keys or if we need to forcibly set quotas or
+        # if some of the values for the quotas can be converted to integers.
         for key, value in quota_set.items():
             if (key not in self.supported_quotas
                 and key not in NON_QUOTA_KEYS):
@@ -174,7 +161,7 @@ class QuotaSetsController(wsgi.Controller):
                 force_update = strutils.bool_from_string(value)
             elif key not in NON_QUOTA_KEYS and value:
                 try:
-                    value = utils.validate_integer(value, key)
+                    utils.validate_integer(value, key)
                 except exception.InvalidInput as e:
                     raise webob.exc.HTTPBadRequest(
                         explanation=e.format_message())
@@ -183,6 +170,11 @@ class QuotaSetsController(wsgi.Controller):
             msg = _("Bad key(s) %s in quota_set") % ",".join(bad_keys)
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
+        # NOTE(dims): Pass #2 - In this loop for quota_set.items(), based on
+        # force_update flag we validate the quota limit. A loop just for
+        # the validation of min/max values ensure that we can bail out if
+        # any of the items in the set is bad.
+        valid_quotas = {}
         for key, value in quota_set.items():
             if key in NON_QUOTA_KEYS or (not value and value != 0):
                 continue
@@ -194,7 +186,13 @@ class QuotaSetsController(wsgi.Controller):
                 minimum = settable_quotas[key]['minimum']
                 maximum = settable_quotas[key]['maximum']
                 self._validate_quota_limit(key, value, minimum, maximum)
+            valid_quotas[key] = value
 
+        # NOTE(dims): Pass #3 - At this point we know that all the keys and
+        # values are valid and we can iterate and update them all in one
+        # shot without having to worry about rolling back etc as we have done
+        # the validation up front in the 2 loops above.
+        for key, value in valid_quotas.items():
             try:
                 objects.Quotas.create_limit(context, project_id,
                                             key, value, user_id=user_id)
@@ -206,7 +204,6 @@ class QuotaSetsController(wsgi.Controller):
         values = self._get_quotas(context, id, user_id=user_id)
         return self._format_quota_set(None, values)
 
-    @wsgi.serializers(xml=QuotaTemplate)
     def defaults(self, req, id):
         context = req.environ['nova.context']
         authorize_show(context)

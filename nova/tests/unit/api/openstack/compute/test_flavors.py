@@ -13,14 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
+import six
 import six.moves.urllib.parse as urlparse
 import webob
 
 from nova.api.openstack import common
 from nova.api.openstack.compute import flavors as flavors_v2
-from nova.api.openstack.compute.plugins.v3 import flavors as flavors_v3
-from nova.api.openstack import xmlutil
+from nova.api.openstack.compute.plugins.v3 import flavors as flavors_v21
 import nova.compute.flavors
 from nova import context
 from nova import db
@@ -115,7 +114,7 @@ def return_flavor_not_found(flavor_id, ctxt=None):
 
 class FlavorsTestV21(test.TestCase):
     _prefix = "/v3"
-    Controller = flavors_v3.FlavorsController
+    Controller = flavors_v21.FlavorsController
     fake_request = fakes.HTTPRequestV3
     _rspv = "v3"
     _fake = ""
@@ -287,7 +286,7 @@ class FlavorsTestV21(test.TestCase):
     def test_get_flavor_detail_with_limit(self):
         url = self._prefix + '/flavors/detail?limit=1'
         req = self.fake_request.blank(url)
-        response = self.controller.index(req)
+        response = self.controller.detail(req)
         response_list = response["flavors"]
         response_links = response["flavors_links"]
 
@@ -295,6 +294,9 @@ class FlavorsTestV21(test.TestCase):
             {
                 "id": "1",
                 "name": "flavor 1",
+                "ram": "256",
+                "disk": "10",
+                "vcpus": "",
                 "links": [
                     {
                         "rel": "self",
@@ -309,11 +311,14 @@ class FlavorsTestV21(test.TestCase):
                 ],
             },
         ]
+        self._set_expected_body(expected_flavors[0], ephemeral='20',
+                                swap='10', disabled=False)
+
         self.assertEqual(response_list, expected_flavors)
         self.assertEqual(response_links[0]['rel'], 'next')
 
         href_parts = urlparse.urlparse(response_links[0]['href'])
-        self.assertEqual('/' + self._rspv + '/flavors', href_parts.path)
+        self.assertEqual('/' + self._rspv + '/flavors/detail', href_parts.path)
         params = urlparse.parse_qs(href_parts.query)
         self.assertThat({'limit': ['1'], 'marker': ['1']},
                         matchers.DictMatches(params))
@@ -571,244 +576,9 @@ class FlavorsTestV20(FlavorsTestV21):
         pass
 
 
-class FlavorsXMLSerializationTest(test.TestCase):
-
-    def test_xml_declaration(self):
-        serializer = flavors_v2.FlavorTemplate()
-
-        fixture = {
-            "flavor": {
-                "id": "12",
-                "name": "asdf",
-                "ram": "256",
-                "disk": "10",
-                "vcpus": "",
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": "http://localhost/v2/fake/flavors/12",
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": "http://localhost/fake/flavors/12",
-                    },
-                ],
-            },
-        }
-
-        output = serializer.serialize(fixture)
-        has_dec = output.startswith("<?xml version='1.0' encoding='UTF-8'?>")
-        self.assertTrue(has_dec)
-
-    def test_show(self):
-        serializer = flavors_v2.FlavorTemplate()
-
-        fixture = {
-            "flavor": {
-                "id": "12",
-                "name": "asdf",
-                "ram": "256",
-                "disk": "10",
-                "vcpus": "",
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": "http://localhost/v2/fake/flavors/12",
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": "http://localhost/fake/flavors/12",
-                    },
-                ],
-            },
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'flavor')
-        flavor_dict = fixture['flavor']
-
-        for key in ['name', 'id', 'ram', 'disk']:
-            self.assertEqual(root.get(key), str(flavor_dict[key]))
-
-        link_nodes = root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 2)
-        for i, link in enumerate(flavor_dict['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-    def test_show_handles_integers(self):
-        serializer = flavors_v2.FlavorTemplate()
-
-        fixture = {
-            "flavor": {
-                "id": 12,
-                "name": "asdf",
-                "ram": 256,
-                "disk": 10,
-                "vcpus": "",
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": "http://localhost/v2/fake/flavors/12",
-                    },
-                    {
-                        "rel": "bookmark",
-                        "href": "http://localhost/fake/flavors/12",
-                    },
-                ],
-            },
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'flavor')
-        flavor_dict = fixture['flavor']
-
-        for key in ['name', 'id', 'ram', 'disk']:
-            self.assertEqual(root.get(key), str(flavor_dict[key]))
-
-        link_nodes = root.findall('{0}link'.format(ATOMNS))
-        self.assertEqual(len(link_nodes), 2)
-        for i, link in enumerate(flavor_dict['links']):
-            for key, value in link.items():
-                self.assertEqual(link_nodes[i].get(key), value)
-
-    def test_detail(self):
-        serializer = flavors_v2.FlavorsTemplate()
-
-        fixture = {
-            "flavors": [
-                {
-                    "id": "23",
-                    "name": "flavor 23",
-                    "ram": "512",
-                    "disk": "20",
-                    "vcpus": "",
-                    "links": [
-                        {
-                            "rel": "self",
-                            "href": "http://localhost/v2/fake/flavors/23",
-                        },
-                        {
-                            "rel": "bookmark",
-                            "href": "http://localhost/fake/flavors/23",
-                        },
-                    ],
-                },
-                {
-                    "id": "13",
-                    "name": "flavor 13",
-                    "ram": "256",
-                    "disk": "10",
-                    "vcpus": "",
-                    "links": [
-                        {
-                            "rel": "self",
-                            "href": "http://localhost/v2/fake/flavors/13",
-                        },
-                        {
-                            "rel": "bookmark",
-                            "href": "http://localhost/fake/flavors/13",
-                        },
-                    ],
-                },
-            ],
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'flavors')
-        flavor_elems = root.findall('{0}flavor'.format(NS))
-        self.assertEqual(len(flavor_elems), 2)
-        for i, flavor_elem in enumerate(flavor_elems):
-            flavor_dict = fixture['flavors'][i]
-
-            for key in ['name', 'id', 'ram', 'disk']:
-                self.assertEqual(flavor_elem.get(key), str(flavor_dict[key]))
-
-            link_nodes = flavor_elem.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 2)
-            for i, link in enumerate(flavor_dict['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-    def test_index(self):
-        serializer = flavors_v2.MinimalFlavorsTemplate()
-
-        fixture = {
-            "flavors": [
-                {
-                    "id": "23",
-                    "name": "flavor 23",
-                    "ram": "512",
-                    "disk": "20",
-                    "vcpus": "",
-                    "links": [
-                        {
-                            "rel": "self",
-                            "href": "http://localhost/v2/fake/flavors/23",
-                        },
-                        {
-                            "rel": "bookmark",
-                            "href": "http://localhost/fake/flavors/23",
-                        },
-                    ],
-                },
-                {
-                    "id": "13",
-                    "name": "flavor 13",
-                    "ram": "256",
-                    "disk": "10",
-                    "vcpus": "",
-                    "links": [
-                        {
-                            "rel": "self",
-                            "href": "http://localhost/v2/fake/flavors/13",
-                        },
-                        {
-                            "rel": "bookmark",
-                            "href": "http://localhost/fake/flavors/13",
-                        },
-                    ],
-                },
-            ],
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'flavors')
-        flavor_elems = root.findall('{0}flavor'.format(NS))
-        self.assertEqual(len(flavor_elems), 2)
-        for i, flavor_elem in enumerate(flavor_elems):
-            flavor_dict = fixture['flavors'][i]
-
-            for key in ['name', 'id']:
-                self.assertEqual(flavor_elem.get(key), str(flavor_dict[key]))
-
-            link_nodes = flavor_elem.findall('{0}link'.format(ATOMNS))
-            self.assertEqual(len(link_nodes), 2)
-            for i, link in enumerate(flavor_dict['links']):
-                for key, value in link.items():
-                    self.assertEqual(link_nodes[i].get(key), value)
-
-    def test_index_empty(self):
-        serializer = flavors_v2.MinimalFlavorsTemplate()
-
-        fixture = {
-            "flavors": [],
-        }
-
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'flavors')
-        flavor_elems = root.findall('{0}flavor'.format(NS))
-        self.assertEqual(len(flavor_elems), 0)
-
-
 class DisabledFlavorsWithRealDBTestV21(test.TestCase):
     """Tests that disabled flavors should not be shown nor listed."""
-    Controller = flavors_v3.FlavorsController
+    Controller = flavors_v21.FlavorsController
     _prefix = "/v3"
     fake_request = fakes.HTTPRequestV3
 
@@ -838,7 +608,7 @@ class DisabledFlavorsWithRealDBTestV21(test.TestCase):
 
         del inst_type['id']
         inst_type['name'] += '.disabled'
-        inst_type['flavorid'] = unicode(max(
+        inst_type['flavorid'] = six.text_type(max(
                 [int(flavor['flavorid']) for flavor in inst_types]) + 1)
         inst_type['disabled'] = True
 
@@ -903,7 +673,7 @@ class DisabledFlavorsWithRealDBTestV20(DisabledFlavorsWithRealDBTestV21):
 
 
 class ParseIsPublicTestV21(test.TestCase):
-    Controller = flavors_v3.FlavorsController
+    Controller = flavors_v21.FlavorsController
 
     def setUp(self):
         super(ParseIsPublicTestV21, self).setUp()

@@ -13,29 +13,28 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
 import testtools
 import webob.exc
 
 from nova.api.openstack.compute.contrib import hosts as os_hosts_v2
-from nova.api.openstack.compute.plugins.v3 import hosts as os_hosts_v3
+from nova.api.openstack.compute.plugins.v3 import hosts as os_hosts_v21
 from nova.compute import power_state
 from nova.compute import vm_states
 from nova import context as context_maker
 from nova import db
 from nova import exception
 from nova import test
+from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_hosts
-from nova.tests.unit import utils
 
 
 def stub_service_get_all(context, disabled=None):
     return fake_hosts.SERVICES_LIST
 
 
-def stub_service_get_by_host_and_topic(context, host_name, topic):
+def stub_service_get_by_host_and_binary(context, host_name, binary):
     for service in stub_service_get_all(context):
-        if service['host'] == host_name and service['topic'] == topic:
+        if service['host'] == host_name and service['binary'] == binary:
             return service
 
 
@@ -127,30 +126,15 @@ def _create_instance_dict(**kwargs):
     return inst
 
 
-class FakeRequest(object):
-    environ = {"nova.context": context_maker.get_admin_context()}
-    GET = {}
-
-
 class FakeRequestWithNovaZone(object):
     environ = {"nova.context": context_maker.get_admin_context()}
     GET = {"zone": "nova"}
 
 
-class FakeRequestWithNovaService(object):
-    environ = {"nova.context": context_maker.get_admin_context()}
-    GET = {"service": "compute"}
-
-
-class FakeRequestWithInvalidNovaService(object):
-    environ = {"nova.context": context_maker.get_admin_context()}
-    GET = {"service": "invalid"}
-
-
 class HostTestCaseV21(test.TestCase):
     """Test Case for hosts."""
     validation_ex = exception.ValidationError
-    Controller = os_hosts_v3.HostController
+    Controller = os_hosts_v21.HostController
     policy_ex = exception.PolicyNotAuthorized
 
     def _setup_stubs(self):
@@ -158,8 +142,8 @@ class HostTestCaseV21(test.TestCase):
         self.stubs.Set(db, 'service_get_all',
                        stub_service_get_all)
         # Only hosts in our fake DB exist
-        self.stubs.Set(db, 'service_get_by_host_and_topic',
-                       stub_service_get_by_host_and_topic)
+        self.stubs.Set(db, 'service_get_by_host_and_binary',
+                       stub_service_get_by_host_and_binary)
         # 'host_c1' always succeeds, and 'host_c2'
         self.stubs.Set(self.hosts_api, 'set_host_enabled',
                        stub_set_host_enabled)
@@ -173,7 +157,7 @@ class HostTestCaseV21(test.TestCase):
         super(HostTestCaseV21, self).setUp()
         self.controller = self.Controller()
         self.hosts_api = self.controller.api
-        self.req = FakeRequest()
+        self.req = fakes.HTTPRequest.blank('', use_admin_context=True)
 
         self._setup_stubs()
 
@@ -322,14 +306,6 @@ class HostTestCaseV21(test.TestCase):
         self.assertEqual(result["status"], "disabled")
         self.assertEqual(result["maintenance_mode"], "on_maintenance")
 
-    def test_show_forbidden(self):
-        self.req.environ["nova.context"].is_admin = False
-        dest = 'dummydest'
-        self.assertRaises(self.policy_ex,
-                          self.controller.show,
-                          self.req, dest)
-        self.req.environ["nova.context"].is_admin = True
-
     def test_show_host_not_exist(self):
         # A host given as an argument does not exist.
         self.req.environ["nova.context"].is_admin = True
@@ -398,109 +374,67 @@ class HostTestCaseV21(test.TestCase):
         hosts = result['hosts']
         self.assertEqual(fake_hosts.HOST_LIST_NOVA_ZONE, hosts)
 
-    def test_list_hosts_with_service(self):
-        result = self.controller.index(FakeRequestWithNovaService())
-        self.assertEqual(fake_hosts.HOST_LIST_NOVA_ZONE, result['hosts'])
-
-    def test_list_hosts_with_invalid_service(self):
-        result = self.controller.index(FakeRequestWithInvalidNovaService())
-        self.assertEqual([], result['hosts'])
-
 
 class HostTestCaseV20(HostTestCaseV21):
     validation_ex = webob.exc.HTTPBadRequest
     policy_ex = webob.exc.HTTPForbidden
     Controller = os_hosts_v2.HostController
 
-    # Note: V2 api don't support list with services
-    def test_list_hosts_with_service(self):
-        pass
+    def test_list_hosts_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired,
+                          self.controller.index, fakes.HTTPRequest.blank(''))
 
-    def test_list_hosts_with_invalid_service(self):
-        pass
+    def test_host_maintenance_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired,
+                          self.controller.update, fakes.HTTPRequest.blank(''),
+                          'host_c1', {'maintenance_mode': 'enable'})
+
+    def test_startup_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired,
+                          self.controller.startup, fakes.HTTPRequest.blank(''),
+                          'host_c1')
+
+    def test_reboot_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired,
+                          self.controller.reboot, fakes.HTTPRequest.blank(''),
+                          'host_c1')
+
+    def test_shutdown_with_non_admin(self):
+        self.assertRaises(exception.AdminRequired,
+                          self.controller.shutdown,
+                          fakes.HTTPRequest.blank(''),
+                          'host_c1')
+
+    def test_show_non_admin(self):
+        self.assertRaises(exception.AdminRequired,
+                          self.controller.show,
+                          fakes.HTTPRequest.blank(''),
+                          1)
 
 
-class HostSerializerTest(test.TestCase):
+class HostsPolicyEnforcementV21(test.NoDBTestCase):
+
     def setUp(self):
-        super(HostSerializerTest, self).setUp()
-        self.deserializer = os_hosts_v2.HostUpdateDeserializer()
+        super(HostsPolicyEnforcementV21, self).setUp()
+        self.controller = os_hosts_v21.HostController()
+        self.req = fakes.HTTPRequest.blank('')
 
-    def test_index_serializer(self):
-        serializer = os_hosts_v2.HostIndexTemplate()
-        text = serializer.serialize(fake_hosts.OS_API_HOST_LIST)
+    def test_index_policy_failed(self):
+        rule_name = "os_compute_api:os-hosts"
+        self.policy.set_rules({rule_name: "project_id:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.index, self.req)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
 
-        tree = etree.fromstring(text)
-
-        self.assertEqual('hosts', tree.tag)
-        self.assertEqual(len(fake_hosts.HOST_LIST), len(tree))
-        for i in range(len(fake_hosts.HOST_LIST)):
-            self.assertEqual('host', tree[i].tag)
-            self.assertEqual(fake_hosts.HOST_LIST[i]['host_name'],
-                             tree[i].get('host_name'))
-            self.assertEqual(fake_hosts.HOST_LIST[i]['service'],
-                             tree[i].get('service'))
-            self.assertEqual(fake_hosts.HOST_LIST[i]['zone'],
-                             tree[i].get('zone'))
-
-    def test_update_serializer_with_status(self):
-        exemplar = dict(host='host_c1', status='enabled')
-        serializer = os_hosts_v2.HostUpdateTemplate()
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('host', tree.tag)
-        for key, value in exemplar.items():
-            self.assertEqual(value, tree.get(key))
-
-    def test_update_serializer_with_maintenance_mode(self):
-        exemplar = dict(host='host_c1', maintenance_mode='enabled')
-        serializer = os_hosts_v2.HostUpdateTemplate()
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('host', tree.tag)
-        for key, value in exemplar.items():
-            self.assertEqual(value, tree.get(key))
-
-    def test_update_serializer_with_maintenance_mode_and_status(self):
-        exemplar = dict(host='host_c1',
-                        maintenance_mode='enabled',
-                        status='enabled')
-        serializer = os_hosts_v2.HostUpdateTemplate()
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('host', tree.tag)
-        for key, value in exemplar.items():
-            self.assertEqual(value, tree.get(key))
-
-    def test_action_serializer(self):
-        exemplar = dict(host='host_c1', power_action='reboot')
-        serializer = os_hosts_v2.HostActionTemplate()
-        text = serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('host', tree.tag)
-        for key, value in exemplar.items():
-            self.assertEqual(value, tree.get(key))
-
-    def test_update_deserializer(self):
-        exemplar = dict(status='enabled', maintenance_mode='disable')
-        intext = """<?xml version='1.0' encoding='UTF-8'?>
-    <updates>
-        <status>enabled</status>
-        <maintenance_mode>disable</maintenance_mode>
-    </updates>"""
-        result = self.deserializer.deserialize(intext)
-
-        self.assertEqual(dict(body=exemplar), result)
-
-    def test_corrupt_xml(self):
-        self.assertRaises(
-                exception.MalformedRequestBody,
-                self.deserializer.deserialize,
-                utils.killer_xml_body())
+    def test_show_policy_failed(self):
+        rule_name = "os_compute_api:os-hosts"
+        self.policy.set_rules({rule_name: "project_id:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.show, self.req, 1)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())

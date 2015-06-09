@@ -15,7 +15,10 @@ from nova.objects import base
 from nova.objects import fields
 
 
-class BandwidthUsage(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class BandwidthUsage(base.NovaPersistentObject, base.NovaObject,
+                     base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Add use_slave to get_by_instance_uuid_and_mac
     # Version 1.2: Add update_cells to create
@@ -52,17 +55,18 @@ class BandwidthUsage(base.NovaPersistentObject, base.NovaObject):
 
     @base.serialize_args
     @base.remotable
-    def create(self, context, uuid, mac, bw_in, bw_out, last_ctr_in,
+    def create(self, uuid, mac, bw_in, bw_out, last_ctr_in,
                last_ctr_out, start_period=None, last_refreshed=None,
                update_cells=True):
         db_bw_usage = db.bw_usage_update(
-            context, uuid, mac, start_period, bw_in, bw_out,
+            self._context, uuid, mac, start_period, bw_in, bw_out,
             last_ctr_in, last_ctr_out, last_refreshed=last_refreshed,
             update_cells=update_cells)
 
-        self._from_db_object(context, self, db_bw_usage)
+        self._from_db_object(self._context, self, db_bw_usage)
 
 
+@base.NovaObjectRegistry.register
 class BandwidthUsageList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Add use_slave to get_by_uuids

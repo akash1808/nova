@@ -14,6 +14,7 @@
 
 import urllib
 
+from oslo_utils import netutils
 import webob
 
 from nova.api.openstack.compute.schemas.v3 import floating_ip_dns
@@ -23,11 +24,10 @@ from nova.api import validation
 from nova import exception
 from nova.i18n import _
 from nova import network
-from nova import utils
 
 
 ALIAS = "os-floating-ip-dns"
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 def _translate_dns_entry_view(dns_entry):
@@ -84,7 +84,7 @@ class FloatingIPDNSDomainController(wsgi.Controller):
 
     def __init__(self):
         super(FloatingIPDNSDomainController, self).__init__()
-        self.network_api = network.API()
+        self.network_api = network.API(skip_policy_check=True)
 
     @extensions.expected_errors(501)
     def index(self, req):
@@ -165,7 +165,7 @@ class FloatingIPDNSEntryController(wsgi.Controller):
 
     def __init__(self):
         super(FloatingIPDNSEntryController, self).__init__()
-        self.network_api = network.API()
+        self.network_api = network.API(skip_policy_check=True)
 
     @extensions.expected_errors((404, 501))
     def show(self, req, domain_id, id):
@@ -176,7 +176,7 @@ class FloatingIPDNSEntryController(wsgi.Controller):
 
         floating_ip = None
         # Check whether id is a valid ipv4/ipv6 address.
-        if utils.is_valid_ipv4(id) or utils.is_valid_ipv6(id):
+        if netutils.is_valid_ip(id):
             floating_ip = id
 
         try:

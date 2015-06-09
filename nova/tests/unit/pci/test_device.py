@@ -30,6 +30,7 @@ dev_dict = {
     'address': 'a',
     'vendor_id': 'v',
     'product_id': 'p',
+    'numa_node': 1,
     'dev_type': 't',
     'status': 'available',
     'dev_id': 'i',
@@ -40,7 +41,7 @@ dev_dict = {
     }
 
 
-class PciDeviceTestCase(test.TestCase):
+class PciDeviceTestCase(test.NoDBTestCase):
     def setUp(self):
         super(PciDeviceTestCase, self).setUp()
         self.ctxt = context.get_admin_context()

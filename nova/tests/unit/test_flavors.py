@@ -15,6 +15,8 @@ Unit Tests for flavors code
 """
 import time
 
+import six
+
 from nova.compute import flavors
 from nova import context
 from nova import db
@@ -70,7 +72,7 @@ class InstanceTypeTestCase(test.TestCase):
         """return a flavorid not in the DB."""
         nonexistent_flavor = 2700
         flavor_ids = [value.id for key, value in
-                      flavors.get_all_flavors().iteritems()]
+                      six.iteritems(flavors.get_all_flavors())]
         while nonexistent_flavor in flavor_ids:
             nonexistent_flavor += 1
         else:
@@ -279,6 +281,13 @@ class InstanceTypeToolsTest(test.TestCase):
     def test_extract_flavor(self):
         self._test_extract_flavor('')
 
+    def test_extract_flavor_no_sysmeta(self):
+        instance = {}
+        prefix = ''
+        result = flavors.extract_flavor(instance, prefix)
+
+        self.assertIsNone(result)
+
     def test_extract_flavor_prefix(self):
         self._test_extract_flavor('foo_')
 
@@ -381,14 +390,15 @@ class CreateInstanceTypeTest(test.TestCase):
         flavors.create(u'm1.\u5DE8\u5927', 6400, 100, 12000)
 
     def test_name_with_special_characters(self):
-        # Names can contain alphanumeric and [_.- ]
+        # Names can contain all printable characters
         flavors.create('_foo.bar-123', 64, 1, 120)
 
         # Ensure instance types raises InvalidInput for invalid characters.
-        self.assertInvalidInput('foobar#', 64, 1, 120)
+        self.assertInvalidInput('foobar\x00', 64, 1, 120)
 
-    def test_non_ascii_name_with_special_characters(self):
-        self.assertInvalidInput(u'm1.\u5DE8\u5927 #', 64, 1, 120)
+    def test_name_with_non_printable_characters(self):
+        # Names cannot contain printable characters
+        self.assertInvalidInput(u'm1.\u0868 #', 64, 1, 120)
 
     def test_name_length_checks(self):
         MAX_LEN = 255

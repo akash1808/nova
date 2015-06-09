@@ -63,9 +63,9 @@ class _TestSecurityGroupObject(object):
         self.mox.StubOutWithMock(db, 'security_group_in_use')
         db.security_group_in_use(self.context, 123).AndReturn(True)
         self.mox.ReplayAll()
-        secgroup = security_group.SecurityGroup()
+        secgroup = security_group.SecurityGroup(context=self.context)
         secgroup.id = 123
-        self.assertTrue(secgroup.in_use(self.context))
+        self.assertTrue(secgroup.in_use())
         self.assertRemotes()
 
     def test_save(self):
@@ -76,9 +76,10 @@ class _TestSecurityGroupObject(object):
                                      updated_secgroup)
         self.mox.ReplayAll()
         secgroup = security_group.SecurityGroup._from_db_object(
-            self.context, security_group.SecurityGroup(), fake_secgroup)
+            self.context, security_group.SecurityGroup(),
+            fake_secgroup)
         secgroup.description = 'foobar'
-        secgroup.save(self.context)
+        secgroup.save()
         self.assertEqual(self._fix_deleted(updated_secgroup),
                          dict(secgroup.items()))
         self.assertEqual(secgroup.obj_what_changed(), set())
@@ -88,8 +89,9 @@ class _TestSecurityGroupObject(object):
         self.mox.StubOutWithMock(db, 'security_group_update')
         self.mox.ReplayAll()
         secgroup = security_group.SecurityGroup._from_db_object(
-            self.context, security_group.SecurityGroup(), fake_secgroup)
-        secgroup.save(self.context)
+            self.context, security_group.SecurityGroup(),
+            fake_secgroup)
+        secgroup.save()
 
     def test_refresh(self):
         updated_secgroup = dict(fake_secgroup, description='changed')
@@ -97,8 +99,9 @@ class _TestSecurityGroupObject(object):
         db.security_group_get(self.context, 1).AndReturn(updated_secgroup)
         self.mox.ReplayAll()
         secgroup = security_group.SecurityGroup._from_db_object(
-            self.context, security_group.SecurityGroup(), fake_secgroup)
-        secgroup.refresh(self.context)
+            self.context, security_group.SecurityGroup(self.context),
+            fake_secgroup)
+        secgroup.refresh()
         self.assertEqual(self._fix_deleted(updated_secgroup),
                          dict(secgroup.items()))
         self.assertEqual(secgroup.obj_what_changed(), set())

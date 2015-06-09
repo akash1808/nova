@@ -14,24 +14,55 @@
 #    under the License.
 
 import contextlib
+import glob
 import os
+import platform
 import time
 
+import eventlet
 import fixtures
 import mock
-from oslo.config import cfg
 from oslo_concurrency import processutils
+from oslo_config import cfg
+import six
 
+from nova.compute import arch
 from nova import exception
 from nova.storage import linuxscsi
 from nova import test
 from nova.tests.unit.virt.libvirt import fake_libvirt_utils
+from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova import utils
-from nova.virt import fake
+from nova.virt.libvirt import host
+from nova.virt.libvirt import quobyte
 from nova.virt.libvirt import utils as libvirt_utils
 from nova.virt.libvirt import volume
 
 CONF = cfg.CONF
+SECRET_UUID = '2a0a0d6c-babf-454d-b93e-9ac9957b95e0'
+
+
+class FakeSecret(object):
+
+    def __init__(self):
+        self.uuid = SECRET_UUID
+
+    def getUUIDString(self):
+        return self.uuid
+
+    def UUIDString(self):
+        return self.uuid
+
+    def setValue(self, value):
+        self.value = value
+        return 0
+
+    def getValue(self, value):
+        return self.value
+
+    def undefine(self):
+        self.value = None
+        return 0
 
 
 class LibvirtVolumeTestCase(test.NoDBTestCase):
@@ -46,21 +77,16 @@ class LibvirtVolumeTestCase(test.NoDBTestCase):
 
         self.stubs.Set(utils, 'execute', fake_execute)
 
+        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+
         class FakeLibvirtDriver(object):
-            def __init__(self, hyperv="QEMU", version=1005001):
-                self.hyperv = hyperv
-                self.version = version
-
-            def _get_hypervisor_version(self):
-                return self.version
-
-            def _get_hypervisor_type(self):
-                return self.hyperv
+            def __init__(self):
+                self._host = host.Host("qemu:///system")
 
             def _get_all_block_devices(self):
                 return []
 
-        self.fake_conn = FakeLibvirtDriver(fake.FakeVirtAPI())
+        self.fake_conn = FakeLibvirtDriver()
         self.connr = {
             'ip': '127.0.0.1',
             'initiator': 'fake_initiator',
@@ -83,6 +109,12 @@ class LibvirtVolumeTestCase(test.NoDBTestCase):
         self.assertEqual(tree.find('./source').get('protocol'), 'rbd')
         rbd_name = '%s/%s' % ('rbd', self.name)
         self.assertEqual(tree.find('./source').get('name'), rbd_name)
+
+    def _assertISCSINetworkAndProtocolEquals(self, tree):
+        self.assertEqual(tree.get('type'), 'network')
+        self.assertEqual(tree.find('./source').get('protocol'), 'iscsi')
+        iscsi_name = '%s/%s' % (self.iqn, self.vol['id'])
+        self.assertEqual(tree.find('./source').get('name'), iscsi_name)
 
     def _assertFileTypeEquals(self, tree, file_path):
         self.assertEqual(tree.get('type'), 'file')
@@ -226,10 +258,13 @@ class LibvirtVolumeTestCase(test.NoDBTestCase):
         readonly = tree.find('./readonly')
         self.assertIsNotNone(readonly)
 
-    def iscsi_connection(self, volume, location, iqn):
+    def iscsi_connection(self, volume, location, iqn, auth=False,
+                         transport=None):
         dev_name = 'ip-%s-iscsi-%s-lun-1' % (location, iqn)
+        if transport is not None:
+            dev_name = 'pci-0000:00:00.0-' + dev_name
         dev_path = '/dev/disk/by-path/%s' % (dev_name)
-        return {
+        ret = {
                 'driver_volume_type': 'iscsi',
                 'data': {
                     'volume_id': volume['id'],
@@ -243,6 +278,41 @@ class LibvirtVolumeTestCase(test.NoDBTestCase):
                         }
                 }
         }
+        if auth:
+            ret['data']['auth_method'] = 'CHAP'
+            ret['data']['auth_username'] = 'foo'
+            ret['data']['auth_password'] = 'bar'
+        return ret
+
+    def iscsi_connection_discovery_chap_enable(self, volume, location, iqn):
+        dev_name = 'ip-%s-iscsi-%s-lun-1' % (location, iqn)
+        dev_path = '/dev/disk/by-path/%s' % (dev_name)
+        return {
+                'driver_volume_type': 'iscsi',
+                'data': {
+                    'volume_id': volume['id'],
+                    'target_portal': location,
+                    'target_iqn': iqn,
+                    'target_lun': 1,
+                    'device_path': dev_path,
+                    'discovery_auth_method': 'CHAP',
+                    'discovery_auth_username': "testuser",
+                    'discovery_auth_password': '123456',
+                    'qos_specs': {
+                        'total_bytes_sec': '102400',
+                        'read_iops_sec': '200',
+                        }
+                }
+        }
+
+    def generate_device(self, transport=None, lun=1, short=False):
+        dev_format = "ip-%s-iscsi-%s-lun-%s" % (self.location, self.iqn, lun)
+        if transport:
+            dev_format = "pci-0000:00:00.0-" + dev_format
+        if short:
+            return dev_format
+        fake_dev_path = "/dev/disk/by-path/" + dev_format
+        return fake_dev_path
 
     def test_rescan_multipath(self):
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
@@ -273,12 +343,54 @@ Setting up iSCSI targets: unused
         out = driver._get_target_portals_from_iscsiadm_output(sample_input)
         self.assertEqual(out, targets)
 
-    def test_libvirt_iscsi_driver(self):
+    def test_libvirt_iscsi_get_host_device(self, transport=None):
+        libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
+        connection_info = self.iscsi_connection(self.vol, self.location,
+                                                self.iqn)
+        iscsi_properties = connection_info['data']
+        expected_device = self.generate_device(transport, 1, False)
+        if transport:
+            self.stubs.Set(glob, 'glob', lambda x: [expected_device])
+            self.stubs.Set(libvirt_driver, '_validate_transport',
+                           lambda x: True)
+        device = libvirt_driver._get_host_device(iscsi_properties)
+        self.assertEqual(expected_device, device)
+
+    def test_libvirt_iscsi_get_host_device_with_transport(self):
+        self.flags(iscsi_iface='fake_transport', group='libvirt')
+        self.test_libvirt_iscsi_get_host_device('fake_transport')
+
+    @mock.patch.object(volume.utils, 'execute')
+    def test_libvirt_iscsi_validate_transport(self, mock_execute):
+        libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
+        sample_output = ('# BEGIN RECORD 2.0-872\n'
+                         'iface.iscsi_ifacename = %s.fake_suffix\n'
+                         'iface.net_ifacename = <empty>\n'
+                         'iface.ipaddress = <empty>\n'
+                         'iface.hwaddress = 00:53:00:00:53:00\n'
+                         'iface.transport_name = %s\n'
+                         'iface.initiatorname = <empty>\n'
+                         '# END RECORD')
+        for tport in libvirt_driver.supported_transports:
+            mock_execute.return_value = (sample_output % (tport, tport), '')
+            self.assertTrue(libvirt_driver._validate_transport(
+                                    tport + '.fake_suffix'))
+
+        mock_execute.return_value = ("", 'iscsiadm: Could not '
+                                'read iface fake_transport (6)')
+        self.assertFalse(libvirt_driver._validate_transport('fake_transport'))
+
+    def test_libvirt_iscsi_driver(self, transport=None):
         # NOTE(vish) exists is to make driver assume connecting worked
         self.stubs.Set(os.path, 'exists', lambda x: True)
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
         connection_info = self.iscsi_connection(self.vol, self.location,
-                                                self.iqn)
+                                                self.iqn, False, transport)
+        if transport is not None:
+            self.stubs.Set(libvirt_driver, '_get_host_device',
+                           lambda x: self.generate_device(transport, 1, False))
+            self.stubs.Set(libvirt_driver, '_validate_transport',
+                           lambda x: True)
         libvirt_driver.connect_volume(connection_info, self.disk_info)
         libvirt_driver.disconnect_volume(connection_info, "vde")
         expected_commands = [('iscsiadm', '-m', 'node', '-T', self.iqn,
@@ -298,19 +410,27 @@ Setting up iSCSI targets: unused
                               '-p', self.location, '--logout'),
                              ('iscsiadm', '-m', 'node', '-T', self.iqn,
                               '-p', self.location, '--op', 'delete')]
-        self.assertEqual(self.executes, expected_commands)
+        self.assertEqual(expected_commands, self.executes)
 
-    def test_libvirt_iscsi_driver_still_in_use(self):
+    def test_libvirt_iscsi_driver_with_transport(self):
+        self.flags(iscsi_iface='fake_transport', group='libvirt')
+        self.test_libvirt_iscsi_driver('fake_transport')
+
+    def test_libvirt_iscsi_driver_still_in_use(self, transport=None):
         # NOTE(vish) exists is to make driver assume connecting worked
         self.stubs.Set(os.path, 'exists', lambda x: True)
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
-        devs = ['/dev/disk/by-path/ip-%s-iscsi-%s-lun-2' % (self.location,
-                                                            self.iqn)]
+        dev_name = self.generate_device(transport, 1, True)
+        if transport is not None:
+            self.stubs.Set(libvirt_driver, '_get_host_device',
+                           lambda x: self.generate_device(transport, 1, False))
+            self.stubs.Set(libvirt_driver, '_validate_transport',
+                           lambda x: True)
+        devs = [self.generate_device(transport, 2, False)]
         self.stubs.Set(self.fake_conn, '_get_all_block_devices', lambda: devs)
         vol = {'id': 1, 'name': self.name}
         connection_info = self.iscsi_connection(vol, self.location, self.iqn)
         libvirt_driver.connect_volume(connection_info, self.disk_info)
-        dev_name = 'ip-%s-iscsi-%s-lun-1' % (self.location, self.iqn)
         libvirt_driver.disconnect_volume(connection_info, "vde")
         expected_commands = [('iscsiadm', '-m', 'node', '-T', self.iqn,
                               '-p', self.location),
@@ -326,11 +446,19 @@ Setting up iSCSI targets: unused
                               '/sys/block/%s/device/delete' % dev_name)]
         self.assertEqual(self.executes, expected_commands)
 
-    def test_libvirt_iscsi_driver_disconnect_multipath_error(self):
+    def test_libvirt_iscsi_driver_still_in_use_with_transport(self):
+        self.flags(iscsi_iface='fake_transport', group='libvirt')
+        self.test_libvirt_iscsi_driver_still_in_use('fake_transport')
+
+    def test_libvirt_iscsi_driver_disconnect_multipath_error(self,
+                                                             transport=None):
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
-        devs = ['/dev/disk/by-path/ip-%s-iscsi-%s-lun-2' % (self.location,
-                                                            self.iqn)]
-        iscsi_devs = ['ip-fake-ip-iscsi-fake-portal-lun-2']
+        if transport is None:
+            prefix = ""
+        else:
+            prefix = "pci-0000:00:00.0-"
+        devs = [self.generate_device(transport, 2, False)]
+        iscsi_devs = ['%sip-fake-ip-iscsi-fake-portal-lun-2' % prefix]
         with contextlib.nested(
             mock.patch.object(os.path, 'exists', return_value=True),
             mock.patch.object(self.fake_conn, '_get_all_block_devices',
@@ -361,13 +489,13 @@ Setting up iSCSI targets: unused
                                             ['-f', 'fake-multipath-devname'],
                                             check_exit_code=[0, 1])
 
-    def test_libvirt_iscsi_driver_get_config(self):
+    def test_libvirt_iscsi_driver_get_config(self, transport=None):
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
-        dev_name = 'ip-%s-iscsi-%s-lun-1' % (self.location, self.iqn)
+        dev_name = self.generate_device(transport, 1, True)
         dev_path = '/dev/disk/by-path/%s' % (dev_name)
         vol = {'id': 1, 'name': self.name}
         connection_info = self.iscsi_connection(vol, self.location,
-                                                self.iqn)
+                                                self.iqn, False, transport)
         conf = libvirt_driver.get_config(connection_info, self.disk_info)
         tree = conf.format_dom()
         self.assertEqual('block', tree.get('type'))
@@ -378,6 +506,10 @@ Setting up iSCSI targets: unused
         tree = conf.format_dom()
         self.assertEqual('block', tree.get('type'))
         self.assertEqual(dev_path, tree.find('./source').get('dev'))
+
+    def test_libvirt_iscsi_driver_get_config_with_transport(self):
+        self.flags(iscsi_iface = 'fake_transport', group='libvirt')
+        self.test_libvirt_iscsi_driver_get_config('fake_transport')
 
     def test_libvirt_iscsi_driver_multipath_id(self):
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
@@ -581,6 +713,71 @@ Setting up iSCSI targets: unused
         self.assertEqual(tree.find('./auth/secret').get('uuid'), flags_uuid)
         libvirt_driver.disconnect_volume(connection_info, "vde")
 
+    @mock.patch.object(host.Host, 'find_secret')
+    @mock.patch.object(host.Host, 'create_secret')
+    @mock.patch.object(host.Host, 'delete_secret')
+    def test_libvirt_iscsi_net_driver(self, mock_delete, mock_create,
+                                      mock_find):
+        mock_find.return_value = FakeSecret()
+        mock_create.return_value = FakeSecret()
+        libvirt_driver = volume.LibvirtNetVolumeDriver(self.fake_conn)
+        connection_info = self.iscsi_connection(self.vol, self.location,
+                                                self.iqn, auth=True)
+        secret_type = 'iscsi'
+        flags_user = connection_info['data']['auth_username']
+        conf = libvirt_driver.get_config(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self._assertISCSINetworkAndProtocolEquals(tree)
+        self.assertEqual(tree.find('./auth').get('username'), flags_user)
+        self.assertEqual(tree.find('./auth/secret').get('type'), secret_type)
+        self.assertEqual(tree.find('./auth/secret').get('uuid'), SECRET_UUID)
+        libvirt_driver.disconnect_volume(connection_info, 'vde')
+
+    def test_libvirt_iscsi_driver_discovery_chap_enable(self):
+        # NOTE(vish) exists is to make driver assume connecting worked
+        self.stubs.Set(os.path, 'exists', lambda x: True)
+        libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
+        libvirt_driver.use_multipath = True
+        connection_info = self.iscsi_connection_discovery_chap_enable(
+                                                self.vol, self.location,
+                                                self.iqn)
+        mpdev_filepath = '/dev/mapper/foo'
+        libvirt_driver._get_multipath_device_name = lambda x: mpdev_filepath
+        libvirt_driver.connect_volume(connection_info, self.disk_info)
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+        expected_commands = [('iscsiadm', '-m', 'discoverydb',
+                              '-t', 'sendtargets',
+                              '-p', self.location, '--op', 'update',
+                              '-n', 'discovery.sendtargets.auth.authmethod',
+                              '-v', 'CHAP',
+                              '-n', 'discovery.sendtargets.auth.username',
+                              '-v', 'testuser',
+                              '-n', 'discovery.sendtargets.auth.password',
+                              '-v', '123456'),
+                             ('iscsiadm', '-m', 'discoverydb',
+                              '-t', 'sendtargets',
+                              '-p', self.location, '--discover'),
+                             ('iscsiadm', '-m', 'node', '--rescan'),
+                             ('iscsiadm', '-m', 'session', '--rescan'),
+                             ('multipath', '-r'),
+                             ('iscsiadm', '-m', 'node', '--rescan'),
+                             ('iscsiadm', '-m', 'session', '--rescan'),
+                             ('multipath', '-r'),
+                             ('iscsiadm', '-m', 'discoverydb',
+                              '-t', 'sendtargets',
+                              '-p', self.location, '--op', 'update',
+                              '-n', 'discovery.sendtargets.auth.authmethod',
+                              '-v', 'CHAP',
+                              '-n', 'discovery.sendtargets.auth.username',
+                              '-v', 'testuser',
+                              '-n', 'discovery.sendtargets.auth.password',
+                              '-v', '123456'),
+                             ('iscsiadm', '-m', 'discoverydb',
+                              '-t', 'sendtargets',
+                              '-p', self.location, '--discover'),
+                             ('multipath', '-r')]
+        self.assertEqual(self.executes, expected_commands)
+
     def test_libvirt_kvm_volume(self):
         self.stubs.Set(os.path, 'exists', lambda x: True)
         libvirt_driver = volume.LibvirtISCSIVolumeDriver(self.fake_conn)
@@ -690,7 +887,9 @@ Setting up iSCSI targets: unused
 
         iscsi_devs = ['1.2.3.4-iscsi-%s-lun-1' % iqn,
                       '%s-iscsi-%s-lun-1' % (location, iqn),
-                      '%s-iscsi-%s-lun-2' % (location, iqn)]
+                      '%s-iscsi-%s-lun-2' % (location, iqn),
+                      'pci-0000:00:00.0-ip-%s-iscsi-%s-lun-3' % (location,
+                                                                 iqn)]
         libvirt_driver._get_iscsi_devices = lambda: iscsi_devs
 
         self.stubs.Set(libvirt_driver,
@@ -796,7 +995,7 @@ Setting up iSCSI targets: unused
     def test_libvirt_kvm_iser_volume_with_multipath(self):
         self.flags(iser_use_multipath=True, group='libvirt')
         self.stubs.Set(os.path, 'exists', lambda x: True)
-        self.stubs.Set(time, 'sleep', lambda x: None)
+        self.stubs.Set(time, 'sleep', lambda x: eventlet.sleep(0.1))
         devs = ['/dev/mapper/sda', '/dev/mapper/sdb']
         self.stubs.Set(self.fake_conn, '_get_all_block_devices', lambda: devs)
         libvirt_driver = volume.LibvirtISERVolumeDriver(self.fake_conn)
@@ -819,6 +1018,9 @@ Setting up iSCSI targets: unused
         self.stubs.Set(libvirt_driver,
                        '_get_target_portals_from_iscsiadm_output',
                        lambda x: [[location, iqn]])
+        self.stubs.Set(libvirt_driver, '_get_host_device',
+                       lambda x: self.generate_device('iser', 0, False))
+
         libvirt_driver.connect_volume(connection_info, disk_info)
         conf = libvirt_driver.get_config(connection_info, disk_info)
         tree = conf.format_dom()
@@ -831,7 +1033,7 @@ Setting up iSCSI targets: unused
     def test_libvirt_kvm_iser_volume_with_multipath_getmpdev(self):
         self.flags(iser_use_multipath=True, group='libvirt')
         self.stubs.Set(os.path, 'exists', lambda x: True)
-        self.stubs.Set(time, 'sleep', lambda x: None)
+        self.stubs.Set(time, 'sleep', lambda x: eventlet.sleep(0.1))
         libvirt_driver = volume.LibvirtISERVolumeDriver(self.fake_conn)
         name0 = 'volume-00000000'
         location0 = '10.0.2.15:3260'
@@ -845,6 +1047,8 @@ Setting up iSCSI targets: unused
         devs = [dev0, dev]
         self.stubs.Set(self.fake_conn, '_get_all_block_devices', lambda: devs)
         self.stubs.Set(libvirt_driver, '_get_iscsi_devices', lambda: [])
+        self.stubs.Set(libvirt_driver, '_get_host_device',
+                       lambda x: self.generate_device('iser', 1, False))
         connection_info = self.iser_connection(vol, location, iqn)
         mpdev_filepath = '/dev/mapper/foo'
         disk_info = {
@@ -1171,7 +1375,7 @@ Setting up iSCSI targets: unused
         self.stubs.Set(linuxscsi, 'find_multipath_device', lambda x: devices)
         self.stubs.Set(linuxscsi, 'remove_device', lambda x: None)
         # Should work for string, unicode, and list
-        wwns = ['1234567890123456', unicode('1234567890123456'),
+        wwns = ['1234567890123456', six.text_type('1234567890123456'),
                 ['1234567890123456', '1234567890123457']]
         for wwn in wwns:
             connection_info = self.fibrechan_connection(self.vol,
@@ -1205,6 +1409,109 @@ Setting up iSCSI targets: unused
                           libvirt_driver.connect_volume,
                           connection_info, self.disk_info)
 
+    @mock.patch.object(libvirt_utils, 'get_fc_hbas',
+                       side_effect=fake_libvirt_utils.get_fc_hbas)
+    @mock.patch.object(libvirt_utils, 'get_fc_hbas_info',
+                       side_effect=fake_libvirt_utils.get_fc_hbas_info)
+    # NOTE(vish) exists is to make driver assume connecting worked
+    @mock.patch.object(os.path, 'exists', return_value=True)
+    @mock.patch.object(os.path, 'realpath', return_value='/dev/sdb')
+    @mock.patch.object(linuxscsi, 'remove_device', return_value=None)
+    @mock.patch.object(linuxscsi, 'find_multipath_device')
+    def test_libvirt_fc_find_multipath_device_none(self, mock_find,
+            mock_remove, mock_realpath, mock_exists, mock_hbasinfo, mock_hbas):
+        libvirt_driver = volume.LibvirtFibreChannelVolumeDriver(self.fake_conn)
+        multipath_devname = '/dev/md-1'
+        devices = {"device": multipath_devname,
+                   "id": "1234567890",
+                   "devices": [{'device': '/dev/sdb',
+                                'address': '1:0:0:1',
+                                'host': 1, 'channel': 0,
+                                'id': 0, 'lun': 1}]}
+        connection_info = self.fibrechan_connection(self.vol,
+                                                    self.location,
+                                                    '1234567890123456')
+        # Test the scenario where multipath_id is returned during
+        # connect volume
+        mock_find.return_value = devices
+        libvirt_driver.connect_volume(connection_info, self.disk_info)
+        self.assertEqual(0, mock_remove.call_count)
+
+        self.assertIn('multipath_id', connection_info['data'])
+
+        # But NOT during disconnect_volume
+        mock_find.return_value = None
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+        self.assertEqual(0, mock_remove.call_count)
+
+    @mock.patch.object(volume.LibvirtFibreChannelVolumeDriver,
+                       '_remove_lun_from_s390')
+    def _test_libvirt_fibrechan_driver_s390(self, mock_remove_lun):
+        self.stubs.Set(libvirt_utils, 'get_fc_hbas',
+               fake_libvirt_utils.get_fc_hbas)
+        self.stubs.Set(libvirt_utils, 'get_fc_hbas_info',
+                       fake_libvirt_utils.get_fc_hbas_info)
+        # NOTE(vish) exists is to make driver assume connecting worked
+        self.stubs.Set(os.path, 'exists', lambda x: True)
+        self.stubs.Set(os.path, 'realpath', lambda x: '/dev/sdb')
+        libvirt_driver = volume.LibvirtFibreChannelVolumeDriver(self.fake_conn)
+        multipath_devname = '/dev/md-1'
+        devices = {"device": multipath_devname,
+                   "id": "1234567890",
+                   "devices": [{'device': '/dev/sdb',
+                                'address': '1:0:0:1',
+                                'host': 1, 'channel': 0,
+                                'id': 0, 'lun': 1}]}
+        self.stubs.Set(linuxscsi, 'find_multipath_device', lambda x: devices)
+        self.stubs.Set(linuxscsi, 'remove_device', lambda x: None)
+        # Should work for string, unicode, and list
+        wwns = ['1234567890123456', six.text_type('1234567890123456'),
+                ['1234567890123456']]
+        expected_remove_calls = []
+        for wwn in wwns:
+            self.executes = []
+            connection_info = self.fibrechan_connection(self.vol,
+                                                        self.location, wwn)
+            expected_remove_calls.append(mock.call(connection_info))
+            mount_device = "vde"
+            libvirt_driver.connect_volume(connection_info, self.disk_info)
+
+            # Test the scenario where multipath_id is returned
+            libvirt_driver.disconnect_volume(connection_info, mount_device)
+            self.assertEqual(multipath_devname,
+                             connection_info['data']['device_path'])
+            expected_commands = [('tee', '-a',
+                                  '/sys/bus/ccw/drivers/zfcp/0000:05:00.2/'
+                                  '0x1234567890123456/unit_add')]
+            self.assertEqual(expected_commands, self.executes)
+            # Test the scenario where multipath_id is not returned
+            connection_info["data"]["devices"] = devices["devices"]
+            del connection_info["data"]["multipath_id"]
+            libvirt_driver.disconnect_volume(connection_info, mount_device)
+
+        mock_remove_lun.assert_has_calls(expected_remove_calls)
+
+        # Should not work for anything other than string, unicode, and list
+        connection_info = self.fibrechan_connection(self.vol,
+                                                    self.location, 123)
+        self.assertRaises(exception.NovaException,
+                          libvirt_driver.connect_volume,
+                          connection_info, self.disk_info)
+
+        self.stubs.Set(libvirt_utils, 'get_fc_hbas', lambda: [])
+        self.stubs.Set(libvirt_utils, 'get_fc_hbas_info', lambda: [])
+        self.assertRaises(exception.NovaException,
+                          libvirt_driver.connect_volume,
+                          connection_info, self.disk_info)
+
+    @mock.patch.object(platform, 'machine', return_value=arch.S390)
+    def test_libvirt_fibrechan_driver_s390(self, mock_machine):
+        self._test_libvirt_fibrechan_driver_s390()
+
+    @mock.patch.object(platform, 'machine', return_value=arch.S390X)
+    def test_libvirt_fibrechan_driver_s390x(self, mock_machine):
+        self._test_libvirt_fibrechan_driver_s390()
+
     def test_libvirt_fibrechan_driver_get_config(self):
         libvirt_driver = volume.LibvirtFibreChannelVolumeDriver(self.fake_conn)
         connection_info = self.fibrechan_connection(self.vol,
@@ -1228,6 +1535,41 @@ Setting up iSCSI targets: unused
                               "/0000:05:00.3/0000:06:00.6/host2/fc_host/host2"}
         pci_num = libvirt_driver._get_pci_num(hba)
         self.assertEqual("0000:06:00.6", pci_num)
+
+    def test_libvirt_fibrechan_get_device_file_path_s390(self):
+        libvirt_driver = volume.LibvirtFibreChannelVolumeDriver(self.fake_conn)
+        pci_num = "2310"
+        wwn = '1234567890123456'
+        lun = 1
+        file_path = libvirt_driver._get_device_file_path_s390(pci_num,
+                                                              wwn, lun)
+        expected_path = ("/dev/disk/by-path/ccw-2310-zfcp-"
+                         "1234567890123456:1")
+        self.assertEqual(expected_path, file_path)
+
+    @mock.patch.object(libvirt_utils, 'get_fc_hbas_info',
+                       fake_libvirt_utils.get_fc_hbas_info)
+    @mock.patch.object(libvirt_utils, 'perform_unit_remove_for_s390')
+    def test_libvirt_fibrechan_remove_lun_from_s390(self, mock_unit_remove):
+        libvirt_driver = volume.LibvirtFibreChannelVolumeDriver(self.fake_conn)
+        connection_info = {
+                'driver_volume_type': 'fibrechan',
+                'data': {
+                    'target_wwn': ['50014380242b9751',
+                                   '50014380242b9752'],
+                    'target_lun': 1,
+                }}
+        libvirt_driver._remove_lun_from_s390(connection_info)
+
+        expected_calls = []
+        for target_wwn in connection_info['data']['target_wwn']:
+            # NOTE(mriedem): The device_num value comes from ClassDevicePath
+            # in fake_libvirt_utils.fake_libvirt_utils.
+            expected_calls.append(mock.call('0000:05:00.2',
+                                            '0x' + target_wwn,
+                                            '0x0001000000000000'))
+
+        mock_unit_remove.assert_has_calls(expected_calls)
 
     def test_libvirt_scality_driver(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
@@ -1279,7 +1621,8 @@ Setting up iSCSI targets: unused
         export_mnt_base = os.path.join(mnt_base,
                                        utils.get_hash_str(export_string))
         connection_info = {'data': {'export': export_string,
-                                    'name': self.name}}
+                                    'name': self.name,
+                                    'options': None}}
         libvirt_driver.connect_volume(connection_info, self.disk_info)
         libvirt_driver.disconnect_volume(connection_info, "vde")
 
@@ -1350,3 +1693,191 @@ Setting up iSCSI targets: unused
              export_string, export_mnt_base),
             ('umount', export_mnt_base)]
         self.assertEqual(expected_commands, self.executes)
+
+    def test_libvirt_gpfs_driver_get_config(self):
+        libvirt_driver = volume.LibvirtGPFSVolumeDriver(self.fake_conn)
+        connection_info = {
+            'driver_volume_type': 'gpfs',
+            'data': {
+                'device_path': '/gpfs/foo',
+            },
+            'serial': 'fake_serial',
+        }
+        conf = libvirt_driver.get_config(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self.assertEqual('file', tree.get('type'))
+        self.assertEqual('fake_serial', tree.find('./serial').text)
+
+    @mock.patch.object(quobyte, 'validate_volume')
+    @mock.patch.object(quobyte, 'mount_volume')
+    @mock.patch.object(libvirt_utils, 'is_mounted', return_value=False)
+    def test_libvirt_quobyte_driver_mount(self,
+                                          mock_is_mounted,
+                                          mock_mount_volume,
+                                          mock_validate_volume
+                                          ):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = 'quobyte://192.168.1.1/volume-00001'
+        quobyte_volume = '192.168.1.1/volume-00001'
+        export_mnt_base = os.path.join(mnt_base,
+                                       utils.get_hash_str(quobyte_volume))
+        file_path = os.path.join(export_mnt_base, self.name)
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': self.name}}
+        libvirt_driver.connect_volume(connection_info, self.disk_info)
+
+        conf = libvirt_driver.get_config(connection_info, self.disk_info)
+        tree = conf.format_dom()
+
+        self._assertFileTypeEquals(tree, file_path)
+
+        mock_mount_volume.assert_called_once_with(quobyte_volume,
+                                                  export_mnt_base,
+                                                  mock.ANY)
+        mock_validate_volume.assert_called_with(export_mnt_base)
+
+    @mock.patch.object(quobyte, 'validate_volume')
+    @mock.patch.object(quobyte, 'umount_volume')
+    @mock.patch.object(libvirt_utils, 'is_mounted', return_value=True)
+    def test_libvirt_quobyte_driver_umount(self, mock_is_mounted,
+                                           mock_umount_volume,
+                                           mock_validate_volume):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = 'quobyte://192.168.1.1/volume-00001'
+        quobyte_volume = '192.168.1.1/volume-00001'
+        export_mnt_base = os.path.join(mnt_base,
+                                       utils.get_hash_str(quobyte_volume))
+        file_path = os.path.join(export_mnt_base, self.name)
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': self.name}}
+        libvirt_driver.connect_volume(connection_info, self.disk_info)
+
+        conf = libvirt_driver.get_config(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self._assertFileTypeEquals(tree, file_path)
+
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+
+        mock_validate_volume.assert_called_once_with(export_mnt_base)
+        mock_umount_volume.assert_called_once_with(export_mnt_base)
+
+    @mock.patch.object(quobyte, 'validate_volume')
+    @mock.patch.object(quobyte, 'umount_volume')
+    def test_libvirt_quobyte_driver_already_mounted(self,
+                                                    mock_umount_volume,
+                                                    mock_validate_volume
+                                                    ):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = 'quobyte://192.168.1.1/volume-00001'
+        quobyte_volume = '192.168.1.1/volume-00001'
+        export_mnt_base = os.path.join(mnt_base,
+                                       utils.get_hash_str(quobyte_volume))
+        file_path = os.path.join(export_mnt_base, self.name)
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': self.name}}
+
+        libvirt_driver.connect_volume(connection_info, self.disk_info)
+
+        conf = libvirt_driver.get_config(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self._assertFileTypeEquals(tree, file_path)
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+
+        expected_commands = [
+            ('findmnt', '--target', export_mnt_base,
+             '--source', "quobyte@" + quobyte_volume),
+            ('findmnt', '--target', export_mnt_base,
+             '--source', "quobyte@" + quobyte_volume),
+            ]
+        self.assertEqual(expected_commands, self.executes)
+
+        mock_umount_volume.assert_called_once_with(export_mnt_base)
+        mock_validate_volume.assert_called_once_with(export_mnt_base)
+
+    @mock.patch.object(quobyte, 'validate_volume')
+    @mock.patch.object(quobyte, 'mount_volume')
+    @mock.patch.object(libvirt_utils, 'is_mounted', return_value=False)
+    def test_libvirt_quobyte_driver_qcow2(self, mock_is_mounted,
+                                          mock_mount_volume,
+                                          mock_validate_volume
+                                          ):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = 'quobyte://192.168.1.1/volume-00001'
+        name = 'volume-00001'
+        image_format = 'qcow2'
+        quobyte_volume = '192.168.1.1/volume-00001'
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': name,
+                                    'format': image_format}}
+
+        export_mnt_base = os.path.join(mnt_base,
+                                       utils.get_hash_str(quobyte_volume))
+
+        libvirt_driver.connect_volume(connection_info, self.disk_info)
+        conf = libvirt_driver.get_config(connection_info, self.disk_info)
+        tree = conf.format_dom()
+        self.assertEqual(tree.get('type'), 'file')
+        self.assertEqual(tree.find('./driver').get('type'), 'qcow2')
+
+        (mock_mount_volume.
+         assert_called_once_with('192.168.1.1/volume-00001',
+                                 export_mnt_base,
+                                 mock.ANY))
+        mock_validate_volume.assert_called_with(export_mnt_base)
+
+        libvirt_driver.disconnect_volume(connection_info, "vde")
+
+    def test_libvirt_quobyte_driver_mount_non_quobyte_volume(self):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = 'quobyte://192.168.1.1/volume-00001'
+
+        connection_info = {'data': {'export': export_string,
+                                    'name': self.name}}
+
+        def exe_side_effect(*cmd, **kwargs):
+            if cmd == mock.ANY:
+                raise exception.NovaException()
+
+        with mock.patch.object(quobyte,
+                               'validate_volume') as mock_execute:
+            mock_execute.side_effect = exe_side_effect
+            self.assertRaises(exception.NovaException,
+                              libvirt_driver.connect_volume,
+                              connection_info,
+                              self.disk_info)
+
+    def test_libvirt_quobyte_driver_normalize_url_with_protocol(self):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = 'quobyte://192.168.1.1/volume-00001'
+        self.assertEqual(libvirt_driver._normalize_url(export_string),
+                         "192.168.1.1/volume-00001")
+
+    def test_libvirt_quobyte_driver_normalize_url_without_protocol(self):
+        mnt_base = '/mnt'
+        self.flags(quobyte_mount_point_base=mnt_base, group='libvirt')
+
+        libvirt_driver = volume.LibvirtQuobyteVolumeDriver(self.fake_conn)
+        export_string = '192.168.1.1/volume-00001'
+        self.assertEqual(libvirt_driver._normalize_url(export_string),
+                         "192.168.1.1/volume-00001")

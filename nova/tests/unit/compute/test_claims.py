@@ -18,16 +18,16 @@
 import uuid
 
 import mock
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from nova.compute import claims
+from nova import context
 from nova import db
 from nova import exception
 from nova import objects
 from nova.pci import manager as pci_manager
 from nova import test
 from nova.tests.unit.pci import fakes as pci_fakes
-from nova.virt import hardware
 
 
 class FakeResourceHandler(object):
@@ -43,8 +43,10 @@ class FakeResourceHandler(object):
 class DummyTracker(object):
     icalled = False
     rcalled = False
-    pci_tracker = pci_manager.PciDevTracker()
     ext_resources_handler = FakeResourceHandler()
+
+    def __init__(self):
+        self.new_pci_tracker()
 
     def abort_instance_claim(self, *args, **kwargs):
         self.icalled = True
@@ -53,7 +55,8 @@ class DummyTracker(object):
         self.rcalled = True
 
     def new_pci_tracker(self):
-        self.pci_tracker = pci_manager.PciDevTracker()
+        ctxt = context.RequestContext('testuser', 'testproject')
+        self.pci_tracker = pci_manager.PciDevTracker(ctxt)
 
 
 @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid',
@@ -123,9 +126,13 @@ class ClaimTestCase(test.NoDBTestCase):
             'vcpus_used': 0,
             'numa_topology': objects.NUMATopology(
                 cells=[objects.NUMACell(id=1, cpuset=set([1, 2]), memory=512,
-                                        memory_usage=0, cpu_usage=0),
+                                        memory_usage=0, cpu_usage=0,
+                                        mempages=[], siblings=[],
+                                        pinned_cpus=set([])),
                        objects.NUMACell(id=2, cpuset=set([3, 4]), memory=512,
-                                        memory_usage=0, cpu_usage=0)]
+                                        memory_usage=0, cpu_usage=0,
+                                        mempages=[], siblings=[],
+                                        pinned_cpus=set([]))]
                 )._to_json()
         }
         if values:
@@ -170,14 +177,14 @@ class ClaimTestCase(test.NoDBTestCase):
 
     def test_disk_insufficient(self, mock_get):
         limits = {'disk_gb': 45}
-        self.assertRaisesRegexp(
+        self.assertRaisesRegex(
                 exception.ComputeResourcesUnavailable,
                 "disk",
                 self._claim, limits=limits, root_gb=10, ephemeral_gb=40)
 
     def test_disk_and_memory_insufficient(self, mock_get):
         limits = {'disk_gb': 45, 'memory_mb': 8192}
-        self.assertRaisesRegexp(
+        self.assertRaisesRegex(
                 exception.ComputeResourcesUnavailable,
                 "memory.*disk",
                 self._claim, limits=limits, root_gb=10, ephemeral_gb=40,
@@ -190,6 +197,7 @@ class ClaimTestCase(test.NoDBTestCase):
             'address': 'a',
             'product_id': 'p',
             'vendor_id': 'v',
+            'numa_node': 0,
             'status': 'available'}
         self.tracker.new_pci_tracker()
         self.tracker.pci_tracker.set_hvdevs([dev_dict])
@@ -207,6 +215,7 @@ class ClaimTestCase(test.NoDBTestCase):
             'address': 'a',
             'product_id': 'p',
             'vendor_id': 'v1',
+            'numa_node': 1,
             'status': 'available'}
         self.tracker.new_pci_tracker()
         self.tracker.pci_tracker.set_hvdevs([dev_dict])
@@ -224,6 +233,7 @@ class ClaimTestCase(test.NoDBTestCase):
             'address': 'a',
             'product_id': 'p',
             'vendor_id': 'v',
+            'numa_node': 0,
             'status': 'available'}
         self.tracker.new_pci_tracker()
         self.tracker.pci_tracker.set_hvdevs([dev_dict])
@@ -245,27 +255,98 @@ class ClaimTestCase(test.NoDBTestCase):
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
                     id=1, cpuset=set([1, 2, 3, 4, 5]), memory=2048)])
-        limit_topo = hardware.VirtNUMALimitTopology(
-                cells=[hardware.VirtNUMATopologyCellLimit(
-                            1, [1, 2], 512, cpu_limit=2, memory_limit=512),
-                       hardware.VirtNUMATopologyCellLimit(
-                            1, [3, 4], 512, cpu_limit=2, memory_limit=512)])
+        limit_topo = objects.NUMATopologyLimits(
+            cpu_allocation_ratio=1, ram_allocation_ratio=1)
         self.assertRaises(exception.ComputeResourcesUnavailable,
                           self._claim,
-                          limits={'numa_topology': limit_topo.to_json()},
+                          limits={'numa_topology': limit_topo},
                           numa_topology=huge_instance)
 
     def test_numa_topology_passes(self, mock_get):
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
                     id=1, cpuset=set([1, 2]), memory=512)])
-        limit_topo = hardware.VirtNUMALimitTopology(
-                cells=[hardware.VirtNUMATopologyCellLimit(
-                            1, [1, 2], 512, cpu_limit=5, memory_limit=4096),
-                       hardware.VirtNUMATopologyCellLimit(
-                            1, [3, 4], 512, cpu_limit=5, memory_limit=4096)])
-        self._claim(limits={'numa_topology': limit_topo.to_json()},
+        limit_topo = objects.NUMATopologyLimits(
+            cpu_allocation_ratio=1, ram_allocation_ratio=1)
+        self._claim(limits={'numa_topology': limit_topo},
                     numa_topology=huge_instance)
+
+    @pci_fakes.patch_pci_whitelist
+    def test_numa_topology_with_pci(self, mock_get):
+        dev_dict = {
+            'compute_node_id': 1,
+            'address': 'a',
+            'product_id': 'p',
+            'vendor_id': 'v',
+            'numa_node': 1,
+            'status': 'available'}
+        self.tracker.new_pci_tracker()
+        self.tracker.pci_tracker.set_hvdevs([dev_dict])
+        request = objects.InstancePCIRequest(count=1,
+            spec=[{'vendor_id': 'v', 'product_id': 'p'}])
+        mock_get.return_value = objects.InstancePCIRequests(
+            requests=[request])
+
+        huge_instance = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(
+                    id=1, cpuset=set([1, 2]), memory=512)])
+
+        self._claim(numa_topology= huge_instance)
+
+    @pci_fakes.patch_pci_whitelist
+    def test_numa_topology_with_pci_fail(self, mock_get):
+        dev_dict = {
+            'compute_node_id': 1,
+            'address': 'a',
+            'product_id': 'p',
+            'vendor_id': 'v',
+            'numa_node': 1,
+            'status': 'available'}
+        dev_dict2 = {
+            'compute_node_id': 1,
+            'address': 'a',
+            'product_id': 'p',
+            'vendor_id': 'v',
+            'numa_node': 2,
+            'status': 'available'}
+        self.tracker.new_pci_tracker()
+        self.tracker.pci_tracker.set_hvdevs([dev_dict, dev_dict2])
+
+        request = objects.InstancePCIRequest(count=2,
+            spec=[{'vendor_id': 'v', 'product_id': 'p'}])
+        mock_get.return_value = objects.InstancePCIRequests(
+            requests=[request])
+
+        huge_instance = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(
+                    id=1, cpuset=set([1, 2]), memory=512)])
+
+        self.assertRaises(exception.ComputeResourcesUnavailable,
+                          self._claim,
+                          numa_topology=huge_instance)
+
+    @pci_fakes.patch_pci_whitelist
+    def test_numa_topology_with_pci_no_numa_info(self, mock_get):
+        dev_dict = {
+            'compute_node_id': 1,
+            'address': 'a',
+            'product_id': 'p',
+            'vendor_id': 'v',
+            'numa_node': None,
+            'status': 'available'}
+        self.tracker.new_pci_tracker()
+        self.tracker.pci_tracker.set_hvdevs([dev_dict])
+
+        request = objects.InstancePCIRequest(count=1,
+            spec=[{'vendor_id': 'v', 'product_id': 'p'}])
+        mock_get.return_value = objects.InstancePCIRequests(
+            requests=[request])
+
+        huge_instance = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(
+                    id=1, cpuset=set([1, 2]), memory=512)])
+
+        self._claim(numa_topology= huge_instance)
 
     def test_abort(self, mock_get):
         claim = self._abort()

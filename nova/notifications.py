@@ -20,20 +20,20 @@ the system.
 
 import datetime
 
-from oslo.config import cfg
-from oslo.utils import excutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_context import context as common_context
+from oslo_log import log
+from oslo_utils import excutils
+from oslo_utils import timeutils
 import six
 
 import nova.context
-from nova import db
 from nova.i18n import _LE
 from nova.image import glance
 from nova import network
 from nova.network import model as network_model
+from nova import objects
 from nova.objects import base as obj_base
-from nova.openstack.common import context as common_context
-from nova.openstack.common import log
 from nova import rpc
 from nova import utils
 
@@ -51,6 +51,7 @@ notify_opts = [
              'in the API service.'),
     cfg.StrOpt('default_notification_level',
                default='INFO',
+               choices=('DEBUG', 'INFO', 'WARN', 'ERROR', 'CRITICAL'),
                help='Default notification level for outgoing notifications'),
     cfg.StrOpt('default_publisher_id',
                help='Default publisher_id for outgoing notifications'),
@@ -65,8 +66,8 @@ def notify_decorator(name, fn):
     """Decorator for notify which is used from utils.monkey_patch().
 
         :param name: name of the function
-        :param function: - object of the function
-        :returns: function -- decorated function
+        :param fn: - object of the function
+        :returns: fn -- decorated function
 
     """
     def wrapped_func(*args, **kwarg):
@@ -81,7 +82,8 @@ def notify_decorator(name, fn):
         ctxt = common_context.get_context_from_function_and_args(
             fn, args, kwarg)
 
-        notifier = rpc.get_notifier(publisher_id=(CONF.default_publisher_id
+        notifier = rpc.get_notifier('api',
+                                    publisher_id=(CONF.default_publisher_id
                                                   or CONF.host))
         method = notifier.getattr(CONF.default_notification_level.lower(),
                                   'info')
@@ -100,10 +102,14 @@ def send_api_fault(url, status, exception):
     payload = {'url': url, 'exception': six.text_type(exception),
                'status': status}
 
-    rpc.get_notifier('api').error(None, 'api.fault', payload)
+    rpc.get_notifier('api').error(common_context.get_current() or
+                                  nova.context.get_admin_context(),
+                                  'api.fault',
+                                  payload)
 
 
-def send_update(context, old_instance, new_instance, service=None, host=None):
+def send_update(context, old_instance, new_instance, service="compute",
+                host=None):
     """Send compute.instance.update notification to report any changes occurred
     in that instance
     """
@@ -306,19 +312,19 @@ def bandwidth_usage(instance_ref, audit_start,
     macs = [vif['address'] for vif in nw_info]
     uuids = [instance_ref["uuid"]]
 
-    bw_usages = db.bw_usage_get_by_uuids(admin_context, uuids, audit_start)
-    bw_usages = [b for b in bw_usages if b.mac in macs]
-
+    bw_usages = objects.BandwidthUsageList.get_by_uuids(admin_context, uuids,
+                                                        audit_start)
     bw = {}
 
     for b in bw_usages:
-        label = 'net-name-not-found-%s' % b['mac']
-        for vif in nw_info:
-            if vif['address'] == b['mac']:
-                label = vif['network']['label']
-                break
+        if b.mac in macs:
+            label = 'net-name-not-found-%s' % b.mac
+            for vif in nw_info:
+                if vif['address'] == b.mac:
+                    label = vif['network']['label']
+                    break
 
-        bw[label] = dict(bw_in=b.bw_in, bw_out=b.bw_out)
+            bw[label] = dict(bw_in=b.bw_in, bw_out=b.bw_out)
 
     return bw
 
@@ -328,7 +334,7 @@ def image_meta(system_metadata):
     system metadata.
     """
     image_meta = {}
-    for md_key, md_value in system_metadata.iteritems():
+    for md_key, md_value in six.iteritems(system_metadata):
         if md_key.startswith('image_'):
             image_meta[md_key[6:]] = md_value
 

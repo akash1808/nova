@@ -24,19 +24,19 @@ import re
 import time
 
 import netaddr
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import excutils
-from oslo.utils import importutils
-from oslo.utils import timeutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import timeutils
 import six
 
 from nova import exception
 from nova.i18n import _, _LE, _LW
 from nova import objects
 from nova.openstack.common import fileutils
-from nova.openstack.common import log as logging
 from nova import paths
 from nova.pci import utils as pci_utils
 from nova import utils
@@ -73,7 +73,7 @@ linux_net_opts = [
                      ' as dns servers.'),
     cfg.ListOpt('dmz_cidr',
                default=[],
-               help='A list of dmz range that should be accepted'),
+               help='A list of dmz ranges that should be accepted'),
     cfg.MultiStrOpt('force_snat_range',
                default=[],
                help='Traffic to this range will always be snatted to the '
@@ -111,16 +111,16 @@ linux_net_opts = [
                help='The port for the metadata API port'),
     cfg.StrOpt('iptables_top_regex',
                default='',
-               help='Regular expression to match iptables rule that should '
-                    'always be on the top.'),
+               help='Regular expression to match the iptables rule that '
+                    'should always be on the top.'),
     cfg.StrOpt('iptables_bottom_regex',
                default='',
-               help='Regular expression to match iptables rule that should '
-                    'always be on the bottom.'),
+               help='Regular expression to match the iptables rule that '
+                    'should always be on the bottom.'),
     cfg.StrOpt('iptables_drop_action',
                default='DROP',
-               help=('The table that iptables to jump to when a packet is '
-                     'to be dropped.')),
+               help='The table that iptables to jump to when a packet is '
+                    'to be dropped.'),
     cfg.IntOpt('ovs_vsctl_timeout',
                default=120,
                help='Amount of time, in seconds, that ovs_vsctl should wait '
@@ -178,7 +178,7 @@ class IptablesRule(object):
     def __ne__(self, other):
         return not self == other
 
-    def __str__(self):
+    def __repr__(self):
         if self.wrap:
             chain = '%s-%s' % (binary_name, self.chain)
         else:
@@ -394,7 +394,7 @@ class IptablesManager(object):
             elif ip_version == 6:
                 tables = self.ipv6
 
-            for table, chains in builtin_chains[ip_version].iteritems():
+            for table, chains in six.iteritems(builtin_chains[ip_version]):
                 for chain in chains:
                     tables[table].add_chain(chain)
                     tables[table].add_rule(chain, '-j $%s' % (chain,),
@@ -426,11 +426,11 @@ class IptablesManager(object):
         self.apply()
 
     def dirty(self):
-        for table in self.ipv4.itervalues():
+        for table in six.itervalues(self.ipv4):
             if table.dirty:
                 return True
         if CONF.use_ipv6:
-            for table in self.ipv6.itervalues():
+            for table in six.itervalues(self.ipv6):
                 if table.dirty:
                     return True
         return False
@@ -461,7 +461,7 @@ class IptablesManager(object):
                                                 run_as_root=True,
                                                 attempts=5)
             all_lines = all_tables.split('\n')
-            for table_name, table in tables.iteritems():
+            for table_name, table in six.iteritems(tables):
                 start, end = self._find_table(all_lines, table_name)
                 all_lines[start:end] = self._modify_rules(
                         all_lines[start:end], table, table_name)
@@ -485,7 +485,7 @@ class IptablesManager(object):
 
     def _modify_rules(self, current_lines, table, table_name):
         unwrapped_chains = table.unwrapped_chains
-        chains = table.chains
+        chains = sorted(table.chains)
         remove_chains = table.remove_chains
         rules = table.rules
         remove_rules = table.remove_rules
@@ -645,6 +645,21 @@ def write_to_file(file, data, mode='w'):
         f.write(data)
 
 
+def is_pid_cmdline_correct(pid, match):
+    """Ensure that the cmdline for a pid seems sane
+
+    Because pids are recycled, blindly killing by pid is something to
+    avoid. This provides the ability to include a substring that is
+    expected in the cmdline as a safety check.
+    """
+    try:
+        with open('/proc/%d/cmdline' % pid) as f:
+            cmdline = f.read()
+            return match in cmdline
+    except EnvironmentError:
+        return False
+
+
 def metadata_forward():
     """Create forwarding rule for metadata."""
     if CONF.metadata_host != '127.0.0.1':
@@ -663,14 +678,25 @@ def metadata_forward():
     iptables_manager.apply()
 
 
+def _iptables_dest(ip):
+    if ((netaddr.IPAddress(ip).version == 4 and ip == '127.0.0.1')
+        or ip == '::1'):
+        return '-m addrtype --dst-type LOCAL'
+    else:
+        return '-d %s' % ip
+
+
 def metadata_accept():
     """Create the filter accept rule for metadata."""
-    rule = '-s 0.0.0.0/0 -p tcp -m tcp --dport %s' % CONF.metadata_port
-    if CONF.metadata_host != '127.0.0.1':
-        rule += ' -d %s -j ACCEPT' % CONF.metadata_host
+
+    rule = ('-p tcp -m tcp --dport %s %s -j ACCEPT' %
+            (CONF.metadata_port, _iptables_dest(CONF.metadata_host)))
+
+    if netaddr.IPAddress(CONF.metadata_host).version == 4:
+        iptables_manager.ipv4['filter'].add_rule('INPUT', rule)
     else:
-        rule += ' -m addrtype --dst-type LOCAL -j ACCEPT'
-    iptables_manager.ipv4['filter'].add_rule('INPUT', rule)
+        iptables_manager.ipv6['filter'].add_rule('INPUT', rule)
+
     iptables_manager.apply()
 
 
@@ -782,8 +808,8 @@ def ensure_floating_forward(floating_ip, fixed_ip, device, network):
     regex = '.*\s+%s(/32|\s+|$)' % floating_ip
     num_rules = iptables_manager.ipv4['nat'].remove_rules_regex(regex)
     if num_rules:
-        msg = _('Removed %(num)d duplicate rules for floating ip %(float)s')
-        LOG.warn(msg % {'num': num_rules, 'float': floating_ip})
+        msg = _LW('Removed %(num)d duplicate rules for floating ip %(float)s')
+        LOG.warn(msg, {'num': num_rules, 'float': floating_ip})
     for chain, rule in floating_forward_rules(floating_ip, fixed_ip, device):
         iptables_manager.ipv4['nat'].add_rule(chain, rule)
     iptables_manager.apply()
@@ -862,7 +888,10 @@ def initialize_gateway_device(dev, network_ref):
     for line in out.split('\n'):
         fields = line.split()
         if fields and fields[0] == 'inet':
-            ip_params = fields[1:-1]
+            if fields[-2] in ('secondary', 'dynamic'):
+                ip_params = fields[1:-2]
+            else:
+                ip_params = fields[1:-1]
             old_ip_params.append(ip_params)
             if ip_params[0] != full_ip:
                 new_ip_params.append(ip_params)
@@ -1000,12 +1029,13 @@ def get_dhcp_opts(context, network_ref, fixedips):
 
 
 def release_dhcp(dev, address, mac_address):
-    try:
-        utils.execute('dhcp_release', dev, address, mac_address,
-                      run_as_root=True)
-    except processutils.ProcessExecutionError:
-        raise exception.NetworkDhcpReleaseFailed(address=address,
-                                                 mac_address=mac_address)
+    if device_exists(dev):
+        try:
+            utils.execute('dhcp_release', dev, address, mac_address,
+                          run_as_root=True)
+        except processutils.ProcessExecutionError:
+            raise exception.NetworkDhcpReleaseFailed(address=address,
+                                                     mac_address=mac_address)
 
 
 def update_dhcp(context, dev, network_ref):
@@ -1042,9 +1072,7 @@ def kill_dhcp(dev):
     if pid:
         # Check that the process exists and looks like a dnsmasq process
         conffile = _dhcp_file(dev, 'conf')
-        out, _err = _execute('cat', '/proc/%d/cmdline' % pid,
-                             check_exit_code=False)
-        if conffile.split('/')[-1] in out:
+        if is_pid_cmdline_correct(pid, conffile.split('/')[-1]):
             _execute('kill', '-9', pid, run_as_root=True)
         else:
             LOG.debug('Pid %d is stale, skip killing dnsmasq', pid)
@@ -1078,17 +1106,13 @@ def restart_dhcp(context, dev, network_ref, fixedips):
 
     # if dnsmasq is already running, then tell it to reload
     if pid:
-        out, _err = _execute('cat', '/proc/%d/cmdline' % pid,
-                             check_exit_code=False)
-        # Using symlinks can cause problems here so just compare the name
-        # of the file itself
-        if conffile.split('/')[-1] in out:
+        if is_pid_cmdline_correct(pid, conffile.split('/')[-1]):
             try:
                 _execute('kill', '-HUP', pid, run_as_root=True)
                 _add_dnsmasq_accept_rules(dev)
                 return
-            except Exception as exc:  # pylint: disable=W0703
-                LOG.error(_LE('Hupping dnsmasq threw %s'), exc)
+            except Exception as exc:
+                LOG.error(_LE('kill -HUP dnsmasq threw %s'), exc)
         else:
             LOG.debug('Pid %d is stale, relaunching dnsmasq', pid)
 
@@ -1119,12 +1143,12 @@ def restart_dhcp(context, dev, network_ref, fixedips):
     if CONF.dhcp_domain:
         cmd.append('--domain=%s' % CONF.dhcp_domain)
 
-    dns_servers = set(CONF.dns_server)
+    dns_servers = CONF.dns_server
     if CONF.use_network_dns_servers:
         if network_ref.get('dns1'):
-            dns_servers.add(network_ref.get('dns1'))
+            dns_servers.append(network_ref.get('dns1'))
         if network_ref.get('dns2'):
-            dns_servers.add(network_ref.get('dns2'))
+            dns_servers.append(network_ref.get('dns2'))
     if network_ref['multi_host']:
         cmd.append('--addn-hosts=%s' % _dhcp_file(dev, 'hosts'))
     if dns_servers:
@@ -1162,12 +1186,10 @@ interface %s
 
     # if radvd is already running, then tell it to reload
     if pid:
-        out, _err = _execute('cat', '/proc/%d/cmdline'
-                             % pid, check_exit_code=False)
-        if conffile in out:
+        if is_pid_cmdline_correct(pid, conffile):
             try:
                 _execute('kill', pid, run_as_root=True)
-            except Exception as exc:  # pylint: disable=W0703
+            except Exception as exc:
                 LOG.error(_LE('killing radvd threw %s'), exc)
         else:
             LOG.debug('Pid %d is stale, relaunching radvd', pid)
@@ -1359,6 +1381,10 @@ def delete_ovs_vif_port(bridge, dev):
     delete_net_dev(dev)
 
 
+def ovs_set_vhostuser_port_type(dev):
+    _ovs_vsctl(['--', 'set', 'Interface', dev, 'type=dpdkvhostuser'])
+
+
 def create_ivs_vif_port(dev, iface_id, mac, instance_id):
     utils.execute('ivs-ctl', 'add-port',
                    dev, run_as_root=True)
@@ -1397,6 +1423,17 @@ def delete_net_dev(dev):
         except processutils.ProcessExecutionError:
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE("Failed removing net device: '%s'"), dev)
+
+
+def delete_bridge_dev(dev):
+    """Delete a network bridge."""
+    if device_exists(dev):
+        try:
+            utils.execute('ip', 'link', 'set', dev, 'down', run_as_root=True)
+            utils.execute('brctl', 'delbr', dev, run_as_root=True)
+        except processutils.ProcessExecutionError:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE("Failed removing bridge device: '%s'"), dev)
 
 
 # Similar to compute virt layers, the Linux network node
@@ -1652,7 +1689,7 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                         ipv4_filter.remove_rule('FORWARD',
                                                 ('--out-interface %s -j %s'
                                                  % (bridge, drop_action)))
-            delete_net_dev(bridge)
+            delete_bridge_dev(bridge)
 
 
 # NOTE(cfb): This is a temporary fix to LP #1316621. We really want to call
@@ -1664,6 +1701,11 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
 #            with calls to ebtables --concurrent and a reasonable timeout.
 def _exec_ebtables(*cmd, **kwargs):
     check_exit_code = kwargs.pop('check_exit_code', True)
+
+    # List of error strings to re-try.
+    retry_strings = (
+        'Multiple ebtables programs',
+    )
 
     # We always try at least once
     attempts = CONF.ebtables_exec_attempts
@@ -1677,19 +1719,28 @@ def _exec_ebtables(*cmd, **kwargs):
         # NOTE(cfb): ebtables reports all errors with a return code of 255.
         #            As such we can't know if we hit a locking error, or some
         #            other error (like a rule doesn't exist) so we have to
-        #            retry on all errors.
+        #            to parse stderr.
         try:
             _execute(*cmd, check_exit_code=[0], **kwargs)
-        except processutils.ProcessExecutionError:
-            if count > attempts and check_exit_code:
-                LOG.warning(_LW('%s failed. Not Retrying.'), ' '.join(cmd))
-                raise
+        except processutils.ProcessExecutionError as exc:
+            # See if we can retry the error.
+            if any(error in exc.stderr for error in retry_strings):
+                if count > attempts and check_exit_code:
+                    LOG.warning(_LW('%s failed. Not Retrying.'), ' '.join(cmd))
+                    raise
+                else:
+                    # We need to sleep a bit before retrying
+                    LOG.warning(_LW("%(cmd)s failed. Sleeping %(time)s "
+                                    "seconds before retry."),
+                                {'cmd': ' '.join(cmd), 'time': sleep})
+                    time.sleep(sleep)
             else:
-                # We need to sleep a bit before retrying
-                LOG.warning(_LW("%(cmd)s failed. Sleeping %(time)s seconds "
-                                "before retry."),
-                            {'cmd': ' '.join(cmd), 'time': sleep})
-                time.sleep(sleep)
+                # Not eligible for retry
+                if check_exit_code:
+                    LOG.warning(_LW('%s failed. Not Retrying.'), ' '.join(cmd))
+                    raise
+                else:
+                    return
         else:
             # Success
             return

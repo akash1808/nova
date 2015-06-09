@@ -19,14 +19,15 @@ Tests For CellStateManager
 import time
 
 import mock
-from oslo.config import cfg
-from oslo.db import exception as db_exc
+from oslo_config import cfg
+from oslo_db import exception as db_exc
 import six
 
 from nova.cells import state
 from nova import db
 from nova.db.sqlalchemy import models
 from nova import exception
+from nova import objects
 from nova.openstack.common import fileutils
 from nova import test
 
@@ -35,6 +36,13 @@ FAKE_COMPUTES = [
     ('host2', 1024, 100, -1, -1),
     ('host3', 1024, 100, 1024, 100),
     ('host4', 1024, 100, 300, 30),
+]
+
+FAKE_COMPUTES_N_TO_ONE = [
+    ('host1', 1024, 100, 0, 0),
+    ('host1', 1024, 100, -1, -1),
+    ('host2', 1024, 100, 1024, 100),
+    ('host2', 1024, 100, 300, 30),
 ]
 
 # NOTE(alaski): It's important to have multiple types that end up having the
@@ -48,17 +56,34 @@ FAKE_ITYPES = [
 ]
 
 
-def _fake_compute_node_get_all(context):
+def _create_fake_node(host, total_mem, total_disk, free_mem, free_disk):
+    return objects.ComputeNode(host=host,
+                               memory_mb=total_mem,
+                               local_gb=total_disk,
+                               free_ram_mb=free_mem,
+                               free_disk_gb=free_disk)
+
+
+@classmethod
+def _fake_service_get_all_by_binary(cls, context, binary):
     def _node(host, total_mem, total_disk, free_mem, free_disk):
-        service = {'host': host, 'disabled': False}
-        return {'service': service,
-                'host': host,
-                'memory_mb': total_mem,
-                'local_gb': total_disk,
-                'free_ram_mb': free_mem,
-                'free_disk_gb': free_disk}
+        return objects.Service(host=host, disabled=False)
 
     return [_node(*fake) for fake in FAKE_COMPUTES]
+
+
+@classmethod
+def _fake_compute_node_get_all(cls, context):
+    return [_create_fake_node(*fake) for fake in FAKE_COMPUTES]
+
+
+@classmethod
+def _fake_compute_node_n_to_one_get_all(cls, context):
+    return [_create_fake_node(*fake) for fake in FAKE_COMPUTES_N_TO_ONE]
+
+
+def _fake_cell_get_all(context):
+    return []
 
 
 def _fake_instance_type_all(context):
@@ -70,13 +95,17 @@ def _fake_instance_type_all(context):
     return [_type(*fake) for fake in FAKE_ITYPES]
 
 
-class TestCellsStateManager(test.TestCase):
+class TestCellsStateManager(test.NoDBTestCase):
 
     def setUp(self):
         super(TestCellsStateManager, self).setUp()
 
-        self.stubs.Set(db, 'compute_node_get_all', _fake_compute_node_get_all)
+        self.stubs.Set(objects.ComputeNodeList, 'get_all',
+                       _fake_compute_node_get_all)
+        self.stubs.Set(objects.ServiceList, 'get_by_binary',
+                       _fake_service_get_all_by_binary)
         self.stubs.Set(db, 'flavor_get_all', _fake_instance_type_all)
+        self.stubs.Set(db, 'cell_get_all', _fake_cell_get_all)
 
     def test_cells_config_not_found(self):
         self.flags(cells_config='no_such_file_exists.conf', group='cells')
@@ -171,7 +200,36 @@ class TestCellsStateManager(test.TestCase):
         return my_state.capacities
 
 
-class TestCellStateManagerException(test.TestCase):
+class TestCellsStateManagerNToOne(TestCellsStateManager):
+    def setUp(self):
+        super(TestCellsStateManagerNToOne, self).setUp()
+
+        self.stubs.Set(objects.ComputeNodeList, 'get_all',
+                       _fake_compute_node_n_to_one_get_all)
+
+    def test_capacity_part_reserve(self):
+        # utilize half the cell's free capacity
+        cap = self._capacity(50.0)
+
+        cell_free_ram = sum(compute[3] for compute in FAKE_COMPUTES_N_TO_ONE)
+        self.assertEqual(cell_free_ram, cap['ram_free']['total_mb'])
+
+        cell_free_disk = (1024 *
+                sum(compute[4] for compute in FAKE_COMPUTES_N_TO_ONE))
+        self.assertEqual(cell_free_disk, cap['disk_free']['total_mb'])
+
+        self.assertEqual(0, cap['ram_free']['units_by_mb']['0'])
+        self.assertEqual(0, cap['disk_free']['units_by_mb']['0'])
+
+        units = 6  # 6 from host 2
+        self.assertEqual(units, cap['ram_free']['units_by_mb']['50'])
+
+        sz = 25 * 1024
+        units = 1  # 1 on host 2
+        self.assertEqual(units, cap['disk_free']['units_by_mb'][str(sz)])
+
+
+class TestCellStateManagerException(test.NoDBTestCase):
     @mock.patch.object(time, 'sleep')
     def test_init_db_error(self, mock_sleep):
         class TestCellStateManagerDB(state.CellStateManagerDB):
@@ -228,7 +286,7 @@ class FakeCellStateManager(object):
         self.called.append(('_cell_data_sync', force))
 
 
-class TestSyncDecorators(test.TestCase):
+class TestSyncDecorators(test.NoDBTestCase):
     def test_sync_before(self):
         manager = FakeCellStateManager()
 

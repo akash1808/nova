@@ -20,8 +20,7 @@ ALIAS = "os-migrations"
 
 
 def authorize(context, action_name):
-    action = 'v3:%s:%s' % (ALIAS, action_name)
-    extensions.extension_authorizer('compute', action)(context)
+    extensions.os_compute_authorizer(ALIAS)(context, action=action_name)
 
 
 def output(migrations_obj):
@@ -31,9 +30,12 @@ def output(migrations_obj):
     primitive objects with the only necessary fields.
     """
     objects = obj_base.obj_to_primitive(migrations_obj)
+    objects = [x for x in objects if not x['hidden']]
     for obj in objects:
         del obj['deleted']
         del obj['deleted_at']
+        del obj['migration_type']
+        del obj['hidden']
     return objects
 
 
@@ -59,7 +61,7 @@ class Migrations(extensions.V3APIExtensionBase):
 
     def get_resources(self):
         resources = []
-        resource = extensions.ResourceExtension('os-migrations',
+        resource = extensions.ResourceExtension(ALIAS,
                                                 MigrationsController())
         resources.append(resource)
         return resources

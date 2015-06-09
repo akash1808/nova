@@ -19,6 +19,7 @@ import mock
 from nova.tests.unit.virt.hyperv import test_base
 from nova.virt.hyperv import constants
 from nova.virt.hyperv import pathutils
+from nova.virt.hyperv import vmutils
 
 
 class PathUtilsTestCase(test_base.HyperVBaseTestCase):
@@ -30,6 +31,24 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
         self.fake_instance_name = 'fake_instance_name'
 
         self._pathutils = pathutils.PathUtils()
+
+    @mock.patch.object(pathutils.PathUtils, 'rename')
+    @mock.patch.object(os.path, 'isfile')
+    @mock.patch.object(os, 'listdir')
+    def test_move_folder_files(self, mock_listdir, mock_isfile, mock_rename):
+        src_dir = 'src'
+        dest_dir = 'dest'
+        fname = 'tmp_file.txt'
+        subdir = 'tmp_folder'
+        src_fname = os.path.join(src_dir, fname)
+        dest_fname = os.path.join(dest_dir, fname)
+
+        # making sure src_subdir is not moved.
+        mock_listdir.return_value = [fname, subdir]
+        mock_isfile.side_effect = [True, False]
+
+        self._pathutils.move_folder_files(src_dir, dest_dir)
+        mock_rename.assert_called_once_with(src_fname, dest_fname)
 
     def _mock_lookup_configdrive_path(self, ext):
         self._pathutils.get_instance_dir = mock.MagicMock(
@@ -116,3 +135,20 @@ class PathUtilsTestCase(test_base.HyperVBaseTestCase):
 
     def test_force_unmount_smb_share(self):
         self._test_unmount_smb_share(force=True)
+
+    @mock.patch('os.path.join')
+    def test_get_instances_sub_dir(self, fake_path_join):
+
+        class WindowsError(Exception):
+            def __init__(self, winerror=None):
+                self.winerror = winerror
+
+        fake_dir_name = "fake_dir_name"
+        fake_windows_error = WindowsError
+        self._pathutils._check_create_dir = mock.MagicMock(
+            side_effect=WindowsError(pathutils.ERROR_INVALID_NAME))
+        with mock.patch('__builtin__.WindowsError',
+                        fake_windows_error, create=True):
+            self.assertRaises(vmutils.HyperVException,
+                              self._pathutils._get_instances_sub_dir,
+                              fake_dir_name)

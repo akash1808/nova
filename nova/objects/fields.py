@@ -13,13 +13,25 @@
 #    under the License.
 
 import abc
+from collections import OrderedDict
 import datetime
 
+import copy
 import iso8601
 import netaddr
-from oslo.utils import timeutils
+from oslo_utils import strutils
+from oslo_utils import timeutils
 import six
 
+# TODO(berrange) Temporary import for Arch class
+from nova.compute import arch
+# TODO(berrange) Temporary import for CPU* classes
+from nova.compute import cpumodel
+# TODO(berrange) Temporary import for HVType class
+from nova.compute import hv_type
+# TODO(berrange) Temporary import for VMMode class
+from nova.compute import vm_mode
+from nova import exception
 from nova.i18n import _
 from nova.network import model as network_model
 
@@ -46,7 +58,8 @@ class ElementTypeError(TypeError):
                    })
 
 
-class AbstractFieldType(six.with_metaclass(abc.ABCMeta, object)):
+@six.add_metaclass(abc.ABCMeta)
+class AbstractFieldType(object):
     @abc.abstractmethod
     def coerce(self, obj, attr, value):
         """This is called to coerce (if possible) a value on assignment.
@@ -137,6 +150,7 @@ class Field(object):
             'nullable': self._nullable,
             'default': self._default,
             }
+        args = OrderedDict(sorted(args.items()))
         return '%s(%s)' % (self._type.__class__.__name__,
                            ','.join(['%s=%s' % (k, v)
                                      for k, v in args.items()]))
@@ -160,7 +174,7 @@ class Field(object):
             # NOTE(danms): We coerce the default value each time the field
             # is set to None as our contract states that we'll let the type
             # examine the object and attribute name at that time.
-            return self._type.coerce(obj, attr, self._default)
+            return self._type.coerce(obj, attr, copy.deepcopy(self._default))
         else:
             raise ValueError(_("Field `%s' cannot be None") % attr)
 
@@ -241,14 +255,259 @@ class String(FieldType):
         # FIXME(danms): We should really try to avoid the need to do this
         if isinstance(value, (six.string_types, int, long, float,
                               datetime.datetime)):
-            return unicode(value)
+            return six.text_type(value)
         else:
-            raise ValueError(_('A string is required here, not %s') %
-                             value.__class__.__name__)
+            raise ValueError(_('A string is required in field %(attr)s, '
+                               'not %(type)s') %
+                             {'attr': attr, 'type': value.__class__.__name__})
 
     @staticmethod
     def stringify(value):
         return '\'%s\'' % value
+
+
+class Enum(String):
+    def __init__(self, valid_values, **kwargs):
+        try:
+            length = len(valid_values)
+        except TypeError:
+            raise ValueError('valid_values is not a sequence'
+                             ' of permitted values')
+        if length == 0:
+            raise ValueError('valid_values may not be empty')
+        self._valid_values = valid_values
+        super(Enum, self).__init__(**kwargs)
+
+    def coerce(self, obj, attr, value):
+        if value not in self._valid_values:
+            msg = _("Field value %s is invalid") % value
+            raise ValueError(msg)
+        return super(Enum, self).coerce(obj, attr, value)
+
+    def stringify(self, value):
+        if value not in self._valid_values:
+            msg = _("Field value %s is invalid") % value
+            raise ValueError(msg)
+        return super(Enum, self).stringify(value)
+
+
+class Architecture(Enum):
+    # TODO(berrange): move all constants out of 'nova.compute.arch'
+    # into fields on this class
+    def __init__(self, **kwargs):
+        super(Architecture, self).__init__(
+            valid_values=arch.ALL, **kwargs)
+
+    def coerce(self, obj, attr, value):
+        try:
+            value = arch.canonicalize(value)
+        except exception.InvalidArchitectureName:
+            msg = _("Architecture name '%s' is not valid") % value
+            raise ValueError(msg)
+        return super(Architecture, self).coerce(obj, attr, value)
+
+
+class CPUAllocationPolicy(Enum):
+
+    DEDICATED = "dedicated"
+    SHARED = "shared"
+
+    ALL = (DEDICATED, SHARED)
+
+    def __init__(self):
+        super(CPUAllocationPolicy, self).__init__(
+            valid_values=CPUAllocationPolicy.ALL)
+
+
+class CPUMode(Enum):
+    # TODO(berrange): move all constants out of 'nova.compute.cpumodel'
+    # into fields on this class
+    def __init__(self, **kwargs):
+        super(CPUMode, self).__init__(
+            valid_values=cpumodel.ALL_CPUMODES, **kwargs)
+
+
+class CPUMatch(Enum):
+    # TODO(berrange): move all constants out of 'nova.compute.cpumodel'
+    # into fields on this class
+    def __init__(self, **kwargs):
+        super(CPUMatch, self).__init__(
+            valid_values=cpumodel.ALL_MATCHES, **kwargs)
+
+
+class CPUFeaturePolicy(Enum):
+    # TODO(berrange): move all constants out of 'nova.compute.cpumodel'
+    # into fields on this class
+    def __init__(self, **kwargs):
+        super(CPUFeaturePolicy, self).__init__(
+            valid_values=cpumodel.ALL_POLICIES, **kwargs)
+
+
+class DiskBus(Enum):
+
+    FDC = "fdc"
+    IDE = "ide"
+    SATA = "sata"
+    SCSI = "scsi"
+    USB = "usb"
+    VIRTIO = "virtio"
+    XEN = "xen"
+
+    ALL = (FDC, IDE, SATA, SCSI, USB, VIRTIO, XEN)
+
+    def __init__(self):
+        super(DiskBus, self).__init__(
+            valid_values=DiskBus.ALL)
+
+
+class HVType(Enum):
+    # TODO(berrange): move all constants out of 'nova.compute.hv_type'
+    # into fields on this class
+    def __init__(self):
+        super(HVType, self).__init__(
+            valid_values=hv_type.ALL)
+
+    def coerce(self, obj, attr, value):
+        try:
+            value = hv_type.canonicalize(value)
+        except exception.InvalidHypervisorVirtType:
+            msg = _("Hypervisor virt type '%s' is not valid") % value
+            raise ValueError(msg)
+        return super(HVType, self).coerce(obj, attr, value)
+
+
+class OSType(Enum):
+
+    LINUX = "linux"
+    WINDOWS = "windows"
+
+    ALL = (LINUX, WINDOWS)
+
+    def __init__(self):
+        super(OSType, self).__init__(
+            valid_values=OSType.ALL)
+
+    def coerce(self, obj, attr, value):
+        # Some code/docs use upper case or initial caps
+        # so canonicalize to all lower case
+        value = value.lower()
+        return super(OSType, self).coerce(obj, attr, value)
+
+
+class RNGModel(Enum):
+
+    VIRTIO = "virtio"
+
+    ALL = (VIRTIO,)
+
+    def __init__(self):
+        super(RNGModel, self).__init__(
+            valid_values=RNGModel.ALL)
+
+
+class SCSIModel(Enum):
+
+    BUSLOGIC = "buslogic"
+    IBMVSCSI = "ibmvscsi"
+    LSILOGIC = "lsilogic"
+    LSISAS1068 = "lsisas1068"
+    LSISAS1078 = "lsisas1078"
+    VIRTIO_SCSI = "virtio-scsi"
+    VMPVSCSI = "vmpvscsi"
+
+    ALL = (BUSLOGIC, IBMVSCSI, LSILOGIC, LSISAS1068,
+           LSISAS1078, VIRTIO_SCSI, VMPVSCSI)
+
+    def __init__(self):
+        super(SCSIModel, self).__init__(
+            valid_values=SCSIModel.ALL)
+
+    def coerce(self, obj, attr, value):
+        # Some compat for strings we'd see in the legacy
+        # vmware_adaptertype image property
+        value = value.lower()
+        if value == "lsilogicsas":
+            value = SCSIModel.LSISAS1068
+        elif value == "paravirtual":
+            value = SCSIModel.VMPVSCSI
+
+        return super(SCSIModel, self).coerce(obj, attr, value)
+
+
+class VideoModel(Enum):
+
+    CIRRUS = "cirrus"
+    QXL = "qxl"
+    VGA = "vga"
+    VMVGA = "vmvga"
+    XEN = "xen"
+
+    ALL = (CIRRUS, QXL, VGA, VMVGA, XEN)
+
+    def __init__(self):
+        super(VideoModel, self).__init__(
+            valid_values=VideoModel.ALL)
+
+
+class VIFModel(Enum):
+
+    LEGACY_VALUES = {"virtuale1000":
+                     network_model.VIF_MODEL_E1000,
+                     "virtuale1000e":
+                     network_model.VIF_MODEL_E1000E,
+                     "virtualpcnet32":
+                     network_model.VIF_MODEL_PCNET,
+                     "virtualsriovethernetcard":
+                     network_model.VIF_MODEL_SRIOV,
+                     "virtualvmxnet":
+                     network_model.VIF_MODEL_VMXNET,
+                     "virtualvmxnet3":
+                     network_model.VIF_MODEL_VMXNET3,
+                    }
+
+    def __init__(self):
+        super(VIFModel, self).__init__(
+            valid_values=network_model.VIF_MODEL_ALL)
+
+    def _get_legacy(self, value):
+        return value
+
+    def coerce(self, obj, attr, value):
+        # Some compat for strings we'd see in the legacy
+        # hw_vif_model image property
+        value = value.lower()
+        value = VIFModel.LEGACY_VALUES.get(value, value)
+        return super(VIFModel, self).coerce(obj, attr, value)
+
+
+class VMMode(Enum):
+    # TODO(berrange): move all constants out of 'nova.compute.vm_mode'
+    # into fields on this class
+    def __init__(self):
+        super(VMMode, self).__init__(
+            valid_values=vm_mode.ALL)
+
+    def coerce(self, obj, attr, value):
+        try:
+            value = vm_mode.canonicalize(value)
+        except exception.InvalidVirtualMachineMode:
+            msg = _("Virtual machine mode '%s' is not valid") % value
+            raise ValueError(msg)
+        return super(VMMode, self).coerce(obj, attr, value)
+
+
+class WatchdogAction(Enum):
+
+    NONE = "none"
+    PAUSE = "pause"
+    POWEROFF = "poweroff"
+    RESET = "reset"
+
+    ALL = (NONE, PAUSE, POWEROFF, RESET)
+
+    def __init__(self):
+        super(WatchdogAction, self).__init__(
+            valid_values=WatchdogAction.ALL)
 
 
 class UUID(FieldType):
@@ -275,6 +534,12 @@ class Boolean(FieldType):
         return bool(value)
 
 
+class FlexibleBoolean(Boolean):
+    @staticmethod
+    def coerce(obj, attr, value):
+        return strutils.bool_from_string(value)
+
+
 class DateTime(FieldType):
     @staticmethod
     def coerce(obj, attr, value):
@@ -283,7 +548,8 @@ class DateTime(FieldType):
             # during our objects transition
             value = timeutils.parse_isotime(value)
         elif not isinstance(value, datetime.datetime):
-            raise ValueError(_('A datetime.datetime is required here'))
+            raise ValueError(_('A datetime.datetime is required '
+                               'in field %s') % attr)
 
         if value.utcoffset() is None:
             # NOTE(danms): Legacy objects from sqlalchemy are stored in UTC,
@@ -325,7 +591,9 @@ class IPV4Address(IPAddress):
     def coerce(obj, attr, value):
         result = IPAddress.coerce(obj, attr, value)
         if result.version != 4:
-            raise ValueError(_('Network "%s" is not valid') % value)
+            raise ValueError(_('Network "%(val)s" is not valid '
+                               'in field %(attr)s') %
+                             {'val': value, 'attr': attr})
         return result
 
 
@@ -334,7 +602,9 @@ class IPV6Address(IPAddress):
     def coerce(obj, attr, value):
         result = IPAddress.coerce(obj, attr, value)
         if result.version != 6:
-            raise ValueError(_('Network "%s" is not valid') % value)
+            raise ValueError(_('Network "%(val)s" is not valid '
+                               'in field %(attr)s') %
+                             {'val': value, 'attr': attr})
         return result
 
 
@@ -343,7 +613,9 @@ class IPV4AndV6Address(IPAddress):
     def coerce(obj, attr, value):
         result = IPAddress.coerce(obj, attr, value)
         if result.version != 4 and result.version != 6:
-            raise ValueError(_('Network "%s" is not valid') % value)
+            raise ValueError(_('Network "%(val)s" is not valid '
+                               'in field %(attr)s') %
+                             {'val': value, 'attr': attr})
         return result
 
 
@@ -382,7 +654,7 @@ class CompoundFieldType(FieldType):
 class List(CompoundFieldType):
     def coerce(self, obj, attr, value):
         if not isinstance(value, list):
-            raise ValueError(_('A list is required here'))
+            raise ValueError(_('A list is required in field %s') % attr)
         for index, element in enumerate(list(value)):
             value[index] = self._element_type.coerce(
                     obj, '%s[%i]' % (attr, index), element)
@@ -402,7 +674,7 @@ class List(CompoundFieldType):
 class Dict(CompoundFieldType):
     def coerce(self, obj, attr, value):
         if not isinstance(value, dict):
-            raise ValueError(_('A dict is required here'))
+            raise ValueError(_('A dict is required in field %s') % attr)
         for key, element in value.items():
             if not isinstance(key, six.string_types):
                 # NOTE(guohliu) In order to keep compatibility with python3
@@ -455,21 +727,21 @@ class DictProxyField(object):
             return self
         if getattr(obj, self._fld_name) is None:
             return
-        return dict((self._key_type(k), v)
-                     for k, v in six.iteritems(getattr(obj, self._fld_name)))
+        return {self._key_type(k): v
+                for k, v in six.iteritems(getattr(obj, self._fld_name))}
 
     def __set__(self, obj, val):
         if val is None:
             setattr(obj, self._fld_name, val)
         else:
-            setattr(obj, self._fld_name, dict((six.text_type(k), v)
-                                              for k, v in six.iteritems(val)))
+            setattr(obj, self._fld_name, {six.text_type(k): v
+                                          for k, v in six.iteritems(val)})
 
 
 class Set(CompoundFieldType):
     def coerce(self, obj, attr, value):
         if not isinstance(value, set):
-            raise ValueError(_('A set is required here'))
+            raise ValueError(_('A set is required in field %s') % attr)
 
         coerced = set()
         for element in value:
@@ -502,8 +774,9 @@ class Object(FieldType):
             obj_name = ""
 
         if obj_name != self._obj_name:
-            raise ValueError(_('An object of type %s is required here') %
-                             self._obj_name)
+            raise ValueError(_('An object of type %(type)s is required '
+                               'in field %(attr)s') %
+                             {'type': self._obj_name, 'attr': attr})
         return value
 
     @staticmethod
@@ -545,7 +818,8 @@ class NetworkModel(FieldType):
             # Hmm, do we need this?
             return network_model.NetworkInfo.hydrate(value)
         else:
-            raise ValueError(_('A NetworkModel is required here'))
+            raise ValueError(_('A NetworkModel is required in field %s') %
+                             attr)
 
     @staticmethod
     def to_primitive(obj, attr, value):
@@ -571,6 +845,106 @@ class StringField(AutoTypedField):
     AUTO_TYPE = String()
 
 
+class BaseEnumField(AutoTypedField):
+    '''This class should not be directly instantiated. Instead
+    subclass it and set AUTO_TYPE to be a SomeEnum()
+    where SomeEnum is a subclass of Enum.
+    '''
+    def __init__(self, **kwargs):
+        if self.AUTO_TYPE is None:
+            raise exception.EnumFieldUnset(
+                fieldname=self.__class__.__name__)
+
+        if not isinstance(self.AUTO_TYPE, Enum):
+            raise exception.EnumFieldInvalid(
+                typename=self.AUTO_TYPE.__class__.__name,
+                fieldname=self.__class__.__name__)
+
+        super(BaseEnumField, self).__init__(**kwargs)
+
+    def __repr__(self):
+        valid_values = self._type._valid_values
+        args = {
+            'nullable': self._nullable,
+            'default': self._default,
+            }
+        if valid_values:
+            args.update({'valid_values': valid_values})
+        args = OrderedDict(sorted(args.items()))
+        return '%s(%s)' % (self._type.__class__.__name__,
+                           ','.join(['%s=%s' % (k, v)
+                                     for k, v in args.items()]))
+
+
+class EnumField(BaseEnumField):
+    '''This class allows for anonymous enum types to be
+    declared, simply by passing in a list of valid values
+    to its constructor. It is generally preferrable though,
+    to create an explicit named enum type by sub-classing
+    the BaeEnumField type directly. See ArchitectureField
+    for an example.
+    '''
+    def __init__(self, valid_values, **kwargs):
+        self.AUTO_TYPE = Enum(valid_values=valid_values)
+        super(EnumField, self).__init__(**kwargs)
+
+
+class ArchitectureField(BaseEnumField):
+    AUTO_TYPE = Architecture()
+
+
+class CPUAllocationPolicyField(BaseEnumField):
+    AUTO_TYPE = CPUAllocationPolicy()
+
+
+class CPUModeField(BaseEnumField):
+    AUTO_TYPE = CPUMode()
+
+
+class CPUMatchField(BaseEnumField):
+    AUTO_TYPE = CPUMatch()
+
+
+class CPUFeaturePolicyField(BaseEnumField):
+    AUTO_TYPE = CPUFeaturePolicy()
+
+
+class DiskBusField(BaseEnumField):
+    AUTO_TYPE = DiskBus()
+
+
+class HVTypeField(BaseEnumField):
+    AUTO_TYPE = HVType()
+
+
+class OSTypeField(BaseEnumField):
+    AUTO_TYPE = OSType()
+
+
+class RNGModelField(BaseEnumField):
+    AUTO_TYPE = RNGModel()
+
+
+class SCSIModelField(BaseEnumField):
+    AUTO_TYPE = SCSIModel()
+
+
+class VideoModelField(BaseEnumField):
+    AUTO_TYPE = VideoModel()
+
+
+class VIFModelField(BaseEnumField):
+    AUTO_TYPE = VIFModel()
+
+
+class VMModeField(BaseEnumField):
+    AUTO_TYPE = VMMode()
+
+
+class WatchdogActionField(BaseEnumField):
+    AUTO_TYPE = WatchdogAction()
+
+
 class UUIDField(AutoTypedField):
     AUTO_TYPE = UUID()
 
@@ -583,8 +957,19 @@ class FloatField(AutoTypedField):
     AUTO_TYPE = Float()
 
 
+# This is a strict interpretation of boolean
+# values using Python's semantics for truth/falsehood
 class BooleanField(AutoTypedField):
     AUTO_TYPE = Boolean()
+
+
+# This is a flexible interpretation of boolean
+# values using common user friendly semantics for
+# truth/falsehood. ie strings like 'yes', 'no',
+# 'on', 'off', 't', 'f' get mapped to values you
+# would expect.
+class FlexibleBooleanField(AutoTypedField):
+    AUTO_TYPE = FlexibleBoolean()
 
 
 class DateTimeField(AutoTypedField):
@@ -633,6 +1018,10 @@ class DictOfIntegersField(AutoTypedField):
 
 class ListOfStringsField(AutoTypedField):
     AUTO_TYPE = List(String())
+
+
+class ListOfIntegersField(AutoTypedField):
+    AUTO_TYPE = List(Integer())
 
 
 class SetOfIntegersField(AutoTypedField):

@@ -14,6 +14,7 @@
 
 from migrate.changeset import UniqueConstraint
 from migrate import ForeignKeyConstraint
+from oslo_log import log as logging
 from sqlalchemy import Boolean, BigInteger, Column, DateTime, Enum, Float
 from sqlalchemy import dialects
 from sqlalchemy import ForeignKey, Index, Integer, MetaData, String, Table
@@ -21,7 +22,6 @@ from sqlalchemy import Text
 from sqlalchemy.types import NullType
 
 from nova.i18n import _LE
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
@@ -1551,7 +1551,3 @@ def upgrade(migrate_engine):
     _populate_instance_types(instance_types)
 
     _create_dump_tables(migrate_engine)
-
-
-def downgrade(migrate_engine):
-    raise NotImplementedError('Downgrade from Havana is unsupported.')

@@ -17,7 +17,8 @@
 Tests for availability zones
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+import six
 
 from nova import availability_zones as az
 from nova import context
@@ -125,7 +126,7 @@ class AvailabilityZoneTestCases(test.TestCase):
         service = self._create_service_with_topic('network', self.host)
         services = db.service_get_all(self.context)
         az.set_availability_zones(self.context, services)
-        self.assertIsInstance(services[0]['host'], unicode)
+        self.assertIsInstance(services[0]['host'], six.text_type)
         cached_key = az._make_cache_key(services[0]['host'])
         self.assertIsInstance(cached_key, str)
         self._destroy_service(service)
@@ -188,7 +189,7 @@ class AvailabilityZoneTestCases(test.TestCase):
         # to default False, it returns two lists, zones with at least one
         # enabled services, and zones with no enabled services,
         # when get_only_available is set to True, only return a list of zones
-        # with at least one enabled servies.
+        # with at least one enabled services.
         # Use the following test data:
         #
         # zone         host        enabled
@@ -229,10 +230,12 @@ class AvailabilityZoneTestCases(test.TestCase):
         zones, not_zones = az.get_availability_zones(self.context,
                                                      with_hosts=True)
 
-        self.assertEqual(zones, [(u'nova-test2', set([u'host3'])),
+        self.assertJsonEqual(zones,
+                         [(u'nova-test2', set([u'host3'])),
                                  (u'nova-test', set([u'host1']))])
-        self.assertEqual(not_zones, [(u'nova-test3', set([u'host4'])),
-                                     (u'nova', set([u'host5']))])
+        self.assertJsonEqual(not_zones,
+                         [(u'nova-test3', set([u'host4'])),
+                                 (u'nova', set([u'host5']))])
 
     def test_get_instance_availability_zone_default_value(self):
         """Test get right availability zone by given an instance."""

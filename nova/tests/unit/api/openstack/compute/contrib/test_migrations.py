@@ -14,7 +14,6 @@
 
 import datetime
 
-from lxml import etree
 from oslotest import moxstubout
 
 from nova.api.openstack.compute.contrib import migrations as migrations_v2
@@ -24,6 +23,8 @@ from nova import exception
 from nova import objects
 from nova.objects import base
 from nova import test
+from nova.tests.unit.api.openstack import fakes
+
 
 fake_migrations = [
     {
@@ -37,6 +38,8 @@ fake_migrations = [
         'instance_uuid': 'instance_id_123',
         'old_instance_type_id': 1,
         'new_instance_type_id': 2,
+        'migration_type': 'resize',
+        'hidden': False,
         'created_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
         'updated_at': datetime.datetime(2012, 10, 29, 13, 42, 2),
         'deleted_at': None,
@@ -53,6 +56,8 @@ fake_migrations = [
         'instance_uuid': 'instance_id_456',
         'old_instance_type_id': 5,
         'new_instance_type_id': 6,
+        'migration_type': 'resize',
+        'hidden': False,
         'created_at': datetime.datetime(2013, 10, 22, 13, 42, 2),
         'updated_at': datetime.datetime(2013, 10, 22, 13, 42, 2),
         'deleted_at': None,
@@ -68,7 +73,8 @@ migrations_obj = base.obj_make_list(
 
 
 class FakeRequest(object):
-    environ = {"nova.context": context.get_admin_context()}
+    environ = {"nova.context": context.RequestContext('fake_user', 'fake',
+                                                      is_admin=True)}
     GET = {}
 
 
@@ -79,9 +85,8 @@ class MigrationsTestCaseV21(test.NoDBTestCase):
         """Run before each test."""
         super(MigrationsTestCaseV21, self).setUp()
         self.controller = self.migrations.MigrationsController()
-        self.context = context.get_admin_context()
         self.req = FakeRequest()
-        self.req.environ['nova.context'] = self.context
+        self.context = self.req.environ['nova.context']
         mox_fixture = self.useFixture(moxstubout.MoxStubout())
         self.mox = mox_fixture.mox
 
@@ -96,7 +101,7 @@ class MigrationsTestCaseV21(test.NoDBTestCase):
 
         filters = {'host': 'host1', 'status': 'migrating',
                    'cell_name': 'ChildCell'}
-        self.req.GET = filters
+        self.req.GET.update(filters)
         self.mox.StubOutWithMock(self.controller.compute_api,
                                  "get_migrations")
 
@@ -106,6 +111,15 @@ class MigrationsTestCaseV21(test.NoDBTestCase):
 
         response = self.controller.index(self.req)
         self.assertEqual(migrations_in_progress, response)
+
+
+class MigrationsTestCaseV2(MigrationsTestCaseV21):
+    migrations = migrations_v2
+
+    def setUp(self):
+        super(MigrationsTestCaseV2, self).setUp()
+        self.req = fakes.HTTPRequest.blank('', use_admin_context=True)
+        self.context = self.req.environ['nova.context']
 
     def test_index_needs_authorization(self):
         user_context = context.RequestContext(user_id=None,
@@ -119,30 +133,18 @@ class MigrationsTestCaseV21(test.NoDBTestCase):
                           self.req)
 
 
-class MigrationsTestCaseV2(MigrationsTestCaseV21):
-    migrations = migrations_v2
-
-
-class MigrationsTemplateTestV2(test.NoDBTestCase):
-    migrations = migrations_v2
-
+class MigrationsPolicyEnforcement(test.NoDBTestCase):
     def setUp(self):
-        super(MigrationsTemplateTestV2, self).setUp()
-        self.serializer = self.migrations.MigrationsTemplate()
+        super(MigrationsPolicyEnforcement, self).setUp()
+        self.controller = migrations_v21.MigrationsController()
+        self.req = fakes.HTTPRequest.blank('')
 
-    def test_index_serialization(self):
-        migrations_out = self.migrations.output(migrations_obj)
-        res_xml = self.serializer.serialize(
-            {'migrations': migrations_out})
-
-        tree = etree.XML(res_xml)
-        children = tree.findall('migration')
-        self.assertEqual(tree.tag, 'migrations')
-        self.assertEqual(2, len(children))
-
-        for idx, child in enumerate(children):
-            self.assertEqual(child.tag, 'migration')
-            migration = migrations_out[idx]
-            for attr in migration.keys():
-                self.assertEqual(str(migration[attr]),
-                                 child.get(attr))
+    def test_list_policy_failed(self):
+        rule_name = "os_compute_api:os-migrations:index"
+        self.policy.set_rules({rule_name: "project_id:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller.index, self.req)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())

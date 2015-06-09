@@ -18,20 +18,22 @@ Tests For CellsScheduler
 import copy
 import time
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import uuidutils
 
 from nova import block_device
 from nova.cells import filters
 from nova.cells import weights
+from nova.compute import flavors
 from nova.compute import vm_states
 from nova import context
 from nova import db
 from nova import exception
-from nova.openstack.common import uuidutils
+from nova import objects
 from nova.scheduler import utils as scheduler_utils
 from nova import test
 from nova.tests.unit.cells import fakes
-from nova.tests.unit import fake_instance
+from nova.tests.unit import fake_block_device
 from nova import utils
 
 CONF = cfg.CONF
@@ -77,12 +79,13 @@ class CellsSchedulerTestCase(test.TestCase):
         self.my_cell_state = self.state_manager.get_my_state()
         self.ctxt = context.RequestContext('fake', 'fake')
         instance_uuids = []
-        for x in xrange(3):
+        for x in range(3):
             instance_uuids.append(uuidutils.generate_uuid())
         self.instance_uuids = instance_uuids
-        self.instances = [{'uuid': uuid} for uuid in instance_uuids]
+        self.instances = [objects.Instance(uuid=uuid, id=id)
+                          for id, uuid in enumerate(instance_uuids)]
         self.request_spec = {
-                'instance_uuids': instance_uuids,
+                'num_instances': len(instance_uuids),
                 'instance_properties': self.instances[0],
                 'instance_type': 'fake_type',
                 'image': 'fake_image'}
@@ -95,7 +98,7 @@ class CellsSchedulerTestCase(test.TestCase):
 
     def test_create_instances_here(self):
         # Just grab the first instance type
-        inst_type = db.flavor_get(self.ctxt, 1)
+        inst_type = flavors.get_flavor(1)
         image = {'properties': {}}
         instance_uuids = self.instance_uuids
         instance_props = {'id': 'removed',
@@ -107,13 +110,18 @@ class CellsSchedulerTestCase(test.TestCase):
                           'image_ref': 'fake_image_ref',
                           'user_id': self.ctxt.user_id,
                           # Test these as lists
-                          'metadata': [{'key': 'moo', 'value': 'cow'}],
-                          'system_metadata': [{'key': 'meow', 'value': 'cat'}],
+                          'metadata': {'moo': 'cow'},
+                          'system_metadata': {'meow': 'cat'},
+                          'flavor': inst_type,
                           'project_id': self.ctxt.project_id}
 
         call_info = {'uuids': []}
-        block_device_mapping = [block_device.create_image_bdm(
-            'fake_image_ref')]
+        block_device_mapping = [
+                objects.BlockDeviceMapping(context=self.ctxt,
+                    **fake_block_device.FakeDbBlockDeviceDict(
+                            block_device.create_image_bdm('fake_image_ref'),
+                            anon=True))
+               ]
 
         def _fake_instance_update_at_top(_ctxt, instance):
             call_info['uuids'].append(instance['uuid'])
@@ -126,14 +134,14 @@ class CellsSchedulerTestCase(test.TestCase):
                 ['default'], block_device_mapping)
         self.assertEqual(instance_uuids, call_info['uuids'])
 
-        for instance_uuid in instance_uuids:
+        for count, instance_uuid in enumerate(instance_uuids):
             instance = db.instance_get_by_uuid(self.ctxt, instance_uuid)
             meta = utils.instance_meta(instance)
             self.assertEqual('cow', meta['moo'])
             sys_meta = utils.instance_sys_meta(instance)
             self.assertEqual('cat', sys_meta['meow'])
             self.assertEqual('meow', instance['hostname'])
-            self.assertEqual('moo-%s' % instance['uuid'],
+            self.assertEqual('moo-%d' % (count + 1),
                              instance['display_name'])
             self.assertEqual('fake_image_ref', instance['image_ref'])
 
@@ -161,7 +169,7 @@ class CellsSchedulerTestCase(test.TestCase):
 
         def fake_build_request_spec(ctxt, image, instances):
             request_spec = {
-                    'instance_uuids': [inst['uuid'] for inst in instances],
+                    'num_instances': len(instances),
                     'image': image}
             return request_spec
 
@@ -197,16 +205,14 @@ class CellsSchedulerTestCase(test.TestCase):
             call_info['image'] = image
             call_info['security_groups'] = security_groups
             call_info['block_device_mapping'] = block_device_mapping
-            instances = [fake_instance.fake_instance_obj(ctxt, **instance)
-                    for instance in self.instances]
-            return instances
+            return self.instances
 
         def fake_rpc_build_instances(ctxt, **build_inst_kwargs):
             call_info['build_inst_kwargs'] = build_inst_kwargs
 
         def fake_build_request_spec(ctxt, image, instances):
             request_spec = {
-                    'instance_uuids': [inst['uuid'] for inst in instances],
+                    'num_instances': len(instances),
                     'image': image}
             return request_spec
 
@@ -222,8 +228,8 @@ class CellsSchedulerTestCase(test.TestCase):
 
         self.assertEqual(self.ctxt, call_info['ctxt'])
         self.assertEqual(self.instance_uuids, call_info['instance_uuids'])
-        self.assertEqual(self.build_inst_kwargs['instances'][0],
-                call_info['instance_properties'])
+        self.assertEqual(self.build_inst_kwargs['instances'][0]['id'],
+                         call_info['instance_properties']['id'])
         self.assertEqual(
             self.build_inst_kwargs['filter_properties']['instance_type'],
             call_info['instance_type'])
@@ -254,7 +260,7 @@ class CellsSchedulerTestCase(test.TestCase):
 
         def fake_build_request_spec(ctxt, image, instances):
             request_spec = {
-                    'instance_uuids': [inst['uuid'] for inst in instances],
+                    'num_instances': len(instances),
                     'image': image}
             return request_spec
 
@@ -298,7 +304,7 @@ class CellsSchedulerTestCase(test.TestCase):
 
         def fake_build_request_spec(ctxt, image, instances):
             request_spec = {
-                    'instance_uuids': [inst['uuid'] for inst in instances],
+                    'num_instances': len(instances),
                     'image': image}
             return request_spec
 
@@ -370,7 +376,7 @@ class CellsSchedulerTestCase(test.TestCase):
 
         def fake_build_request_spec(ctxt, image, instances):
             request_spec = {
-                    'instance_uuids': [inst['uuid'] for inst in instances],
+                    'num_instances': len(instances),
                     'instance_properties': instances[0],
                     'image': image,
                     'instance_type': 'fake_type'}
@@ -398,8 +404,8 @@ class CellsSchedulerTestCase(test.TestCase):
         # Our cell was selected.
         self.assertEqual(self.ctxt, call_info['ctxt'])
         self.assertEqual(self.instance_uuids, call_info['instance_uuids'])
-        self.assertEqual(self.request_spec['instance_properties'],
-                call_info['instance_properties'])
+        self.assertEqual(self.request_spec['instance_properties']['id'],
+                         call_info['instance_properties']['id'])
         self.assertEqual(self.request_spec['instance_type'],
                 call_info['instance_type'])
         self.assertEqual(self.request_spec['image'], call_info['image'])
@@ -485,7 +491,7 @@ class CellsSchedulerTestCase(test.TestCase):
 
         def fake_build_request_spec(ctxt, image, instances):
             request_spec = {
-                    'instance_uuids': [inst['uuid'] for inst in instances],
+                    'num_instances': len(instances),
                     'instance_properties': instances[0],
                     'image': image,
                     'instance_type': 'fake_type'}
@@ -513,8 +519,8 @@ class CellsSchedulerTestCase(test.TestCase):
         # Our cell was selected.
         self.assertEqual(self.ctxt, call_info['ctxt'])
         self.assertEqual(self.instance_uuids, call_info['instance_uuids'])
-        self.assertEqual(self.request_spec['instance_properties'],
-                call_info['instance_properties'])
+        self.assertEqual(self.request_spec['instance_properties']['id'],
+                         call_info['instance_properties']['id'])
         self.assertEqual(self.request_spec['instance_type'],
                 call_info['instance_type'])
         self.assertEqual(self.request_spec['image'], call_info['image'])

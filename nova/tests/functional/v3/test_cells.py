@@ -13,6 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
+from six.moves import range
+
 from nova.cells import rpcapi as cells_rpcapi
 from nova.cells import state
 from nova import db
@@ -20,9 +23,26 @@ from nova.db.sqlalchemy import models
 from nova import exception
 from nova.tests.functional.v3 import api_sample_base
 
+CONF = cfg.CONF
+CONF.import_opt('osapi_compute_extension',
+                'nova.api.openstack.compute.extensions')
+
 
 class CellsSampleJsonTest(api_sample_base.ApiSampleTestBaseV3):
     extension_name = "os-cells"
+    # TODO(gmann): Overriding '_api_version' till all functional tests
+    # are merged between v2 and v2.1. After that base class variable
+    # itself can be changed to 'v2'
+    _api_version = 'v2'
+
+    def _get_flags(self):
+        f = super(CellsSampleJsonTest, self)._get_flags()
+        f['osapi_compute_extension'] = CONF.osapi_compute_extension[:]
+        f['osapi_compute_extension'].append(
+            'nova.api.openstack.compute.contrib.cells.Cells')
+        f['osapi_compute_extension'].append('nova.api.openstack.compute.'
+                      'contrib.cell_capacities.Cell_capacities')
+        return f
 
     def setUp(self):
         # db_check_interval < 0 makes cells manager always hit the DB
@@ -43,7 +63,7 @@ class CellsSampleJsonTest(api_sample_base.ApiSampleTestBaseV3):
                     return cell
             raise exception.CellNotFound(cell_name=cell_name)
 
-        for x in xrange(num_cells):
+        for x in range(num_cells):
             cell = models.Cell()
             our_id = self.cells_next_id
             self.cells_next_id += 1

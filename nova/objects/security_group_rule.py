@@ -21,7 +21,10 @@ from nova.objects import fields
 OPTIONAL_ATTRS = ['parent_group', 'grantee_group']
 
 
-class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject,
+                        base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added create() and set id as read_only
     VERSION = '1.1'
@@ -62,7 +65,7 @@ class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject):
         return rule
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                       reason='already created')
@@ -73,8 +76,8 @@ class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject):
         grantee_group = updates.pop('grantee_group', None)
         if grantee_group:
             updates['group_id'] = grantee_group.id
-        db_rule = db.security_group_rule_create(context, updates)
-        self._from_db_object(context, self, db_rule)
+        db_rule = db.security_group_rule_create(self._context, updates)
+        self._from_db_object(self._context, self, db_rule)
 
     @base.remotable_classmethod
     def get_by_id(cls, context, rule_id):
@@ -82,6 +85,7 @@ class SecurityGroupRule(base.NovaPersistentObject, base.NovaObject):
         return cls._from_db_object(context, cls(), db_rule)
 
 
+@base.NovaObjectRegistry.register
 class SecurityGroupRuleList(base.ObjectListBase, base.NovaObject):
     fields = {
         'objects': fields.ListOfObjectsField('SecurityGroupRule'),

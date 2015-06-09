@@ -18,9 +18,10 @@ import sys
 if sys.platform == 'win32':
     import wmi
 
+from oslo_log import log as logging
+
 from nova import exception
-from nova.i18n import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE
 from nova.virt.hyperv import vmutils
 from nova.virt.hyperv import vmutilsv2
 from nova.virt.hyperv import volumeutilsv2
@@ -38,7 +39,7 @@ class LiveMigrationUtils(object):
         try:
             return wmi.WMI(moniker='//%s/root/virtualization/v2' % host)
         except wmi.x_wmi as ex:
-            LOG.exception(ex)
+            LOG.exception(_LE('Get version 2 connection error'))
             if ex.com_error.hresult == -2147217394:
                 msg = (_('Live migration is not supported on target host "%s"')
                        % host)
@@ -109,7 +110,11 @@ class LiveMigrationUtils(object):
 
     def _get_physical_disk_paths(self, vm_name):
         ide_ctrl_path = self._vmutils.get_vm_ide_controller(vm_name, 0)
-        ide_paths = self._vmutils.get_controller_volume_paths(ide_ctrl_path)
+        if ide_ctrl_path:
+            ide_paths = self._vmutils.get_controller_volume_paths(
+                ide_ctrl_path)
+        else:
+            ide_paths = {}
 
         scsi_ctrl_path = self._vmutils.get_vm_scsi_controller(vm_name)
         scsi_paths = self._vmutils.get_controller_volume_paths(scsi_ctrl_path)

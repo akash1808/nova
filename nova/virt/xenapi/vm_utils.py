@@ -28,14 +28,16 @@ from xml.dom import minidom
 from xml.parsers import expat
 
 from eventlet import greenthread
-from oslo.config import cfg
-from oslo.utils import excutils
-from oslo.utils import importutils
-from oslo.utils import strutils
-from oslo.utils import timeutils
-from oslo.utils import units
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import importutils
+from oslo_utils import strutils
+from oslo_utils import timeutils
+from oslo_utils import units
 import six
+from six.moves import range
 import six.moves.urllib.parse as urlparse
 
 from nova.api.metadata import base as instance_metadata
@@ -45,7 +47,6 @@ from nova.compute import vm_mode
 from nova import exception
 from nova.i18n import _, _LE, _LI, _LW
 from nova.network import model as network_model
-from nova.openstack.common import log as logging
 from nova.openstack.common import versionutils
 from nova import utils
 from nova.virt import configdrive
@@ -63,6 +64,7 @@ LOG = logging.getLogger(__name__)
 xenapi_vm_utils_opts = [
     cfg.StrOpt('cache_images',
                default='all',
+               choices=('all', 'some', 'none'),
                help='Cache glance images locally. `all` will cache all'
                     ' images, `some` will only cache images that have the'
                     ' image_property `cache_in_nova=True`, and `none` turns'
@@ -98,11 +100,12 @@ xenapi_vm_utils_opts = [
                      'won\'t have to be rsynced'),
     cfg.IntOpt('num_vbd_unplug_retries',
                default=10,
-               help='Maximum number of retries to unplug VBD'),
+               help='Maximum number of retries to unplug VBD. if <=0, '
+                    'should try once and no retry'),
     cfg.StrOpt('torrent_images',
                default='none',
-               help='Whether or not to download images via Bit Torrent '
-                    '(all|some|none).'),
+               choices=('all', 'some', 'none'),
+               help='Whether or not to download images via Bit Torrent.'),
     cfg.StrOpt('ipxe_network_name',
                help='Name of network to use for booting iPXE ISOs'),
     cfg.StrOpt('ipxe_boot_menu_url',
@@ -314,8 +317,8 @@ def destroy_vm(session, instance, vm_ref):
     """Destroys a VM record."""
     try:
         session.VM.destroy(vm_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Destroy VM failed'))
         return
 
     LOG.debug("VM destroyed", instance=instance)
@@ -330,8 +333,8 @@ def clean_shutdown_vm(session, instance, vm_ref):
     LOG.debug("Shutting down VM (cleanly)", instance=instance)
     try:
         session.call_xenapi('VM.clean_shutdown', vm_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Shutting down VM (cleanly) failed.'))
         return False
     return True
 
@@ -345,8 +348,8 @@ def hard_shutdown_vm(session, instance, vm_ref):
     LOG.debug("Shutting down VM (hard)", instance=instance)
     try:
         session.call_xenapi('VM.hard_shutdown', vm_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Shutting down VM (hard) failed'))
         return False
     return True
 
@@ -379,8 +382,9 @@ def _should_retry_unplug_vbd(err):
 
 
 def unplug_vbd(session, vbd_ref, this_vm_ref):
-    max_attempts = CONF.xenserver.num_vbd_unplug_retries + 1
-    for num_attempt in xrange(1, max_attempts + 1):
+    # make sure that perform at least once
+    max_attempts = max(0, CONF.xenserver.num_vbd_unplug_retries) + 1
+    for num_attempt in range(1, max_attempts + 1):
         try:
             if num_attempt > 1:
                 greenthread.sleep(1)
@@ -398,7 +402,7 @@ def unplug_vbd(session, vbd_ref, this_vm_ref):
                          {'vbd_ref': vbd_ref, 'num_attempt': num_attempt,
                           'max_attempts': max_attempts, 'err': err})
             else:
-                LOG.exception(exc)
+                LOG.exception(_LE('Unable to unplug VBD'))
                 raise exception.StorageError(
                         reason=_('Unable to unplug VBD %s') % vbd_ref)
 
@@ -412,8 +416,8 @@ def destroy_vbd(session, vbd_ref):
     """Destroy VBD from host database."""
     try:
         session.call_xenapi('VBD.destroy', vbd_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to destroy VBD'))
         raise exception.StorageError(
                 reason=_('Unable to destroy VBD %s') % vbd_ref)
 
@@ -594,7 +598,7 @@ def _set_vdi_info(session, vdi_ref, vdi_type, name_label, description,
     session.call_xenapi('VDI.set_name_description', vdi_ref, description)
 
     other_config = _get_vdi_other_config(vdi_type, instance=instance)
-    for key, value in other_config.iteritems():
+    for key, value in six.iteritems(other_config):
         if key not in existing_other_config:
             session.call_xenapi(
                     "VDI.add_to_other_config", vdi_ref, key, value)
@@ -981,7 +985,7 @@ def try_auto_configure_disk(session, vdi_ref, new_gb):
     try:
         _auto_configure_disk(session, vdi_ref, new_gb)
     except exception.CannotResizeDisk as e:
-        msg = _('Attempted auto_configure_disk failed because: %s')
+        msg = _LW('Attempted auto_configure_disk failed because: %s')
         LOG.warn(msg % e)
 
 
@@ -1329,7 +1333,7 @@ def create_image(context, session, instance, name_label, image_id,
              {'image_id': image_id, 'cache': cache, 'downloaded': downloaded,
               'duration': duration})
 
-    for vdi_type, vdi in vdis.iteritems():
+    for vdi_type, vdi in six.iteritems(vdis):
         vdi_ref = session.call_xenapi('VDI.get_by_uuid', vdi['uuid'])
         _set_vdi_info(session, vdi_ref, vdi_type, name_label, vdi_type,
                       instance)
@@ -1349,7 +1353,7 @@ def _fetch_image(context, session, instance, name_label, image_id, image_type):
         vdis = _fetch_disk_image(context, session, instance, name_label,
                                  image_id, image_type)
 
-    for vdi_type, vdi in vdis.iteritems():
+    for vdi_type, vdi in six.iteritems(vdis):
         vdi_uuid = vdi['uuid']
         LOG.debug("Fetched VDIs of type '%(vdi_type)s' with UUID"
                   " '%(vdi_uuid)s'",
@@ -1364,7 +1368,7 @@ def _make_uuid_stack():
     # which does not have the `uuid` module. To work around this,
     # we generate the uuids here (under Python 2.6+) and
     # pass them as arguments
-    return [str(uuid.uuid4()) for i in xrange(MAX_VDI_CHAIN_SIZE)]
+    return [str(uuid.uuid4()) for i in range(MAX_VDI_CHAIN_SIZE)]
 
 
 def _image_uses_bittorrent(context, instance):
@@ -1682,8 +1686,8 @@ def lookup_vm_vdis(session, vm_ref):
                 if not vbd_other_config.get('osvol'):
                     # This is not an attached volume
                     vdi_refs.append(vdi_ref)
-            except session.XenAPI.Failure as exc:
-                LOG.exception(exc)
+            except session.XenAPI.Failure:
+                LOG.exception(_LE('"Look for the VDIs failed'))
     return vdi_refs
 
 
@@ -2097,7 +2101,7 @@ def _wait_for_vhd_coalesce(session, instance, sr_ref, vdi_ref,
     # Its possible that other coalesce operation happen, so we need
     # to consider the full chain, rather than just the most recent parent.
     good_parent_uuids = vdi_uuid_list[1:]
-    for i in xrange(max_attempts):
+    for i in range(max_attempts):
         # NOTE(sirp): This rescan is necessary to ensure the VM's `sm_config`
         # matches the underlying VHDs.
         # This can also kick XenServer into performing a pending coalesce.
@@ -2144,7 +2148,7 @@ def _remap_vbd_dev(dev):
 
 def _wait_for_device(dev):
     """Wait for device node to appear."""
-    for i in xrange(0, CONF.xenserver.block_device_creation_timeout):
+    for i in range(0, CONF.xenserver.block_device_creation_timeout):
         dev_path = utils.make_dev_path(dev)
         if os.path.exists(dev_path):
             return
@@ -2288,9 +2292,6 @@ def _write_partition(session, virtual_size, dev):
               ' to %(dev_path)s...',
               {'primary_first': primary_first, 'primary_last': primary_last,
                'dev_path': dev_path})
-
-    def execute(*cmd, **kwargs):
-        return utils.execute(*cmd, **kwargs)
 
     _make_partition(session, dev, "%ds" % primary_first, "%ds" % primary_last)
     LOG.debug('Writing partition table %s done.', dev_path)
@@ -2492,8 +2493,10 @@ def ensure_correct_host(session):
                           'specified by connection_url'))
 
 
-def import_all_migrated_disks(session, instance):
-    root_vdi = _import_migrated_root_disk(session, instance)
+def import_all_migrated_disks(session, instance, import_root=True):
+    root_vdi = None
+    if import_root:
+        root_vdi = _import_migrated_root_disk(session, instance)
     eph_vdis = _import_migrate_ephemeral_disks(session, instance)
     return {'root': root_vdi, 'ephemerals': eph_vdis}
 

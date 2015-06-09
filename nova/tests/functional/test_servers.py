@@ -17,11 +17,11 @@ import datetime
 import time
 import zlib
 
-from oslo.utils import timeutils
+from oslo_log import log as logging
+from oslo_utils import timeutils
 
 from nova import context
 from nova import exception
-from nova.openstack.common import log as logging
 from nova.tests.functional.api import client
 from nova.tests.functional import integrated_helpers
 from nova.tests.unit import fake_network
@@ -31,7 +31,7 @@ import nova.virt.fake
 LOG = logging.getLogger(__name__)
 
 
-class ServersTest(integrated_helpers._IntegratedTestBase):
+class ServersTestBase(integrated_helpers._IntegratedTestBase):
     _api_version = 'v2'
     _force_delete_parameter = 'forceDelete'
     _image_ref_parameter = 'imageRef'
@@ -42,12 +42,12 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
     _min_count_parameter = 'min_count'
 
     def setUp(self):
-        super(ServersTest, self).setUp()
+        super(ServersTestBase, self).setUp()
         self.conductor = self.start_service(
             'conductor', manager='nova.conductor.manager.ConductorManager')
 
     def _wait_for_state_change(self, server, from_status):
-        for i in xrange(0, 50):
+        for i in range(0, 50):
             server = self.api.get_server(server['id'])
             if server['status'] != from_status:
                 break
@@ -59,6 +59,43 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
         """restart compute service. NOTE: fake driver forgets all instances."""
         self.compute.kill()
         self.compute = self.start_service('compute', *args, **kwargs)
+
+    def _wait_for_deletion(self, server_id):
+        # Wait (briefly) for deletion
+        for _retries in range(50):
+            try:
+                found_server = self.api.get_server(server_id)
+            except client.OpenStackApiNotFoundException:
+                found_server = None
+                LOG.debug("Got 404, proceeding")
+                break
+
+            LOG.debug("Found_server=%s" % found_server)
+
+            # TODO(justinsb): Mock doesn't yet do accurate state changes
+            # if found_server['status'] != 'deleting':
+            #    break
+            time.sleep(.1)
+
+        # Should be gone
+        self.assertFalse(found_server)
+
+    def _delete_server(self, server_id):
+        # Delete the server
+        self.api.delete_server(server_id)
+        self._wait_for_deletion(server_id)
+
+    def _get_access_ips_params(self):
+        return {self._access_ipv4_parameter: "172.19.0.2",
+                self._access_ipv6_parameter: "fe80::2"}
+
+    def _verify_access_ips(self, server):
+        self.assertEqual('172.19.0.2',
+                         server[self._access_ipv4_parameter])
+        self.assertEqual('fe80::2', server[self._access_ipv6_parameter])
+
+
+class ServersTest(ServersTestBase):
 
     def test_get_servers(self):
         # Simple check that listing servers works.
@@ -266,31 +303,6 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
         # Wait for real deletion
         self._wait_for_deletion(created_server_id)
 
-    def _wait_for_deletion(self, server_id):
-        # Wait (briefly) for deletion
-        for _retries in range(50):
-            try:
-                found_server = self.api.get_server(server_id)
-            except client.OpenStackApiNotFoundException:
-                found_server = None
-                LOG.debug("Got 404, proceeding")
-                break
-
-            LOG.debug("Found_server=%s" % found_server)
-
-            # TODO(justinsb): Mock doesn't yet do accurate state changes
-            # if found_server['status'] != 'deleting':
-            #    break
-            time.sleep(.1)
-
-        # Should be gone
-        self.assertFalse(found_server)
-
-    def _delete_server(self, server_id):
-        # Delete the server
-        self.api.delete_server(server_id)
-        self._wait_for_deletion(server_id)
-
     def test_create_server_with_metadata(self):
         # Creates a server with metadata.
         fake_network.set_stub_network_methods(self.stubs)
@@ -316,7 +328,7 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
 
         # The server should also be in the all-servers details list
         servers = self.api.get_servers(detail=True)
-        server_map = dict((server['id'], server) for server in servers)
+        server_map = {server['id']: server for server in servers}
         found_server = server_map.get(created_server_id)
         self.assertTrue(found_server)
         # Details do include metadata
@@ -324,7 +336,7 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
 
         # The server should also be in the all-servers summary list
         servers = self.api.get_servers(detail=False)
-        server_map = dict((server['id'], server) for server in servers)
+        server_map = {server['id']: server for server in servers}
         found_server = server_map.get(created_server_id)
         self.assertTrue(found_server)
         # Summary should not include metadata
@@ -399,15 +411,6 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
         # Cleanup
         self._delete_server(created_server_id)
 
-    def _get_access_ips_params(self):
-        return {self._access_ipv4_parameter: "172.19.0.2",
-                self._access_ipv6_parameter: "fe80::2"}
-
-    def _verify_access_ips(self, server):
-        self.assertEqual('172.19.0.2',
-                         server[self._access_ipv4_parameter])
-        self.assertEqual('fe80::2', server[self._access_ipv6_parameter])
-
     def test_rename_server(self):
         # Test building and renaming a server.
         fake_network.set_stub_network_methods(self.stubs)
@@ -453,7 +456,7 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
         # lookup servers created by the first request.
         servers = self.api.get_servers(detail=True,
                 search_opts={'reservation_id': reservation_id})
-        server_map = dict((server['id'], server) for server in servers)
+        server_map = {server['id']: server for server in servers}
         found_server = server_map.get(created_server_id)
         # The server from the 2nd request should not be there.
         self.assertIsNone(found_server)
@@ -462,7 +465,7 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
 
         # Cleanup
         self._delete_server(created_server_id)
-        for server_id in server_map.iterkeys():
+        for server_id in server_map:
             self._delete_server(server_id)
 
     def test_create_server_with_injected_files(self):
@@ -507,17 +510,4 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
 
 
 class ServersTestV3(client.TestOpenStackClientV3Mixin, ServersTest):
-    _force_delete_parameter = 'forceDelete'
     _api_version = 'v3'
-    _image_ref_parameter = 'imageRef'
-    _flavor_ref_parameter = 'flavorRef'
-    _access_ipv4_parameter = None
-    _access_ipv6_parameter = None
-
-    def _get_access_ips_params(self):
-        return {}
-
-    def _verify_access_ips(self, server):
-        # NOTE(alexxu): access_ips was demoted as extensions in v3 api.
-        # So skips verifying access_ips
-        pass

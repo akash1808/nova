@@ -14,7 +14,8 @@
 #    under the License.
 
 import mock
-from oslo.serialization import jsonutils
+
+import six
 
 from nova import exception
 from nova import objects
@@ -22,7 +23,6 @@ from nova.pci import stats
 from nova.pci import whitelist
 from nova import test
 from nova.tests.unit.pci import fakes
-
 fake_pci_1 = {
     'compute_node_id': 1,
     'address': '0000:00:00.1',
@@ -31,16 +31,22 @@ fake_pci_1 = {
     'status': 'available',
     'extra_k1': 'v1',
     'request_id': None,
+    'numa_node': 0,
     }
 
 
 fake_pci_2 = dict(fake_pci_1, vendor_id='v2',
                   product_id='p2',
-                  address='0000:00:00.2')
+                  address='0000:00:00.2',
+                  numa_node=1)
 
 
 fake_pci_3 = dict(fake_pci_1, address='0000:00:00.3')
 
+fake_pci_4 = dict(fake_pci_1, vendor_id='v3',
+                  product_id='p3',
+                  address='0000:00:00.3',
+                  numa_node= None)
 
 pci_requests = [objects.InstancePCIRequest(count=1,
                     spec=[{'vendor_id': 'v1'}]),
@@ -59,9 +65,11 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         self.fake_dev_1 = objects.PciDevice.create(fake_pci_1)
         self.fake_dev_2 = objects.PciDevice.create(fake_pci_2)
         self.fake_dev_3 = objects.PciDevice.create(fake_pci_3)
+        self.fake_dev_4 = objects.PciDevice.create(fake_pci_4)
 
         map(self.pci_stats.add_device,
-            [self.fake_dev_1, self.fake_dev_2, self.fake_dev_3])
+            [self.fake_dev_1, self.fake_dev_2,
+             self.fake_dev_3, self.fake_dev_4])
 
     def setUp(self):
         super(PciDeviceStatsTestCase, self).setUp()
@@ -72,15 +80,15 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         self._create_fake_devs()
 
     def test_add_device(self):
-        self.assertEqual(len(self.pci_stats.pools), 2)
+        self.assertEqual(len(self.pci_stats.pools), 3)
         self.assertEqual(set([d['vendor_id'] for d in self.pci_stats]),
-                         set(['v1', 'v2']))
+                         set(['v1', 'v2', 'v3']))
         self.assertEqual(set([d['count'] for d in self.pci_stats]),
                          set([1, 2]))
 
     def test_remove_device(self):
         self.pci_stats.remove_device(self.fake_dev_2)
-        self.assertEqual(len(self.pci_stats.pools), 1)
+        self.assertEqual(len(self.pci_stats.pools), 2)
         self.assertEqual(self.pci_stats.pools[0]['count'], 2)
         self.assertEqual(self.pci_stats.pools[0]['vendor_id'], 'v1')
 
@@ -90,33 +98,48 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
                           self.pci_stats.remove_device,
                           self.fake_dev_2)
 
-    def test_json_creat(self):
-        m = jsonutils.dumps(self.pci_stats)
+    def test_pci_stats_equivalent(self):
+        pci_stats2 = stats.PciDeviceStats()
+        map(pci_stats2.add_device, [self.fake_dev_1,
+                                    self.fake_dev_2,
+                                    self.fake_dev_3,
+                                    self.fake_dev_4])
+        self.assertEqual(self.pci_stats, pci_stats2)
+
+    def test_pci_stats_not_equivalent(self):
+        pci_stats2 = stats.PciDeviceStats()
+        map(pci_stats2.add_device, [self.fake_dev_1,
+                                    self.fake_dev_2,
+                                    self.fake_dev_3])
+        self.assertNotEqual(self.pci_stats, pci_stats2)
+
+    def test_object_create(self):
+        m = self.pci_stats.to_device_pools_obj()
         new_stats = stats.PciDeviceStats(m)
 
-        self.assertEqual(len(new_stats.pools), 2)
+        self.assertEqual(len(new_stats.pools), 3)
         self.assertEqual(set([d['count'] for d in new_stats]),
                          set([1, 2]))
         self.assertEqual(set([d['vendor_id'] for d in new_stats]),
-                         set(['v1', 'v2']))
+                         set(['v1', 'v2', 'v3']))
 
     def test_support_requests(self):
         self.assertEqual(self.pci_stats.support_requests(pci_requests),
                          True)
-        self.assertEqual(len(self.pci_stats.pools), 2)
+        self.assertEqual(len(self.pci_stats.pools), 3)
         self.assertEqual(set([d['count'] for d in self.pci_stats]),
                          set((1, 2)))
 
     def test_support_requests_failed(self):
         self.assertEqual(
             self.pci_stats.support_requests(pci_requests_multiple), False)
-        self.assertEqual(len(self.pci_stats.pools), 2)
+        self.assertEqual(len(self.pci_stats.pools), 3)
         self.assertEqual(set([d['count'] for d in self.pci_stats]),
                          set([1, 2]))
 
     def test_apply_requests(self):
         self.pci_stats.apply_requests(pci_requests)
-        self.assertEqual(len(self.pci_stats.pools), 1)
+        self.assertEqual(len(self.pci_stats.pools), 2)
         self.assertEqual(self.pci_stats.pools[0]['vendor_id'], 'v1')
         self.assertEqual(self.pci_stats.pools[0]['count'], 1)
 
@@ -139,6 +162,47 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         self.assertRaises(exception.PciDeviceRequestFailed,
             self.pci_stats.consume_requests,
             pci_requests_multiple)
+
+    def test_support_requests_numa(self):
+        cells = [objects.NUMACell(id=0, cpuset=set(), memory=0),
+                 objects.NUMACell(id=1, cpuset=set(), memory=0)]
+        self.assertEqual(True, self.pci_stats.support_requests(
+                                                        pci_requests, cells))
+
+    def test_support_requests_numa_failed(self):
+        cells = [objects.NUMACell(id=0, cpuset=set(), memory=0)]
+        self.assertEqual(False, self.pci_stats.support_requests(
+                                                        pci_requests, cells))
+
+    def test_support_requests_no_numa_info(self):
+        cells = [objects.NUMACell(id=0, cpuset=set(), memory=0)]
+        pci_request = [objects.InstancePCIRequest(count=1,
+                    spec=[{'vendor_id': 'v3'}])]
+        self.assertEqual(True, self.pci_stats.support_requests(
+                                                        pci_request, cells))
+
+    def test_consume_requests_numa(self):
+        cells = [objects.NUMACell(id=0, cpuset=set(), memory=0),
+                 objects.NUMACell(id=1, cpuset=set(), memory=0)]
+        devs = self.pci_stats.consume_requests(pci_requests, cells)
+        self.assertEqual(2, len(devs))
+        self.assertEqual(set(['v1', 'v2']),
+                         set([dev['vendor_id'] for dev in devs]))
+
+    def test_consume_requests_numa_failed(self):
+        cells = [objects.NUMACell(id=0, cpuset=set(), memory=0)]
+        self.assertRaises(exception.PciDeviceRequestFailed,
+            self.pci_stats.consume_requests,
+            pci_requests, cells)
+
+    def test_consume_requests_no_numa_info(self):
+        cells = [objects.NUMACell(id=0, cpuset=set(), memory=0)]
+        pci_request = [objects.InstancePCIRequest(count=1,
+                    spec=[{'vendor_id': 'v3'}])]
+        devs = self.pci_stats.consume_requests(pci_request, cells)
+        self.assertEqual(1, len(devs))
+        self.assertEqual(set(['v3']),
+                         set([dev['vendor_id'] for dev in devs]))
 
 
 @mock.patch.object(whitelist, 'get_pci_devices_filter')
@@ -163,7 +227,8 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
                        'vendor_id': '1137',
                        'product_id': '0071',
                        'status': 'available',
-                       'request_id': None}
+                       'request_id': None,
+                       'numa_node': 0}
             self.pci_tagged_devices.append(objects.PciDevice.create(pci_dev))
 
         self.pci_untagged_devices = []
@@ -173,7 +238,8 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
                        'vendor_id': '1137',
                        'product_id': '0072',
                        'status': 'available',
-                       'request_id': None}
+                       'request_id': None,
+                       'numa_node': 0}
             self.pci_untagged_devices.append(objects.PciDevice.create(pci_dev))
 
         map(self.pci_stats.add_device, self.pci_tagged_devices)
@@ -184,7 +250,7 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
         self.assertEqual(product_id, pool['product_id'])
         self.assertEqual(count, pool['count'])
         if tags:
-            for k, v in tags.iteritems():
+            for k, v in six.iteritems(tags):
                 self.assertEqual(v, pool[k])
 
     def _assertPools(self):

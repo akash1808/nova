@@ -16,12 +16,12 @@
 import functools
 import sys
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova.compute import utils as compute_utils
 from nova import exception
 from nova.image import glance
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt.xenapi import vm_utils
 
@@ -35,7 +35,7 @@ class GlanceStore(object):
         glance_api_servers = glance.get_api_servers()
 
         def pick_glance(kwargs):
-            g_host, g_port, g_use_ssl = glance_api_servers.next()
+            g_host, g_port, g_use_ssl = next(glance_api_servers)
             kwargs['glance_host'] = g_host
             kwargs['glance_port'] = g_port
             kwargs['glance_use_ssl'] = g_use_ssl

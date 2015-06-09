@@ -12,6 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 import webob
 
 from nova.api.openstack.compute.schemas.v3 import server_external_events
@@ -21,14 +22,13 @@ from nova.api import validation
 from nova import compute
 from nova import exception
 from nova.i18n import _
+from nova.i18n import _LI
 from nova import objects
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
 ALIAS = 'os-server-external-events'
-authorize = extensions.extension_authorizer('compute',
-                                            'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class ServerExternalEventsController(wsgi.Controller):
@@ -71,7 +71,7 @@ class ServerExternalEventsController(wsgi.Controller):
                 except exception.InstanceNotFound:
                     LOG.debug('Dropping event %(name)s:%(tag)s for unknown '
                               'instance %(instance_uuid)s',
-                              dict(event.iteritems()))
+                              dict(event))
                     _event['status'] = 'failed'
                     _event['code'] = 404
                     result = 207
@@ -83,9 +83,9 @@ class ServerExternalEventsController(wsgi.Controller):
                 if instance.host:
                     accepted_events.append(event)
                     accepted_instances.add(instance)
-                    LOG.audit(_('Creating event %(name)s:%(tag)s for instance '
-                                '%(instance_uuid)s'),
-                              dict(event.iteritems()))
+                    LOG.info(_LI('Creating event %(name)s:%(tag)s for '
+                                 'instance %(instance_uuid)s'),
+                              dict(event))
                     # NOTE: as the event is processed asynchronously verify
                     # whether 202 is a more suitable response code than 200
                     _event['status'] = 'completed'

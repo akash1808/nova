@@ -18,25 +18,15 @@ Tests For Scheduler
 """
 
 import mock
-from mox3 import mox
-from oslo.config import cfg
 
-from nova.compute import api as compute_api
 from nova import context
 from nova import db
-from nova import exception
-from nova.image import glance
-from nova import rpc
 from nova.scheduler import driver
+from nova.scheduler import host_manager
 from nova.scheduler import manager
 from nova import servicegroup
 from nova import test
 from nova.tests.unit import fake_server_actions
-from nova.tests.unit.image import fake as fake_image
-from nova.tests.unit.objects import test_instance_fault
-from nova.tests.unit.scheduler import fakes
-
-CONF = cfg.CONF
 
 
 class SchedulerManagerTestCase(test.NoDBTestCase):
@@ -46,11 +36,13 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
     driver_cls = driver.Scheduler
     driver_cls_name = 'nova.scheduler.driver.Scheduler'
 
-    def setUp(self):
+    @mock.patch.object(host_manager.HostManager, '_init_instance_info')
+    @mock.patch.object(host_manager.HostManager, '_init_aggregates')
+    def setUp(self, mock_init_agg, mock_init_inst):
         super(SchedulerManagerTestCase, self).setUp()
         self.flags(scheduler_driver=self.driver_cls_name)
-        self.stubs.Set(compute_api, 'API', fakes.FakeComputeAPI)
-        self.manager = self.manager_cls()
+        with mock.patch.object(host_manager.HostManager, '_init_aggregates'):
+            self.manager = self.manager_cls()
         self.context = context.RequestContext('fake_user', 'fake_project')
         self.topic = 'fake_topic'
         self.fake_args = (1, 2, 3)
@@ -62,25 +54,62 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
         manager = self.manager
         self.assertIsInstance(manager.driver, self.driver_cls)
 
-    def _mox_schedule_method_helper(self, method_name):
-        # Make sure the method exists that we're going to test call
-        def stub_method(*args, **kwargs):
-            pass
-
-        setattr(self.manager.driver, method_name, stub_method)
-
-        self.mox.StubOutWithMock(self.manager.driver,
-                method_name)
-
     def test_select_destination(self):
-        with mock.patch.object(self.manager, 'select_destinations'
+        with mock.patch.object(self.manager.driver, 'select_destinations'
                 ) as select_destinations:
             self.manager.select_destinations(None, None, {})
             select_destinations.assert_called_once_with(None, None, {})
 
+    def test_update_aggregates(self):
+        with mock.patch.object(self.manager.driver.host_manager,
+                               'update_aggregates'
+                ) as update_aggregates:
+            self.manager.update_aggregates(None, aggregates='agg')
+            update_aggregates.assert_called_once_with('agg')
+
+    def test_delete_aggregate(self):
+        with mock.patch.object(self.manager.driver.host_manager,
+                               'delete_aggregate'
+                ) as delete_aggregate:
+            self.manager.delete_aggregate(None, aggregate='agg')
+            delete_aggregate.assert_called_once_with('agg')
+
+    def test_update_instance_info(self):
+        with mock.patch.object(self.manager.driver.host_manager,
+                               'update_instance_info') as mock_update:
+            self.manager.update_instance_info(mock.sentinel.context,
+                                              mock.sentinel.host_name,
+                                              mock.sentinel.instance_info)
+            mock_update.assert_called_once_with(mock.sentinel.context,
+                                                mock.sentinel.host_name,
+                                                mock.sentinel.instance_info)
+
+    def test_delete_instance_info(self):
+        with mock.patch.object(self.manager.driver.host_manager,
+                               'delete_instance_info') as mock_delete:
+            self.manager.delete_instance_info(mock.sentinel.context,
+                                              mock.sentinel.host_name,
+                                              mock.sentinel.instance_uuid)
+            mock_delete.assert_called_once_with(mock.sentinel.context,
+                                                mock.sentinel.host_name,
+                                                mock.sentinel.instance_uuid)
+
+    def test_sync_instance_info(self):
+        with mock.patch.object(self.manager.driver.host_manager,
+                               'sync_instance_info') as mock_sync:
+            self.manager.sync_instance_info(mock.sentinel.context,
+                                            mock.sentinel.host_name,
+                                            mock.sentinel.instance_uuids)
+            mock_sync.assert_called_once_with(mock.sentinel.context,
+                                              mock.sentinel.host_name,
+                                              mock.sentinel.instance_uuids)
+
 
 class SchedulerV3PassthroughTestCase(test.TestCase):
-    def setUp(self):
+
+    @mock.patch.object(host_manager.HostManager, '_init_instance_info')
+    @mock.patch.object(host_manager.HostManager, '_init_aggregates')
+    def setUp(self, mock_init_agg, mock_init_inst):
         super(SchedulerV3PassthroughTestCase, self).setUp()
         self.manager = manager.SchedulerManager()
         self.proxy = manager._SchedulerManagerV3Proxy(self.manager)
@@ -98,25 +127,10 @@ class SchedulerTestCase(test.NoDBTestCase):
     # So we can subclass this test and re-use tests if we need.
     driver_cls = driver.Scheduler
 
-    def setUp(self):
+    @mock.patch.object(host_manager.HostManager, '_init_instance_info')
+    @mock.patch.object(host_manager.HostManager, '_init_aggregates')
+    def setUp(self, mock_init_agg, mock_init_inst):
         super(SchedulerTestCase, self).setUp()
-        self.stubs.Set(compute_api, 'API', fakes.FakeComputeAPI)
-
-        def fake_show(meh, context, id, **kwargs):
-            if id:
-                return {'id': id, 'min_disk': None, 'min_ram': None,
-                        'name': 'fake_name',
-                        'status': 'active',
-                        'properties': {'kernel_id': 'fake_kernel_id',
-                                       'ramdisk_id': 'fake_ramdisk_id',
-                                       'something_else': 'meow'}}
-            else:
-                raise exception.ImageNotFound(image_id=id)
-
-        fake_image.stub_out_image_service(self.stubs)
-        self.stubs.Set(fake_image._FakeImageService, 'show', fake_show)
-        self.image_service = glance.get_default_image_service()
-
         self.driver = self.driver_cls()
         self.context = context.RequestContext('fake_user', 'fake_project')
         self.topic = 'fake_topic'
@@ -139,25 +153,6 @@ class SchedulerTestCase(test.NoDBTestCase):
         result = self.driver.hosts_up(self.context, self.topic)
         self.assertEqual(result, ['host2'])
 
-    def test_handle_schedule_error_adds_instance_fault(self):
-        instance = {'uuid': 'fake-uuid'}
-        self.mox.StubOutWithMock(db, 'instance_update_and_get_original')
-        self.mox.StubOutWithMock(db, 'instance_fault_create')
-        db.instance_update_and_get_original(self.context, instance['uuid'],
-                                            mox.IgnoreArg()).AndReturn(
-                                                (None, instance))
-        db.instance_fault_create(self.context, mox.IgnoreArg()).AndReturn(
-            test_instance_fault.fake_faults['fake-uuid'][0])
-        self.mox.StubOutWithMock(rpc, 'get_notifier')
-        notifier = self.mox.CreateMockAnything()
-        rpc.get_notifier('scheduler').AndReturn(notifier)
-        notifier.error(self.context, 'scheduler.run_instance', mox.IgnoreArg())
-        self.mox.ReplayAll()
-
-        driver.handle_schedule_error(self.context,
-                                     exception.NoValidHost('test'),
-                                     instance['uuid'], {})
-
 
 class SchedulerDriverBaseTestCase(SchedulerTestCase):
     """Test cases for base scheduler driver class methods
@@ -169,7 +164,7 @@ class SchedulerDriverBaseTestCase(SchedulerTestCase):
                 self.driver.select_destinations, self.context, {}, {})
 
 
-class SchedulerInstanceGroupData(test.TestCase):
+class SchedulerInstanceGroupData(test.NoDBTestCase):
 
     driver_cls = driver.Scheduler
 

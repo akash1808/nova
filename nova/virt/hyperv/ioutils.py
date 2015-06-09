@@ -17,9 +17,9 @@ import errno
 import os
 
 from eventlet import patcher
+from oslo_log import log as logging
 
 from nova.i18n import _LE
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
@@ -38,15 +38,16 @@ class IOThread(native_threading.Thread):
 
     def run(self):
         try:
-            self._copy(self._src, self._dest)
+            self._copy()
         except IOError as err:
+            self._stopped.set()
             # Invalid argument error means that the vm console pipe was closed,
             # probably the vm was stopped. The worker can stop it's execution.
             if err.errno != errno.EINVAL:
                 LOG.error(_LE("Error writing vm console log file from "
                               "serial console pipe. Error: %s") % err)
 
-    def _copy(self, src, dest):
+    def _copy(self):
         with open(self._src, 'rb') as src:
             with open(self._dest, 'ab', 0) as dest:
                 dest.seek(0, os.SEEK_END)
@@ -67,3 +68,6 @@ class IOThread(native_threading.Thread):
     def join(self):
         self._stopped.set()
         super(IOThread, self).join()
+
+    def is_active(self):
+        return not self._stopped.isSet()

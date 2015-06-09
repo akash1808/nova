@@ -14,16 +14,18 @@
 #    under the License.
 """Tests for keypair API."""
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
 import six
 
 from nova.compute import api as compute_api
 from nova import context
 from nova import db
 from nova import exception
-from nova.i18n import _
+from nova.objects import keypair as keypair_obj
 from nova import quota
 from nova.tests.unit.compute import test_compute
+from nova.tests.unit import fake_crypto
 from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_keypair
 
@@ -47,6 +49,7 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
                         'HJAXVI+oCiyMMfffoTq16M1xfV58JstgtTqAXG+ZFpicGajREU'
                         'E/E3hO5MGgcHmyzIrWHKpe1n3oEGuz')
         self.fingerprint = '4e:48:c6:a0:4a:f9:dd:b5:4c:85:54:5a:af:43:47:5a'
+        self.keypair_type = keypair_obj.KEYPAIR_TYPE_SSH
         self.key_destroyed = False
 
     def _keypair_db_call_stubs(self):
@@ -109,33 +112,34 @@ class CreateImportSharedTestMixIn(object):
     up by the test runner unless they are part of a 'concrete' test case.
     """
 
-    def assertKeyNameRaises(self, exc_class, expected_message, name):
+    def assertKeypairRaises(self, exc_class, expected_message, name):
         func = getattr(self.keypair_api, self.func_name)
 
         args = []
         if self.func_name == 'import_key_pair':
             args.append(self.pub_key)
+        args.append(self.keypair_type)
 
         exc = self.assertRaises(exc_class, func, self.ctxt, self.ctxt.user_id,
                                 name, *args)
         self.assertEqual(expected_message, six.text_type(exc))
 
     def assertInvalidKeypair(self, expected_message, name):
-        msg = _('Keypair data is invalid: %s') % expected_message
-        self.assertKeyNameRaises(exception.InvalidKeypair, msg, name)
+        msg = 'Keypair data is invalid: %s' % expected_message
+        self.assertKeypairRaises(exception.InvalidKeypair, msg, name)
 
     def test_name_too_short(self):
-        msg = _('Keypair name must be string and between 1 '
-                'and 255 characters long')
+        msg = ('Keypair name must be string and between 1 '
+               'and 255 characters long')
         self.assertInvalidKeypair(msg, '')
 
     def test_name_too_long(self):
-        msg = _('Keypair name must be string and between 1 '
-                'and 255 characters long')
+        msg = ('Keypair name must be string and between 1 '
+               'and 255 characters long')
         self.assertInvalidKeypair(msg, 'x' * 256)
 
     def test_invalid_chars(self):
-        msg = _("Keypair name contains unsafe characters")
+        msg = "Keypair name contains unsafe characters"
         self.assertInvalidKeypair(msg, '* BAD CHARACTERS!  *')
 
     def test_already_exists(self):
@@ -144,9 +148,9 @@ class CreateImportSharedTestMixIn(object):
 
         self.stubs.Set(db, "key_pair_create", db_key_pair_create_duplicate)
 
-        msg = (_("Key pair '%(key_name)s' already exists.") %
+        msg = ("Key pair '%(key_name)s' already exists." %
                {'key_name': self.existing_key_name})
-        self.assertKeyNameRaises(exception.KeyPairExists, msg,
+        self.assertKeypairRaises(exception.KeyPairExists, msg,
                                  self.existing_key_name)
 
     def test_quota_limit(self):
@@ -155,33 +159,64 @@ class CreateImportSharedTestMixIn(object):
 
         self.stubs.Set(QUOTAS, "count", fake_quotas_count)
 
-        msg = _("Maximum number of key pairs exceeded")
-        self.assertKeyNameRaises(exception.KeypairLimitExceeded, msg, 'foo')
+        msg = "Maximum number of key pairs exceeded"
+        self.assertKeypairRaises(exception.KeypairLimitExceeded, msg, 'foo')
 
 
 class CreateKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     func_name = 'create_key_pair'
 
-    def test_success(self):
+    def _check_success(self):
         keypair, private_key = self.keypair_api.create_key_pair(
-            self.ctxt, self.ctxt.user_id, 'foo')
+            self.ctxt, self.ctxt.user_id, 'foo', key_type=self.keypair_type)
         self.assertEqual('foo', keypair['name'])
+        self.assertEqual(self.keypair_type, keypair['type'])
         self._check_notifications()
+
+    def test_success_ssh(self):
+        self._check_success()
+
+    def test_success_x509(self):
+        self.keypair_type = keypair_obj.KEYPAIR_TYPE_X509
+        self._check_success()
+
+    def test_x509_subject_too_long(self):
+        # X509 keypairs will fail if the Subject they're created with
+        # is longer than 64 characters. The previous unit tests could not
+        # detect the issue because the ctxt.user_id was too short.
+        # This unit tests is added to prove this issue.
+        self.keypair_type = keypair_obj.KEYPAIR_TYPE_X509
+        self.ctxt.user_id = 'a' * 65
+        self.assertRaises(processutils.ProcessExecutionError,
+                          self._check_success)
 
 
 class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     func_name = 'import_key_pair'
 
-    def test_success(self):
+    def _check_success(self):
         keypair = self.keypair_api.import_key_pair(self.ctxt,
                                                    self.ctxt.user_id,
                                                    'foo',
-                                                   self.pub_key)
+                                                   self.pub_key,
+                                                   self.keypair_type)
 
         self.assertEqual('foo', keypair['name'])
+        self.assertEqual(self.keypair_type, keypair['type'])
         self.assertEqual(self.fingerprint, keypair['fingerprint'])
         self.assertEqual(self.pub_key, keypair['public_key'])
+        self.assertEqual(self.keypair_type, keypair['type'])
         self._check_notifications(action='import')
+
+    def test_success_ssh(self):
+        self._check_success()
+
+    def test_success_x509(self):
+        self.keypair_type = keypair_obj.KEYPAIR_TYPE_X509
+        certif, fingerprint = fake_crypto.get_x509_cert_and_fingerprint()
+        self.pub_key = certif
+        self.fingerprint = fingerprint
+        self._check_success()
 
     def test_bad_key_data(self):
         exc = self.assertRaises(exception.InvalidKeypair,

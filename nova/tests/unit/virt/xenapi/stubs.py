@@ -18,7 +18,8 @@ import random
 import sys
 
 import fixtures
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
+import six
 
 from nova import test
 import nova.tests.unit.image.fake
@@ -65,7 +66,7 @@ def stubout_session(stubs, cls, product_version=(5, 6, 2),
 def stubout_get_this_vm_uuid(stubs):
     def f(session):
         vms = [rec['uuid'] for ref, rec
-               in fake.get_all_records('VM').iteritems()
+               in six.iteritems(fake.get_all_records('VM'))
                if rec['is_control_domain']]
         return vms[0]
     stubs.Set(vm_utils, 'get_this_vm_uuid', f)
@@ -314,7 +315,7 @@ class FakeSessionForVolumeFailedTests(FakeSessionForVolumeTests):
 def stub_out_migration_methods(stubs):
     fakesr = fake.create_sr()
 
-    def fake_import_all_migrated_disks(session, instance):
+    def fake_import_all_migrated_disks(session, instance, import_root=True):
         vdi_ref = fake.create_vdi(instance['name'], fakesr)
         vdi_rec = fake.get_record('VDI', vdi_ref)
         vdi_rec['other_config']['nova_disk_type'] = 'root'

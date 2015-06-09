@@ -21,20 +21,22 @@ import tempfile
 
 import fixtures
 import mock
-from oslo.config import cfg
-from oslo.config import fixture as config_fixture
-from oslo.utils import units
 from oslo_concurrency import lockutils
+from oslo_config import cfg
+from oslo_config import fixture as config_fixture
+from oslo_utils import units
+from oslo_utils import uuidutils
 
 from nova import context
 from nova import exception
 from nova import keymgr
+from nova import objects
 from nova.openstack.common import imageutils
-from nova.openstack.common import uuidutils
 from nova import test
 from nova.tests.unit import fake_processutils
 from nova.tests.unit.virt.libvirt import fake_libvirt_utils
 from nova.virt import images
+from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import imagebackend
 from nova.virt.libvirt import rbd_utils
 
@@ -56,8 +58,7 @@ class _ImageTestCase(object):
         self.fixture.config(disable_process_locking=True,
                             group='oslo_concurrency')
         self.flags(instances_path=self.INSTANCES_PATH)
-        self.INSTANCE = {'name': 'instance',
-                         'uuid': uuidutils.generate_uuid()}
+        self.INSTANCE = objects.Instance(id=1, uuid=uuidutils.generate_uuid())
         self.DISK_INFO_PATH = os.path.join(self.INSTANCES_PATH,
                                            self.INSTANCE['uuid'], 'disk.info')
         self.NAME = 'fake.vm'
@@ -123,6 +124,28 @@ class _ImageTestCase(object):
         image.cache(fake_fetch, self.TEMPLATE_PATH, self.SIZE)
 
         self.assertEqual(fake_processutils.fake_execute_get_log(), [])
+
+    def test_libvirt_fs_info(self):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        fs = image.libvirt_fs_info("/mnt")
+        # check that exception hasn't been raised and the method
+        # returned correct object
+        self.assertIsInstance(fs, vconfig.LibvirtConfigGuestFilesys)
+        self.assertEqual(fs.target_dir, "/mnt")
+        if image.is_block_dev:
+            self.assertEqual(fs.source_type, "block")
+            self.assertEqual(fs.source_dev, image.path)
+        else:
+            self.assertEqual(fs.source_type, "file")
+            self.assertEqual(fs.source_file, image.path)
+
+    @mock.patch('nova.virt.disk.api.get_disk_size')
+    def test_get_disk_size(self, get_disk_size):
+        get_disk_size.return_value = 2361393152
+
+        image = self.image_class(self.INSTANCE, self.NAME)
+        self.assertEqual(2361393152, image.get_disk_size(image.path))
+        get_disk_size.assert_called_once_with(image.path)
 
 
 class RawTestCase(_ImageTestCase, test.NoDBTestCase):
@@ -378,6 +401,8 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         fn = self.prepare_mocks()
         fn(max_size=self.SIZE, target=self.TEMPLATE_PATH)
         self.mox.StubOutWithMock(os.path, 'exists')
+        self.mox.StubOutWithMock(imagebackend.Image,
+                                 'verify_base_size')
         if self.OLD_STYLE_INSTANCE_PATH:
             os.path.exists(self.OLD_STYLE_INSTANCE_PATH).AndReturn(False)
         os.path.exists(self.DISK_INFO_PATH).AndReturn(False)
@@ -385,6 +410,7 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         os.path.exists(self.TEMPLATE_PATH).AndReturn(False)
         os.path.exists(self.PATH).AndReturn(False)
         os.path.exists(self.PATH).AndReturn(False)
+        imagebackend.Image.verify_base_size(self.TEMPLATE_PATH, self.SIZE)
         imagebackend.libvirt_utils.create_cow_image(self.TEMPLATE_PATH,
                                                     self.PATH)
         imagebackend.disk.extend(self.PATH, self.SIZE, use_cow=True)
@@ -419,6 +445,8 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(os.path, 'exists')
         self.mox.StubOutWithMock(imagebackend.libvirt_utils,
                                  'get_disk_backing_file')
+        self.mox.StubOutWithMock(imagebackend.Image,
+                                 'verify_base_size')
         if self.OLD_STYLE_INSTANCE_PATH:
             os.path.exists(self.OLD_STYLE_INSTANCE_PATH).AndReturn(False)
         os.path.exists(self.DISK_INFO_PATH).AndReturn(False)
@@ -429,6 +457,7 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         imagebackend.libvirt_utils.get_disk_backing_file(self.PATH)\
             .AndReturn(self.QCOW2_BASE)
         os.path.exists(self.QCOW2_BASE).AndReturn(False)
+        imagebackend.Image.verify_base_size(self.TEMPLATE_PATH, self.SIZE)
         imagebackend.libvirt_utils.copy_image(self.TEMPLATE_PATH,
                                               self.QCOW2_BASE)
         imagebackend.disk.extend(self.QCOW2_BASE, self.SIZE, use_cow=True)
@@ -447,6 +476,8 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         self.mox.StubOutWithMock(os.path, 'exists')
         self.mox.StubOutWithMock(imagebackend.libvirt_utils,
                                  'get_disk_backing_file')
+        self.mox.StubOutWithMock(imagebackend.Image,
+                                 'verify_base_size')
         if self.OLD_STYLE_INSTANCE_PATH:
             os.path.exists(self.OLD_STYLE_INSTANCE_PATH).AndReturn(False)
         os.path.exists(self.DISK_INFO_PATH).AndReturn(False)
@@ -457,6 +488,7 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
 
         imagebackend.libvirt_utils.get_disk_backing_file(self.PATH)\
             .AndReturn(None)
+        imagebackend.Image.verify_base_size(self.TEMPLATE_PATH, self.SIZE)
         os.path.exists(self.PATH).AndReturn(True)
         self.mox.ReplayAll()
 
@@ -1181,6 +1213,8 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
         image.get_disk_size(rbd_name).AndReturn(self.SIZE)
         self.mox.StubOutWithMock(image.driver, 'resize')
         image.driver.resize(rbd_name, full_size)
+        self.mox.StubOutWithMock(image, 'verify_base_size')
+        image.verify_base_size(self.TEMPLATE_PATH, full_size)
 
         self.mox.ReplayAll()
 
@@ -1219,9 +1253,6 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
         def fake_fetch(target, *args, **kwargs):
             return
 
-        def fake_resize(rbd_name, size):
-            return
-
         self.stubs.Set(os.path, 'exists', lambda _: True)
         self.stubs.Set(image, 'check_image_exists', lambda: True)
 
@@ -1248,10 +1279,96 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
 
         self.assertEqual(image.path, rbd_path)
 
+    def test_get_disk_size(self):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch.object(image.driver, 'size') as size_mock:
+            size_mock.return_value = 2361393152
+
+            self.assertEqual(2361393152, image.get_disk_size(image.path))
+            size_mock.assert_called_once_with(image.rbd_name)
+
+    def test_create_image_too_small(self):
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch.object(image, 'driver') as driver_mock:
+            driver_mock.exists.return_value = True
+            driver_mock.size.return_value = 2
+
+            self.assertRaises(exception.FlavorDiskTooSmall,
+                              image.create_image, mock.MagicMock(),
+                              self.TEMPLATE_PATH, 1)
+            driver_mock.size.assert_called_once_with(image.rbd_name)
+
+
+class PloopTestCase(_ImageTestCase, test.NoDBTestCase):
+    SIZE = 1024
+
+    def setUp(self):
+        self.image_class = imagebackend.Ploop
+        super(PloopTestCase, self).setUp()
+        self.utils = imagebackend.utils
+
+    def prepare_mocks(self):
+        fn = self.mox.CreateMockAnything()
+        self.mox.StubOutWithMock(imagebackend.utils.synchronized,
+                                 '__call__')
+        self.mox.StubOutWithMock(imagebackend.libvirt_utils, 'copy_image')
+        self.mox.StubOutWithMock(self.utils, 'execute')
+        return fn
+
+    def test_cache(self):
+        self.mox.StubOutWithMock(os.path, 'exists')
+        if self.OLD_STYLE_INSTANCE_PATH:
+            os.path.exists(self.OLD_STYLE_INSTANCE_PATH).AndReturn(False)
+        os.path.exists(self.TEMPLATE_DIR).AndReturn(False)
+        os.path.exists(self.PATH).AndReturn(False)
+        os.path.exists(self.TEMPLATE_PATH).AndReturn(False)
+        fn = self.mox.CreateMockAnything()
+        fn(target=self.TEMPLATE_PATH)
+        self.mox.StubOutWithMock(imagebackend.fileutils, 'ensure_tree')
+        imagebackend.fileutils.ensure_tree(self.TEMPLATE_DIR)
+        self.mox.ReplayAll()
+
+        image = self.image_class(self.INSTANCE, self.NAME)
+        self.mock_create_image(image)
+        image.cache(fn, self.TEMPLATE)
+
+        self.mox.VerifyAll()
+
+    def test_create_image(self):
+        self.stubs.Set(imagebackend.Ploop, 'get_disk_size', lambda a, b: 2048)
+        fn = self.prepare_mocks()
+        fn(target=self.TEMPLATE_PATH, max_size=2048, image_id=None)
+        img_path = os.path.join(self.PATH, "root.hds")
+        imagebackend.libvirt_utils.copy_image(self.TEMPLATE_PATH, img_path)
+        self.utils.execute("ploop", "restore-descriptor", "-f", "raw",
+                           self.PATH, img_path)
+        self.utils.execute("ploop", "grow", '-s', "2K",
+                           os.path.join(self.PATH, "DiskDescriptor.xml"),
+                           run_as_root=True)
+        self.mox.ReplayAll()
+
+        image = self.image_class(self.INSTANCE, self.NAME)
+        image.create_image(fn, self.TEMPLATE_PATH, 2048, image_id=None)
+
+        self.mox.VerifyAll()
+
+    def test_prealloc_image(self):
+        self.flags(preallocate_images='space')
+        fake_processutils.fake_execute_clear_log()
+        fake_processutils.stub_out_processutils_execute(self.stubs)
+        image = self.image_class(self.INSTANCE, self.NAME)
+
+        def fake_fetch(target, *args, **kwargs):
+            return
+
+        self.stubs.Set(os.path, 'exists', lambda _: True)
+        self.stubs.Set(image, 'check_image_exists', lambda: True)
+
+        image.cache(fake_fetch, self.TEMPLATE_PATH, self.SIZE)
+
 
 class BackendTestCase(test.NoDBTestCase):
-    INSTANCE = {'name': 'fake-instance',
-                'uuid': uuidutils.generate_uuid()}
+    INSTANCE = objects.Instance(id=1, uuid=uuidutils.generate_uuid())
     NAME = 'fake-name.suffix'
 
     def setUp(self):
@@ -1280,8 +1397,32 @@ class BackendTestCase(test.NoDBTestCase):
     def test_image_raw(self):
         self._test_image('raw', imagebackend.Raw, imagebackend.Raw)
 
+    def test_image_raw_preallocate_images(self):
+        flags = ('space', 'Space', 'SPACE')
+        for f in flags:
+            self.flags(preallocate_images=f)
+            raw = imagebackend.Raw(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+            self.assertTrue(raw.preallocate)
+
+    def test_image_raw_preallocate_images_bad_conf(self):
+        self.flags(preallocate_images='space1')
+        raw = imagebackend.Raw(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+        self.assertFalse(raw.preallocate)
+
     def test_image_qcow2(self):
         self._test_image('qcow2', imagebackend.Qcow2, imagebackend.Qcow2)
+
+    def test_image_qcow2_preallocate_images(self):
+        flags = ('space', 'Space', 'SPACE')
+        for f in flags:
+            self.flags(preallocate_images=f)
+            qcow = imagebackend.Qcow2(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+            self.assertTrue(qcow.preallocate)
+
+    def test_image_qcow2_preallocate_images_bad_conf(self):
+        self.flags(preallocate_images='space1')
+        qcow = imagebackend.Qcow2(self.INSTANCE, 'fake_disk', '/tmp/xyz')
+        self.assertFalse(qcow.preallocate)
 
     def test_image_lvm(self):
         self.flags(images_volume_group='FakeVG', group='libvirt')
@@ -1298,12 +1439,3 @@ class BackendTestCase(test.NoDBTestCase):
 
     def test_image_default(self):
         self._test_image('default', imagebackend.Raw, imagebackend.Qcow2)
-
-
-class UtilTestCase(test.NoDBTestCase):
-    def test_get_hw_disk_discard(self):
-        self.assertEqual('unmap', imagebackend.get_hw_disk_discard("unmap"))
-        self.assertEqual('ignore', imagebackend.get_hw_disk_discard("ignore"))
-        self.assertIsNone(imagebackend.get_hw_disk_discard(None))
-        self.assertRaises(RuntimeError, imagebackend.get_hw_disk_discard,
-                          "fake")

@@ -19,17 +19,18 @@ import functools
 import inspect
 
 import mock
-from oslo.config import cfg
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_utils import timeutils
 
+from nova import block_device
 from nova.cells import manager
 from nova.compute import api as compute_api
 from nova.compute import cells_api as compute_cells_api
-from nova.compute import delete_types
 from nova.compute import flavors
 from nova.compute import vm_states
 from nova import context
 from nova import db
+from nova import exception
 from nova import objects
 from nova import quota
 from nova import test
@@ -121,12 +122,6 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
         self.stubs.Set(self.compute_api, '_validate_cell',
                 _fake_validate_cell)
 
-        # NOTE(belliott) Don't update the instance state
-        # for the tests at the API layer.  Let it happen after
-        # the stub cast to cells so that expected_task_states
-        # match.
-        self.stubs.Set(self.compute_api, 'update', _nop_update)
-
         deploy_stubs(self.stubs, self.compute_api)
 
     def tearDown(self):
@@ -149,11 +144,50 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
                                  'instance_delete_everywhere')
         inst = self._create_fake_instance_obj()
         cells_rpcapi.instance_delete_everywhere(self.context,
-                inst, delete_types.DELETE)
+                inst, 'hard')
         self.mox.ReplayAll()
         self.stubs.Set(self.compute_api.network_api, 'deallocate_for_instance',
                        lambda *a, **kw: None)
         self.compute_api.delete(self.context, inst)
+
+    def test_delete_instance_no_cell_constraint_failure_does_not_loop(self):
+        with mock.patch.object(self.compute_api.cells_rpcapi,
+                'instance_delete_everywhere'):
+            inst = self._create_fake_instance_obj()
+            inst.cell_name = None
+
+            inst.destroy = mock.MagicMock()
+            inst.destroy.side_effect = exception.ObjectActionError(action='',
+                    reason='')
+            inst.refresh = mock.MagicMock()
+
+            self.assertRaises(exception.ObjectActionError,
+                    self.compute_api.delete, self.context, inst)
+            inst.destroy.assert_called_once_with()
+
+    def test_delete_instance_no_cell_constraint_failure_corrects_itself(self):
+
+        def add_cell_name(context, instance, delete_type):
+            instance.cell_name = 'fake_cell_name'
+
+        @mock.patch.object(compute_api.API, 'delete')
+        @mock.patch.object(self.compute_api.cells_rpcapi,
+                'instance_delete_everywhere', side_effect=add_cell_name)
+        def _test(mock_delete_everywhere, mock_compute_delete):
+            inst = self._create_fake_instance_obj()
+            inst.cell_name = None
+
+            inst.destroy = mock.MagicMock()
+            inst.destroy.side_effect = exception.ObjectActionError(action='',
+                    reason='')
+            inst.refresh = mock.MagicMock()
+
+            self.compute_api.delete(self.context, inst)
+            inst.destroy.assert_called_once_with()
+
+            mock_compute_delete.assert_called_once_with(self.context, inst)
+
+        _test()
 
     def test_soft_delete_instance_no_cell(self):
         cells_rpcapi = self.compute_api.cells_rpcapi
@@ -161,7 +195,7 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
                                  'instance_delete_everywhere')
         inst = self._create_fake_instance_obj()
         cells_rpcapi.instance_delete_everywhere(self.context,
-                inst, delete_types.SOFT_DELETE)
+                inst, 'soft')
         self.mox.ReplayAll()
         self.stubs.Set(self.compute_api.network_api, 'deallocate_for_instance',
                        lambda *a, **kw: None)
@@ -179,6 +213,19 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
         response = self.compute_api.get_migrations(self.context, filters)
 
         self.assertEqual(migrations, response)
+
+    def test_create_block_device_mapping(self):
+        instance_type = {'swap': 1, 'ephemeral_gb': 1}
+        instance = self._create_fake_instance_obj()
+        bdms = [block_device.BlockDeviceDict({'source_type': 'image',
+                                              'destination_type': 'local',
+                                              'image_id': 'fake-image',
+                                              'boot_index': 0})]
+        self.compute_api._create_block_device_mapping(
+            instance_type, instance.uuid, bdms)
+        bdms = db.block_device_mapping_get_all_by_instance(
+            self.context, instance['uuid'])
+        self.assertEqual(0, len(bdms))
 
     @mock.patch('nova.cells.messaging._TargetedMessage')
     def test_rebuild_sig(self, mock_msg):
@@ -251,13 +298,16 @@ class CellsConductorAPIRPCRedirect(test.NoDBTestCase):
     @mock.patch.object(compute_api.API, '_check_auto_disk_config')
     def test_resize_instance(self, _check, _extract, _save, _upsize, _reserve,
                              _cells, _record):
-        _extract.return_value = objects.Flavor(**test_flavor.fake_flavor)
+        flavor = objects.Flavor(**test_flavor.fake_flavor)
+        _extract.return_value = flavor
         orig_system_metadata = {}
         instance = fake_instance.fake_instance_obj(self.context,
                 vm_state=vm_states.ACTIVE, cell_name='fake-cell',
                 launched_at=timeutils.utcnow(),
                 system_metadata=orig_system_metadata,
                 expected_attrs=['system_metadata'])
+        instance.flavor = flavor
+        instance.old_flavor = instance.new_flavor = None
 
         self.compute_api.resize(self.context, instance)
         self.assertTrue(self.cells_rpcapi.resize_instance.called)

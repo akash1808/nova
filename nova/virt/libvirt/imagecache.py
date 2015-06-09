@@ -25,15 +25,16 @@ import os
 import re
 import time
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_concurrency import lockutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
 
 from nova.i18n import _LE
 from nova.i18n import _LI
 from nova.i18n import _LW
 from nova.openstack.common import fileutils
-from nova.openstack.common import log as logging
 from nova import utils
 from nova.virt import imagecache
 from nova.virt.libvirt import utils as libvirt_utils
@@ -47,11 +48,13 @@ imagecache_opts = [
                help='Allows image information files to be stored in '
                     'non-standard locations'),
     cfg.BoolOpt('remove_unused_kernels',
-                default=False,
-                help='Should unused kernel images be removed? This is only '
-                     'safe to enable if all compute nodes have been updated '
-                     'to support this option. This will be enabled by default '
-                     'in future.'),
+                default=True,
+                deprecated_for_removal=True,
+                help='DEPRECATED: Should unused kernel images be removed? '
+                     'This is only safe to enable if all compute nodes have '
+                     'been updated to support this option (running Grizzly or '
+                     'newer level compute). This will be the default behavior '
+                     'in the 2016.1 release.'),
     cfg.IntOpt('remove_unused_resized_minimum_age_seconds',
                default=3600,
                help='Unused resized base images younger than this will not be '
@@ -440,7 +443,8 @@ class ImageCacheManager(imagecache.ImageCacheManager):
 
         return (True, age)
 
-    def _remove_old_enough_file(self, base_file, maxage, remove_sig=True):
+    def _remove_old_enough_file(self, base_file, maxage, remove_sig=True,
+                                remove_lock=True):
         """Remove a single swap or base file if it is old enough."""
         exists, age = self._get_age_of_file(base_file)
         if not exists:
@@ -463,11 +467,28 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                           {'base_file': base_file,
                            'error': e})
 
+            if remove_lock:
+                try:
+                    # NOTE(jichenjc) The lock file will be constructed first
+                    # time the image file was accessed. the lock file looks
+                    # like nova-9e881789030568a317fad9daae82c5b1c65e0d4a
+                    # or nova-03d8e206-6500-4d91-b47d-ee74897f9b4e
+                    # according to the original file name
+                    lock_file = os.path.split(base_file)[-1]
+                    lockutils.remove_external_lock_file(lock_file,
+                        lock_file_prefix='nova-', lock_path=self.lock_path)
+                except OSError as e:
+                    LOG.debug('Failed to remove %(lock_file)s, '
+                              'error was %(error)s',
+                              {'lock_file': lock_file,
+                               'error': e})
+
     def _remove_swap_file(self, base_file):
         """Remove a single swap base file if it is old enough."""
         maxage = CONF.remove_unused_original_minimum_age_seconds
 
-        self._remove_old_enough_file(base_file, maxage, remove_sig=False)
+        self._remove_old_enough_file(base_file, maxage, remove_sig=False,
+                                     remove_lock=False)
 
     def _remove_base_file(self, base_file):
         """Remove a single base file if it is old enough."""
@@ -501,7 +522,6 @@ class ImageCacheManager(imagecache.ImageCacheManager):
             # Give other threads a chance to run
             time.sleep(0)
 
-        instances = []
         if img_id in self.used_images:
             local, remote, instances = self.used_images[img_id]
 

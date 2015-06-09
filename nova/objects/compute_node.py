@@ -12,17 +12,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from nova import db
 from nova import exception
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
+from nova.objects import pci_device_pool
 from nova import utils
 
 
-class ComputeNode(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class ComputeNode(base.NovaPersistentObject, base.NovaObject,
+                  base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added get_by_service_id()
     # Version 1.2: String attributes updated to support unicode
@@ -32,7 +36,10 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
     # Version 1.6: Added supported_hv_specs
     # Version 1.7: Added host field
     # Version 1.8: Added get_by_host_and_nodename()
-    VERSION = '1.8'
+    # Version 1.9: Added pci_device_pools
+    # Version 1.10: Added get_first_node_by_host_for_old_compat()
+    # Version 1.11: PciDevicePoolList version 1.1
+    VERSION = '1.11'
 
     fields = {
         'id': fields.IntegerField(read_only=True),
@@ -60,9 +67,14 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         # NOTE(pmurray): the supported_hv_specs field maps to the
         # supported_instances field in the database
         'supported_hv_specs': fields.ListOfObjectsField('HVSpec'),
+        # NOTE(pmurray): the pci_device_pools field maps to the
+        # pci_stats field in the database
+        'pci_device_pools': fields.ObjectField('PciDevicePoolList',
+                                               nullable=True),
         }
 
     obj_relationships = {
+        'pci_device_pools': [('1.9', '1.0'), ('1.11', '1.1')],
         'supported_hv_specs': [('1.6', '1.0')],
     }
 
@@ -110,9 +122,13 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
 
     @staticmethod
     def _from_db_object(context, compute, db_compute):
-
-        fields = set(compute.fields) - set(['stats', 'supported_hv_specs',
-                                            'host'])
+        special_cases = set([
+            'stats',
+            'supported_hv_specs',
+            'host',
+            'pci_device_pools',
+            ])
+        fields = set(compute.fields) - special_cases
         for key in fields:
             compute[key] = db_compute[key]
 
@@ -127,6 +143,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
                         for hv_spec in hv_specs]
             compute['supported_hv_specs'] = hv_specs
 
+        pci_stats = db_compute.get('pci_stats')
+        compute.pci_device_pools = pci_device_pool.from_pci_stats(pci_stats)
         compute._context = context
 
         # Make sure that we correctly set the host field depending on either
@@ -143,7 +161,10 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
 
     @base.remotable_classmethod
     def get_by_service_id(cls, context, service_id):
-        db_compute = db.compute_node_get_by_service_id(context, service_id)
+        db_computes = db.compute_nodes_get_by_service_id(context, service_id)
+        # NOTE(sbauza): Old version was returning an item, we need to keep this
+        # behaviour for backwards compatibility
+        db_compute = db_computes[0]
         return cls._from_db_object(context, cls(), db_compute)
 
     @base.remotable_classmethod
@@ -157,32 +178,62 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
             # record.
             # We assume the compatibility as an extra penalty of one more DB
             # call but that's necessary until all nodes are upgraded.
-            service = objects.Service.get_by_compute_host(context, host)
-            # NOTE(sbauza): Here, the old model is buggy because there can only
-            # be one compute node per service_id
-            db_compute = db.compute_node_get_by_service_id(context, service.id)
-            # We can avoid an extra call to Service object in _from_db_object
-            db_compute['host'] = service.host
+            try:
+                service = objects.Service.get_by_compute_host(context, host)
+                db_computes = db.compute_nodes_get_by_service_id(
+                    context, service.id)
+            except exception.ServiceNotFound:
+                # We need to provide the same exception upstream
+                raise exception.ComputeHostNotFound(host=host)
+            db_compute = None
+            for compute in db_computes:
+                if compute['hypervisor_hostname'] == nodename:
+                    db_compute = compute
+                    # We can avoid an extra call to Service object in
+                    # _from_db_object
+                    db_compute['host'] = service.host
+                    break
+            if not db_compute:
+                raise exception.ComputeHostNotFound(host=host)
         return cls._from_db_object(context, cls(), db_compute)
 
-    def _convert_stats_to_db_format(self, updates):
+    @base.remotable_classmethod
+    def get_first_node_by_host_for_old_compat(cls, context, host,
+                                              use_slave=False):
+        computes = ComputeNodeList.get_all_by_host(context, host, use_slave)
+        # FIXME(sbauza): Some hypervisors (VMware, Ironic) can return multiple
+        # nodes per host, we should return all the nodes and modify the callers
+        # instead.
+        # Arbitrarily returning the first node.
+        return computes[0]
+
+    @staticmethod
+    def _convert_stats_to_db_format(updates):
         stats = updates.pop('stats', None)
         if stats is not None:
             updates['stats'] = jsonutils.dumps(stats)
 
-    def _convert_host_ip_to_db_format(self, updates):
+    @staticmethod
+    def _convert_host_ip_to_db_format(updates):
         host_ip = updates.pop('host_ip', None)
         if host_ip:
             updates['host_ip'] = str(host_ip)
 
-    def _convert_supported_instances_to_db_format(selfself, updates):
+    @staticmethod
+    def _convert_supported_instances_to_db_format(updates):
         hv_specs = updates.pop('supported_hv_specs', None)
         if hv_specs is not None:
             hv_specs = [hv_spec.to_list() for hv_spec in hv_specs]
             updates['supported_instances'] = jsonutils.dumps(hv_specs)
 
+    @staticmethod
+    def _convert_pci_stats_to_db_format(updates):
+        pools = updates.pop('pci_device_pools', None)
+        if pools:
+            updates['pci_stats'] = jsonutils.dumps(pools.obj_to_primitive())
+
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
@@ -190,12 +241,13 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         self._convert_stats_to_db_format(updates)
         self._convert_host_ip_to_db_format(updates)
         self._convert_supported_instances_to_db_format(updates)
+        self._convert_pci_stats_to_db_format(updates)
 
-        db_compute = db.compute_node_create(context, updates)
-        self._from_db_object(context, self, db_compute)
+        db_compute = db.compute_node_create(self._context, updates)
+        self._from_db_object(self._context, self, db_compute)
 
     @base.remotable
-    def save(self, context, prune_stats=False):
+    def save(self, prune_stats=False):
         # NOTE(belliott) ignore prune_stats param, no longer relevant
 
         updates = self.obj_get_changes()
@@ -203,13 +255,14 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         self._convert_stats_to_db_format(updates)
         self._convert_host_ip_to_db_format(updates)
         self._convert_supported_instances_to_db_format(updates)
+        self._convert_pci_stats_to_db_format(updates)
 
-        db_compute = db.compute_node_update(context, self.id, updates)
-        self._from_db_object(context, self, db_compute)
+        db_compute = db.compute_node_update(self._context, self.id, updates)
+        self._from_db_object(self._context, self, db_compute)
 
     @base.remotable
-    def destroy(self, context):
-        db.compute_node_delete(context, self.id)
+    def destroy(self):
+        db.compute_node_delete(self._context, self.id)
 
     @property
     def service(self):
@@ -219,6 +272,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         return self._cached_service
 
 
+@base.NovaObjectRegistry.register
 class ComputeNodeList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     #              ComputeNode <= version 1.2
@@ -230,7 +284,10 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
     # Version 1.6 ComputeNode version 1.6
     # Version 1.7 ComputeNode version 1.7
     # Version 1.8 ComputeNode version 1.8 + add get_all_by_host()
-    VERSION = '1.8'
+    # Version 1.9 ComputeNode version 1.9
+    # Version 1.10 ComputeNode version 1.10
+    # Version 1.11 ComputeNode version 1.11
+    VERSION = '1.11'
     fields = {
         'objects': fields.ListOfObjectsField('ComputeNode'),
         }
@@ -245,6 +302,9 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
         '1.6': '1.6',
         '1.7': '1.7',
         '1.8': '1.8',
+        '1.9': '1.9',
+        '1.10': '1.10',
+        '1.11': '1.11',
         }
 
     @base.remotable_classmethod
@@ -262,11 +322,15 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
 
     @base.remotable_classmethod
     def _get_by_service(cls, context, service_id, use_slave=False):
-        db_service = db.service_get(context, service_id,
-                                    with_compute_node=True,
-                                    use_slave=use_slave)
+        try:
+            db_computes = db.compute_nodes_get_by_service_id(
+                context, service_id)
+        except exception.ServiceNotFound:
+            # NOTE(sbauza): Previous behaviour was returning an empty list
+            # if the service was created with no computes, we need to keep it.
+            db_computes = []
         return base.obj_make_list(context, cls(context), objects.ComputeNode,
-                                  db_service['compute_node'])
+                                  db_computes)
 
     @classmethod
     def get_by_service(cls, context, service, use_slave=False):
@@ -283,14 +347,16 @@ class ComputeNodeList(base.ObjectListBase, base.NovaObject):
             # record.
             # We assume the compatibility as an extra penalty of one more DB
             # call but that's necessary until all nodes are upgraded.
-            service = objects.Service.get_by_compute_host(context, host,
-                                                          use_slave)
-            db_compute = db.compute_node_get_by_service_id(context,
-                                                           service.id)
+            try:
+                service = objects.Service.get_by_compute_host(context, host,
+                                                              use_slave)
+                db_computes = db.compute_nodes_get_by_service_id(
+                    context, service.id)
+            except exception.ServiceNotFound:
+                # We need to provide the same exception upstream
+                raise exception.ComputeHostNotFound(host=host)
             # We can avoid an extra call to Service object in _from_db_object
-            db_compute['host'] = service.host
-            # NOTE(sbauza): Yeah, the old model sucks, because there can only
-            # be one node per host...
-            db_computes = [db_compute]
+            for db_compute in db_computes:
+                db_compute['host'] = service.host
         return base.obj_make_list(context, cls(context), objects.ComputeNode,
                                   db_computes)

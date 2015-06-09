@@ -17,13 +17,8 @@
 Stubouts for the test suite
 """
 
-import contextlib
+from oslo_vmware import exceptions as vexc
 
-import mock
-from oslo.vmware import exceptions as vexc
-
-from nova import db
-from nova.tests.unit import test_flavors
 from nova.tests.unit.virt.vmwareapi import fake
 from nova.virt.vmwareapi import driver
 from nova.virt.vmwareapi import images
@@ -70,62 +65,12 @@ def fake_session_permission_exception():
     raise vexc.VimFaultException(fault_list, fault_string, details=details)
 
 
-def _fake_flavor_get(context, id):
-    for instance_type in test_flavors.DEFAULT_FLAVORS:
-        if instance_type['id'] == id:
-            return instance_type
-    return {'memory_mb': 128, 'root_gb': 0, 'deleted_at': None,
-            'name': 'm1.micro', 'deleted': 0, 'created_at': None,
-            'ephemeral_gb': 0, 'updated_at': None,
-            'disabled': False, 'vcpus': 1, 'extra_specs': {},
-            'swap': 0, 'rxtx_factor': 1.0, 'is_public': True,
-            'flavorid': '1', 'vcpu_weight': None, 'id': 2}
-
-
 def set_stubs(stubs):
     """Set the stubs."""
     stubs.Set(network_util, 'get_network_with_the_name',
               fake.fake_get_network)
-    stubs.Set(images, 'upload_image', fake.fake_upload_image)
+    stubs.Set(images, 'upload_image_stream_optimized', fake.fake_upload_image)
     stubs.Set(images, 'fetch_image', fake.fake_fetch_image)
     stubs.Set(driver.VMwareAPISession, "vim", fake_vim_prop)
     stubs.Set(driver.VMwareAPISession, "_is_vim_object",
               fake_is_vim_object)
-    stubs.Set(db, 'flavor_get', _fake_flavor_get)
-
-
-def fake_suds_context(calls=None):
-    """Generate a suds client which automatically mocks all SOAP method calls.
-
-    Calls are stored in <calls>, indexed by the name of the call. If you need
-    to mock the behaviour of specific API calls you can pre-populate <calls>
-    with appropriate Mock objects.
-    """
-
-    calls = calls or {}
-
-    class fake_factory:
-        def create(self, name):
-            return mock.NonCallableMagicMock(name=name)
-
-    class fake_service:
-        def __getattr__(self, attr_name):
-            if attr_name in calls:
-                return calls[attr_name]
-
-            mock_call = mock.MagicMock(name=attr_name)
-            calls[attr_name] = mock_call
-            return mock_call
-
-    class fake_client:
-        def __init__(self, wdsl_url, **kwargs):
-            self.service = fake_service()
-            self.factory = fake_factory()
-
-    return contextlib.nested(
-        mock.patch('suds.client.Client', fake_client),
-
-        # As we're not connecting to a real host there's no need to wait
-        # between retries
-        mock.patch.object(driver, 'TIME_BETWEEN_API_CALL_RETRIES', 0)
-    )

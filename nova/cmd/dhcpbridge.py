@@ -24,9 +24,10 @@ import os
 import sys
 import traceback
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import importutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 
 from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
@@ -37,7 +38,6 @@ from nova.i18n import _LE
 from nova.network import rpcapi as network_rpcapi
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common import log as logging
 from nova import rpc
 
 CONF = cfg.CONF
@@ -77,7 +77,7 @@ def init_leases(network_id):
 
 
 def add_action_parsers(subparsers):
-    parser = subparsers.add_parser('init')
+    subparsers.add_parser('init')
 
     # NOTE(cfb): dnsmasq always passes mac, and ip. hostname
     #            is passed if known. We don't care about
@@ -117,7 +117,7 @@ def main():
     config.parse_args(sys.argv,
         default_config_files=jsonutils.loads(os.environ['CONFIG_FILE']))
 
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     global LOG
     LOG = logging.getLogger('nova.dhcpbridge')
     objects.register_all()

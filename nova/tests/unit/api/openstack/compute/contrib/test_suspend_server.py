@@ -16,14 +16,16 @@ from nova.api.openstack.compute.contrib import admin_actions as \
     suspend_server_v2
 from nova.api.openstack.compute.plugins.v3 import suspend_server as \
     suspend_server_v21
-from nova.tests.unit.api.openstack.compute.plugins.v3 import \
-     admin_only_action_common
+from nova import exception
+from nova import test
+from nova.tests.unit.api.openstack.compute import admin_only_action_common
 from nova.tests.unit.api.openstack import fakes
 
 
 class SuspendServerTestsV21(admin_only_action_common.CommonTests):
     suspend_server = suspend_server_v21
     controller_name = 'SuspendServerController'
+    _api_version = '2.1'
 
     def setUp(self):
         super(SuspendServerTestsV21, self).setUp()
@@ -35,39 +37,53 @@ class SuspendServerTestsV21(admin_only_action_common.CommonTests):
 
         self.stubs.Set(self.suspend_server, self.controller_name,
                        _fake_controller)
-        self.app = self._get_app()
         self.mox.StubOutWithMock(self.compute_api, 'get')
 
-    def _get_app(self):
-        return fakes.wsgi_app_v21(init_only=('servers',
-                                             'os-suspend-server'),
-                                  fake_auth_context=self.context)
-
     def test_suspend_resume(self):
-        self._test_actions(['suspend', 'resume'])
+        self._test_actions(['_suspend', '_resume'])
 
     def test_suspend_resume_with_non_existed_instance(self):
-        self._test_actions_with_non_existed_instance(['suspend', 'resume'])
+        self._test_actions_with_non_existed_instance(['_suspend', '_resume'])
 
     def test_suspend_resume_raise_conflict_on_invalid_state(self):
-        self._test_actions_raise_conflict_on_invalid_state(['suspend',
-                                                            'resume'])
+        self._test_actions_raise_conflict_on_invalid_state(['_suspend',
+                                                            '_resume'])
 
     def test_actions_with_locked_instance(self):
-        self._test_actions_with_locked_instance(['suspend', 'resume'])
+        self._test_actions_with_locked_instance(['_suspend', '_resume'])
 
 
 class SuspendServerTestsV2(SuspendServerTestsV21):
     suspend_server = suspend_server_v2
     controller_name = 'AdminActionsController'
+    _api_version = '2'
+
+
+class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
 
     def setUp(self):
-        super(SuspendServerTestsV2, self).setUp()
-        self.flags(
-            osapi_compute_extension=[
-            'nova.api.openstack.compute.contrib.select_extensions'],
-            osapi_compute_ext_list=['Admin_actions'])
+        super(SuspendServerPolicyEnforcementV21, self).setUp()
+        self.controller = suspend_server_v21.SuspendServerController()
+        self.req = fakes.HTTPRequest.blank('')
 
-    def _get_app(self):
-        return fakes.wsgi_app(init_only=('servers',),
-            fake_auth_context=self.context)
+    def test_suspend_policy_failed(self):
+        rule_name = "os_compute_api:os-suspend-server:suspend"
+        self.policy.set_rules({rule_name: "project:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller._suspend, self.req, fakes.FAKE_UUID,
+            body={'suspend': {}})
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())
+
+    def test_resume_policy_failed(self):
+        rule_name = "os_compute_api:os-suspend-server:resume"
+        self.policy.set_rules({rule_name: "project:non_fake"})
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized,
+            self.controller._resume, self.req, fakes.FAKE_UUID,
+            body={'resume': {}})
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." % rule_name,
+            exc.format_message())

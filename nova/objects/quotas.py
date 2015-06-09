@@ -46,7 +46,10 @@ def ids_from_server_group(context, server_group):
     return ids_from_instance(context, server_group)
 
 
-class Quotas(base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class Quotas(base.NovaObject,
+             base.NovaObjectDictCompat):
     # Version 1.0: initial version
     # Version 1.1: Added create_limit() and update_limit()
     # Version 1.2: Added limit_check() and count()
@@ -83,9 +86,9 @@ class Quotas(base.NovaObject):
         return quotas
 
     @base.remotable
-    def reserve(self, context, expire=None, project_id=None, user_id=None,
+    def reserve(self, expire=None, project_id=None, user_id=None,
                 **deltas):
-        reservations = quota.QUOTAS.reserve(context, expire=expire,
+        reservations = quota.QUOTAS.reserve(self._context, expire=expire,
                                             project_id=project_id,
                                             user_id=user_id,
                                             **deltas)
@@ -95,25 +98,21 @@ class Quotas(base.NovaObject):
         self.obj_reset_changes()
 
     @base.remotable
-    def commit(self, context=None):
+    def commit(self):
         if not self.reservations:
             return
-        if context is None:
-            context = self._context
-        quota.QUOTAS.commit(context, self.reservations,
+        quota.QUOTAS.commit(self._context, self.reservations,
                             project_id=self.project_id,
                             user_id=self.user_id)
         self.reservations = None
         self.obj_reset_changes()
 
     @base.remotable
-    def rollback(self, context=None):
+    def rollback(self):
         """Rollback quotas."""
         if not self.reservations:
             return
-        if context is None:
-            context = self._context
-        quota.QUOTAS.rollback(context, self.reservations,
+        quota.QUOTAS.rollback(self._context, self.reservations,
                               project_id=self.project_id,
                               user_id=self.user_id)
         self.reservations = None
@@ -146,6 +145,7 @@ class Quotas(base.NovaObject):
         db.quota_update(context, project_id, resource, limit, user_id=user_id)
 
 
+@base.NovaObjectRegistry.register
 class QuotasNoOp(Quotas):
     def reserve(context, expire=None, project_id=None, user_id=None,
                 **deltas):

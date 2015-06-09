@@ -18,7 +18,10 @@ from nova.objects import base
 from nova.objects import fields
 
 
-class DNSDomain(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class DNSDomain(base.NovaPersistentObject, base.NovaObject,
+                base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     VERSION = '1.0'
 
@@ -56,6 +59,7 @@ class DNSDomain(base.NovaPersistentObject, base.NovaObject):
         db.dnsdomain_unregister(context, domain)
 
 
+@base.NovaObjectRegistry.register
 class DNSDomainList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'

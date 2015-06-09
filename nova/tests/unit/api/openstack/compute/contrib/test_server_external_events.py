@@ -13,17 +13,16 @@
 #    under the License.
 
 import mock
-from oslo.serialization import jsonutils
 import webob
 
 from nova.api.openstack.compute.contrib import server_external_events \
                                                  as server_external_events_v2
 from nova.api.openstack.compute.plugins.v3 import server_external_events \
                                                  as server_external_events_v21
-from nova import context
 from nova import exception
 from nova import objects
 from nova import test
+from nova.tests.unit.api.openstack import fakes
 
 fake_instances = {
     '00000000-0000-0000-0000-000000000001': objects.Instance(
@@ -56,34 +55,26 @@ class ServerExternalEventsTestV21(test.NoDBTestCase):
         super(ServerExternalEventsTestV21, self).setUp()
         self.api = \
             self.server_external_events.ServerExternalEventsController()
-        self.context = context.get_admin_context()
         self.event_1 = {'name': 'network-vif-plugged',
                         'tag': 'foo',
                         'server_uuid': fake_instance_uuids[0],
                         'status': 'completed'}
         self.event_2 = {'name': 'network-changed',
-                        'server_uuid': fake_instance_uuids[1],
-                        'status': 'completed'}
+                        'server_uuid': fake_instance_uuids[1]}
         self.default_body = {'events': [self.event_1, self.event_2]}
         self.resp_event_1 = dict(self.event_1)
         self.resp_event_1['code'] = 200
         self.resp_event_2 = dict(self.event_2)
         self.resp_event_2['code'] = 200
+        self.resp_event_2['status'] = 'completed'
         self.default_resp_body = {'events': [self.resp_event_1,
                                              self.resp_event_2]}
+        self.req = fakes.HTTPRequest.blank('', use_admin_context=True)
 
-    def _create_req(self, body):
-        req = webob.Request.blank('/v2/fake/os-server-external-events')
-        req.method = 'POST'
-        req.headers['content-type'] = 'application/json'
-        req.environ['nova.context'] = self.context
-        req.body = jsonutils.dumps(body)
-        return req
-
-    def _assert_call(self, req, body, expected_uuids, expected_events):
+    def _assert_call(self, body, expected_uuids, expected_events):
         with mock.patch.object(self.api.compute_api,
                                'external_instance_event') as api_method:
-            response = self.api.create(req, body=body)
+            response = self.api.create(self.req, body=body)
 
         result = response.obj
         code = response._code
@@ -98,8 +89,7 @@ class ServerExternalEventsTestV21(test.NoDBTestCase):
         return result, code
 
     def test_create(self):
-        req = self._create_req(self.default_body)
-        result, code = self._assert_call(req, self.default_body,
+        result, code = self._assert_call(self.default_body,
                                          fake_instance_uuids[:2],
                                          ['network-vif-plugged',
                                           'network-changed'])
@@ -109,8 +99,7 @@ class ServerExternalEventsTestV21(test.NoDBTestCase):
     def test_create_one_bad_instance(self):
         body = self.default_body
         body['events'][1]['server_uuid'] = MISSING_UUID
-        req = self._create_req(body)
-        result, code = self._assert_call(req, body, [fake_instance_uuids[0]],
+        result, code = self._assert_call(body, [fake_instance_uuids[0]],
                                          ['network-vif-plugged'])
         self.assertEqual('failed', result['events'][1]['status'])
         self.assertEqual(200, result['events'][0]['code'])
@@ -120,9 +109,8 @@ class ServerExternalEventsTestV21(test.NoDBTestCase):
     def test_create_event_instance_has_no_host(self):
         body = self.default_body
         body['events'][0]['server_uuid'] = fake_instance_uuids[-1]
-        req = self._create_req(body)
         # the instance without host should not be passed to the compute layer
-        result, code = self._assert_call(req, body,
+        result, code = self._assert_call(body,
                                          [fake_instance_uuids[1]],
                                          ['network-changed'])
         self.assertEqual(422, result['events'][0]['code'])
@@ -134,35 +122,30 @@ class ServerExternalEventsTestV21(test.NoDBTestCase):
         body = self.default_body
         body['events'][0]['server_uuid'] = MISSING_UUID
         body['events'][1]['server_uuid'] = MISSING_UUID
-        req = self._create_req(body)
         self.assertRaises(webob.exc.HTTPNotFound,
-                          self.api.create, req, body=body)
+                          self.api.create, self.req, body=body)
 
     def test_create_bad_status(self):
         body = self.default_body
         body['events'][1]['status'] = 'foo'
-        req = self._create_req(body)
         self.assertRaises(self.invalid_error,
-                          self.api.create, req, body=body)
+                          self.api.create, self.req, body=body)
 
     def test_create_extra_gorp(self):
         body = self.default_body
         body['events'][0]['foobar'] = 'bad stuff'
-        req = self._create_req(body)
         self.assertRaises(self.invalid_error,
-                          self.api.create, req, body=body)
+                          self.api.create, self.req, body=body)
 
     def test_create_bad_events(self):
         body = {'events': 'foo'}
-        req = self._create_req(body)
         self.assertRaises(self.invalid_error,
-                          self.api.create, req, body=body)
+                          self.api.create, self.req, body=body)
 
     def test_create_bad_body(self):
         body = {'foo': 'bar'}
-        req = self._create_req(body)
         self.assertRaises(self.invalid_error,
-                          self.api.create, req, body=body)
+                          self.api.create, self.req, body=body)
 
 
 @mock.patch('nova.objects.instance.Instance.get_by_uuid', fake_get_by_uuid)

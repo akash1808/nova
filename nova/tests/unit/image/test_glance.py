@@ -15,18 +15,17 @@
 
 
 import datetime
-import sys
 
 import glanceclient.exc
 import mock
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import netutils
 import testtools
 
 from nova import context
 from nova import exception
 from nova.image import glance
 from nova import test
-from nova import utils
 
 CONF = cfg.CONF
 NOW_GLANCE_FORMAT = "2010-10-11T10:30:22.000000"
@@ -157,22 +156,10 @@ class TestGlanceSerializer(test.NoDBTestCase):
                              'device_name': '/dev/fake'},
                             {'virtual_device': 'ephemeral0',
                              'device_name': '/dev/fake0'}]}}
-
-        converted_expected = {
-            'name': 'image1',
-            'is_public': True,
-            'foo': 'bar',
-            'properties': {
-                'prop1': 'propvalue1',
-                'mappings':
-                '[{"device": "bbb", "virtual": "aaa"}, '
-                '{"device": "yyy", "virtual": "xxx"}]',
-                'block_device_mapping':
-                '[{"virtual_device": "fake", "device_name": "/dev/fake"}, '
-                '{"virtual_device": "ephemeral0", '
-                '"device_name": "/dev/fake0"}]'}}
+        # NOTE(tdurakov): Assertion of serialized objects won't work
+        # during using of random PYTHONHASHSEED. Assertion of
+        # serialized/deserialized object and initial one is enough
         converted = glance._convert_to_string(metadata)
-        self.assertEqual(converted, converted_expected)
         self.assertEqual(glance._convert_from_string(converted), metadata)
 
 
@@ -200,7 +187,7 @@ class TestGetImageService(test.NoDBTestCase):
 
 
 class TestCreateGlanceClient(test.NoDBTestCase):
-    @mock.patch('nova.utils.is_valid_ipv6')
+    @mock.patch('oslo_utils.netutils.is_valid_ipv6')
     @mock.patch('glanceclient.Client')
     def test_headers_passed_glanceclient(self, init_mock, ipv6_mock):
         self.flags(auth_strategy='keystone')
@@ -1040,7 +1027,7 @@ class TestCreate(test.NoDBTestCase):
         # Now verify that if we supply image data to the call,
         # that the client is also called with the data kwarg
         client.reset_mock()
-        image_meta = service.create(ctx, image_mock, data=mock.sentinel.data)
+        service.create(ctx, image_mock, data=mock.sentinel.data)
 
         client.call.assert_called_once_with(ctx, 1, 'create',
                                             image_id=mock.sentinel.image_id,
@@ -1101,8 +1088,8 @@ class TestUpdate(test.NoDBTestCase):
         # Now verify that if we supply image data to the call,
         # that the client is also called with the data kwarg
         client.reset_mock()
-        image_meta = service.update(ctx, mock.sentinel.image_id,
-                                    image_mock, data=mock.sentinel.data)
+        service.update(ctx, mock.sentinel.image_id,
+                       image_mock, data=mock.sentinel.data)
 
         client.call.assert_called_once_with(ctx, 1, 'update',
                                             mock.sentinel.image_id,
@@ -1167,7 +1154,7 @@ class TestGlanceUrl(test.NoDBTestCase):
         generated_url = glance.generate_glance_url()
         glance_host = CONF.glance.host
         # ipv6 address, need to wrap it with '[]'
-        if utils.is_valid_ipv6(glance_host):
+        if netutils.is_valid_ipv6(glance_host):
             glance_host = '[%s]' % glance_host
         http_url = "http://%s:%d" % (glance_host, CONF.glance.port)
         self.assertEqual(generated_url, http_url)
@@ -1177,7 +1164,7 @@ class TestGlanceUrl(test.NoDBTestCase):
         generated_url = glance.generate_glance_url()
         glance_host = CONF.glance.host
         # ipv6 address, need to wrap it with '[]'
-        if utils.is_valid_ipv6(glance_host):
+        if netutils.is_valid_ipv6(glance_host):
             glance_host = '[%s]' % glance_host
         https_url = "https://%s:%d" % (glance_host, CONF.glance.port)
         self.assertEqual(generated_url, https_url)
@@ -1199,8 +1186,6 @@ class TestGlanceApiServers(test.NoDBTestCase):
             if i > 2:
                 break
 
-    # Python 2.6 can not parse ipv6 address correctly
-    @testtools.skipIf(sys.version_info < (2, 7), "py27 or greater only")
     def test_get_ipv6_api_servers(self):
         self.flags(api_servers=['[2001:2012:1:f101::1]:9292',
                                 'https://[2010:2013:1:f122::1]:9293',

@@ -15,12 +15,15 @@
 import contextlib
 
 import mock
+import six
 
 from nova.cells import rpcapi as cells_rpcapi
+from nova import context
 from nova import db
 from nova import exception
 from nova import objects
 from nova.objects import block_device as block_device_obj
+from nova import test
 from nova.tests.unit import fake_block_device
 from nova.tests.unit import fake_instance
 from nova.tests.unit.objects import test_objects
@@ -56,10 +59,10 @@ class _TestBlockDeviceMappingObject(object):
             mock.patch.object(
                 cells_rpcapi.CellsAPI, 'bdm_update_or_create_at_top')
         ) as (bdm_update_mock, cells_update_mock):
-            bdm_object = objects.BlockDeviceMapping()
+            bdm_object = objects.BlockDeviceMapping(context=self.context)
             bdm_object.id = 123
             bdm_object.volume_id = 'fake_volume_id'
-            bdm_object.save(self.context)
+            bdm_object.save()
 
             bdm_update_mock.assert_called_once_with(
                     self.context, 123, {'volume_id': 'fake_volume_id'},
@@ -87,6 +90,12 @@ class _TestBlockDeviceMappingObject(object):
         bdm_object.instance = objects.Instance()
         self.assertRaises(exception.ObjectActionError,
                           bdm_object.save, self.context)
+
+    @mock.patch.object(db, 'block_device_mapping_update', return_value=None)
+    def test_save_not_found(self, bdm_update):
+        bdm_object = objects.BlockDeviceMapping(context=self.context)
+        bdm_object.id = 123
+        self.assertRaises(exception.BDMNotFound, bdm_object.save)
 
     @mock.patch.object(db, 'block_device_mapping_get_by_volume_id')
     def test_get_by_volume_id(self, get_by_vol_id):
@@ -129,7 +138,7 @@ class _TestBlockDeviceMappingObject(object):
                                               ['instance'])
         self.assertRemotes()
 
-    def _test_create_mocked(self, cell_type=None):
+    def _test_create_mocked(self, cell_type=None, update_or_create=False):
         if cell_type:
             self.flags(enable=True, cell_type=cell_type, group='cells')
         else:
@@ -142,57 +151,77 @@ class _TestBlockDeviceMappingObject(object):
         with contextlib.nested(
             mock.patch.object(
                     db, 'block_device_mapping_create', return_value=fake_bdm),
+            mock.patch.object(
+                    db, 'block_device_mapping_update_or_create',
+                    return_value=fake_bdm),
             mock.patch.object(cells_rpcapi.CellsAPI,
                               'bdm_update_or_create_at_top')
-        ) as (bdm_create_mock, cells_update_mock):
-            bdm = objects.BlockDeviceMapping(**values)
+        ) as (bdm_create_mock, bdm_update_or_create_mock, cells_update_mock):
+            bdm = objects.BlockDeviceMapping(context=self.context, **values)
+            if update_or_create:
+                method = bdm.update_or_create
+            else:
+                method = bdm.create
 
             if cell_type == 'api':
                 self.assertRaises(exception.ObjectActionError,
-                                  bdm.create, self.context)
-            elif cell_type == 'compute':
-                bdm.create(self.context)
-                bdm_create_mock.assert_called_once_with(
-                    self.context, values, legacy=False)
-                self.assertEqual(1, cells_update_mock.call_count)
-                self.assertTrue(len(cells_update_mock.call_args[0]) > 1)
-                self.assertIsInstance(cells_update_mock.call_args[0][1],
-                                      block_device_obj.BlockDeviceMapping)
-                self.assertEqual(cells_update_mock.call_args[1],
-                                 {'create': True})
+                                  method)
             else:
-                bdm.create(self.context)
-                self.assertFalse(cells_update_mock.called)
-                bdm_create_mock.assert_called_once_with(
-                    self.context, values, legacy=False)
+                method()
+                if update_or_create:
+                    bdm_update_or_create_mock.assert_called_once_with(
+                            self.context, values, legacy=False)
+                else:
+                    bdm_create_mock.assert_called_once_with(
+                            self.context, values, legacy=False)
+                if cell_type == 'compute':
+                    self.assertEqual(1, cells_update_mock.call_count)
+                    self.assertTrue(len(cells_update_mock.call_args[0]) > 1)
+                    self.assertEqual(cells_update_mock.call_args[0][0],
+                                     self.context)
+                    self.assertIsInstance(cells_update_mock.call_args[0][1],
+                                          block_device_obj.BlockDeviceMapping)
+                    self.assertEqual(cells_update_mock.call_args[1],
+                                     {'create': update_or_create or None})
+                else:
+                    self.assertFalse(cells_update_mock.called)
 
     def test_create_nocells(self):
         self._test_create_mocked()
 
+    def test_update_or_create(self):
+        self._test_create_mocked(update_or_create=True)
+
     def test_create_apicell(self):
         self._test_create_mocked(cell_type='api')
 
+    def test_update_or_create_apicell(self):
+        self._test_create_mocked(cell_type='api', update_or_create=True)
+
     def test_create_computecell(self):
         self._test_create_mocked(cell_type='compute')
+
+    def test_update_or_create_computecell(self):
+        self._test_create_mocked(cell_type='compute', update_or_create=True)
 
     def test_create(self):
         values = {'source_type': 'volume', 'volume_id': 'fake-vol-id',
                   'destination_type': 'volume',
                   'instance_uuid': 'fake-instance'}
-        bdm = objects.BlockDeviceMapping(**values)
+        bdm = objects.BlockDeviceMapping(context=self.context, **values)
         with mock.patch.object(cells_rpcapi.CellsAPI,
                                'bdm_update_or_create_at_top'):
-            bdm.create(self.context)
+            bdm.create()
 
-        for k, v in values.iteritems():
+        for k, v in six.iteritems(values):
             self.assertEqual(v, getattr(bdm, k))
 
     def test_create_fails(self):
         values = {'source_type': 'volume', 'volume_id': 'fake-vol-id',
                   'destination_type': 'volume',
                   'instance_uuid': 'fake-instance'}
-        bdm = objects.BlockDeviceMapping(**values)
-        bdm.create(self.context)
+        bdm = objects.BlockDeviceMapping(context=self.context, **values)
+        bdm.create()
 
         self.assertRaises(exception.ObjectActionError,
                           bdm.create, self.context)
@@ -218,8 +247,8 @@ class _TestBlockDeviceMappingObject(object):
             mock.patch.object(db, 'block_device_mapping_destroy'),
             mock.patch.object(cells_rpcapi.CellsAPI, 'bdm_destroy_at_top')
         ) as (bdm_del, cells_destroy):
-            bdm = objects.BlockDeviceMapping(**values)
-            bdm.destroy(self.context)
+            bdm = objects.BlockDeviceMapping(context=self.context, **values)
+            bdm.destroy()
             bdm_del.assert_called_once_with(self.context, values['id'])
             if cell_type != 'compute':
                 self.assertFalse(cells_destroy.called)
@@ -331,3 +360,21 @@ class TestBlockDeviceMappingListObject(test_objects._LocalTest,
 class TestRemoteBlockDeviceMappingListObject(
         test_objects._RemoteTest, _TestBlockDeviceMappingListObject):
     pass
+
+
+class TestBlockDeviceUtils(test.NoDBTestCase):
+    def test_make_list_from_dicts(self):
+        ctx = context.get_admin_context()
+        dicts = [{'id': 1}, {'id': 2}]
+        objs = block_device_obj.block_device_make_list_from_dicts(ctx,
+                                                                  dicts)
+        self.assertIsInstance(objs, block_device_obj.BlockDeviceMappingList)
+        self.assertEqual(2, len(objs))
+        self.assertEqual(1, objs[0].id)
+        self.assertEqual(2, objs[1].id)
+
+    def test_make_list_from_dicts_empty(self):
+        ctx = context.get_admin_context()
+        objs = block_device_obj.block_device_make_list_from_dicts(ctx, [])
+        self.assertIsInstance(objs, block_device_obj.BlockDeviceMappingList)
+        self.assertEqual(0, len(objs))

@@ -17,7 +17,7 @@
             "id": "1",
             "links": [
                 {
-                    "href": "%(host)s/flavors/1",
+                    "href": "%(host)s/openstack/flavors/1",
                     "rel": "bookmark"
                 }
             ]
@@ -28,7 +28,7 @@
             "id": "%(uuid)s",
             "links": [
                 {
-                    "href": "%(host)s/images/%(uuid)s",
+                    "href": "%(host)s/openstack/images/%(uuid)s",
                     "rel": "bookmark"
                 }
             ]
@@ -36,11 +36,11 @@
         "key_name": null,
         "links": [
             {
-                "href": "%(host)s/v3/servers/%(uuid)s",
+                "href": "%(host)s/v2/openstack/servers/%(uuid)s",
                 "rel": "self"
             },
             {
-                "href": "%(host)s/servers/%(uuid)s",
+                "href": "%(host)s/openstack/servers/%(uuid)s",
                 "rel": "bookmark"
             }
         ],
@@ -54,12 +54,10 @@
         "OS-EXT-SRV-ATTR:host": "%(compute_host)s",
         "OS-EXT-SRV-ATTR:hypervisor_hostname": "%(hypervisor_hostname)s",
         "OS-EXT-SRV-ATTR:instance_name": "instance-00000001",
-        "OS-EXT-STS:locked_by": null,
         "OS-EXT-STS:power_state": 1,
         "OS-EXT-STS:task_state": null,
         "OS-EXT-STS:vm_state": "active",
         "os-extended-volumes:volumes_attached": [],
-        "os-pci:pci_devices": [{"id": 1}],
         "OS-SRV-USG:launched_at": "%(strtime)s",
         "OS-SRV-USG:terminated_at": null,
         "progress": 0,

@@ -13,13 +13,14 @@
 #   under the License.
 
 
-from oslo.utils import strutils
+from oslo_utils import strutils
 from webob import exc
 
 from nova.api.openstack import common
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
+from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova import utils
@@ -42,6 +43,12 @@ class Controller(wsgi.Controller):
         """
         context = req.environ["nova.context"]
         authorize(context)
+
+        # NOTE(alex_xu): back-compatible with db layer hard-code admin
+        # permission checks. This has to be left only for API v2.0 because
+        # this version has to be stable even if it means that only admins
+        # can call this method while the policy could be changed.
+        nova_context.require_admin_context(context)
 
         if not self.is_valid_body(body, "evacuate"):
             raise exc.HTTPBadRequest(_("Malformed request body"))
@@ -80,8 +87,7 @@ class Controller(wsgi.Controller):
                 msg = _("Compute host %s not found.") % host
                 raise exc.HTTPNotFound(explanation=msg)
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       want_objects=True)
+        instance = common.get_instance(self.compute_api, context, id)
         try:
             if instance.host == host:
                 msg = _("The target host can't be the same one.")

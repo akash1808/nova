@@ -16,6 +16,8 @@
 from eventlet import greenthread
 import mock
 
+import six
+
 from nova import exception
 from nova import test
 from nova.tests.unit.virt.xenapi import stubs
@@ -58,11 +60,6 @@ class SROps(stubs.XenAPITestBaseNoDB):
 
         class FakeException(Exception):
             pass
-
-        def fake_call_xenapi(method, *args):
-            self.assertEqual(method, 'VDI.get_SR')
-            self.assertEqual(args[0], vdi_ref)
-            return args[0]
 
         session = mock.Mock()
         session.XenAPI.Failure = FakeException
@@ -153,7 +150,7 @@ class ParseVolumeInfoTestCase(stubs.XenAPITestBaseNoDB):
             'xvdq': -1,
         }
 
-        for (input, expected) in cases.iteritems():
+        for (input, expected) in six.iteritems(cases):
             actual = volume_utils._mountpoint_to_number(input)
             self.assertEqual(actual, expected,
                     '%s yielded %s, not %s' % (input, actual, expected))
@@ -230,3 +227,23 @@ class FindVBDTestCase(stubs.XenAPITestBaseNoDB):
         self.assertIsNone(result)
         session.VM.get_VBDs.assert_called_once_with("vm_ref")
         session.VBD.get_userdevice.assert_called_once_with("a")
+
+
+class BootedFromVolumeTestCase(stubs.XenAPITestBaseNoDB):
+    def test_booted_from_volume(self):
+        session = mock.Mock()
+        session.VM.get_VBDs.return_value = ['vbd_ref']
+        session.VBD.get_userdevice.return_value = '0'
+        session.VBD.get_other_config.return_value = {'osvol': True}
+        booted_from_volume = volume_utils.is_booted_from_volume(session,
+                'vm_ref')
+        self.assertTrue(booted_from_volume)
+
+    def test_not_booted_from_volume(self):
+        session = mock.Mock()
+        session.VM.get_VBDs.return_value = ['vbd_ref']
+        session.VBD.get_userdevice.return_value = '0'
+        session.VBD.get_other_config.return_value = {}
+        booted_from_volume = volume_utils.is_booted_from_volume(session,
+                'vm_ref')
+        self.assertFalse(booted_from_volume)

@@ -16,12 +16,11 @@ import contextlib
 import re
 
 import mock
-from oslo.utils import units
-from oslo.vmware import exceptions as vexc
-from testtools import matchers
+from oslo_utils import units
+from oslo_vmware import exceptions as vexc
+from oslo_vmware.objects import datastore as ds_obj
 
 from nova import exception
-from nova.i18n import _
 from nova import test
 from nova.tests.unit.virt.vmwareapi import fake
 from nova.virt.vmwareapi import ds_util
@@ -52,11 +51,37 @@ class DsUtilTestCase(test.NoDBTestCase):
             mock.patch.object(self.session, '_call_method',
                               fake_call_method)
         ) as (_wait_for_task, _call_method):
-            ds_path = ds_util.DatastorePath('ds', 'fake/path')
+            ds_path = ds_obj.DatastorePath('ds', 'fake/path')
             ds_util.file_delete(self.session,
                                 ds_path, 'fake-dc-ref')
             _wait_for_task.assert_has_calls([
                    mock.call('fake_delete_task')])
+
+    def test_file_copy(self):
+        def fake_call_method(module, method, *args, **kwargs):
+            self.assertEqual('CopyDatastoreFile_Task', method)
+            src_name = kwargs.get('sourceName')
+            self.assertEqual('[ds] fake/path/src_file', src_name)
+            src_dc_ref = kwargs.get('sourceDatacenter')
+            self.assertEqual('fake-src-dc-ref', src_dc_ref)
+            dst_name = kwargs.get('destinationName')
+            self.assertEqual('[ds] fake/path/dst_file', dst_name)
+            dst_dc_ref = kwargs.get('destinationDatacenter')
+            self.assertEqual('fake-dst-dc-ref', dst_dc_ref)
+            return 'fake_copy_task'
+
+        with contextlib.nested(
+            mock.patch.object(self.session, '_wait_for_task'),
+            mock.patch.object(self.session, '_call_method',
+                              fake_call_method)
+        ) as (_wait_for_task, _call_method):
+            src_ds_path = ds_obj.DatastorePath('ds', 'fake/path', 'src_file')
+            dst_ds_path = ds_obj.DatastorePath('ds', 'fake/path', 'dst_file')
+            ds_util.file_copy(self.session,
+                              str(src_ds_path), 'fake-src-dc-ref',
+                              str(dst_ds_path), 'fake-dst-dc-ref')
+            _wait_for_task.assert_has_calls([
+                   mock.call('fake_copy_task')])
 
     def test_file_move(self):
         def fake_call_method(module, method, *args, **kwargs):
@@ -76,8 +101,8 @@ class DsUtilTestCase(test.NoDBTestCase):
             mock.patch.object(self.session, '_call_method',
                               fake_call_method)
         ) as (_wait_for_task, _call_method):
-            src_ds_path = ds_util.DatastorePath('ds', 'tmp/src')
-            dst_ds_path = ds_util.DatastorePath('ds', 'base/dst')
+            src_ds_path = ds_obj.DatastorePath('ds', 'tmp/src')
+            dst_ds_path = ds_obj.DatastorePath('ds', 'base/dst')
             ds_util.file_move(self.session,
                               'fake-dc-ref', src_ds_path, dst_ds_path)
             _wait_for_task.assert_has_calls([
@@ -106,6 +131,35 @@ class DsUtilTestCase(test.NoDBTestCase):
             _wait_for_task.assert_has_calls([
                    mock.call('fake_move_task')])
 
+    def test_disk_copy(self):
+        with contextlib.nested(
+            mock.patch.object(self.session, '_wait_for_task'),
+            mock.patch.object(self.session, '_call_method',
+                              return_value=mock.sentinel.cm)
+        ) as (_wait_for_task, _call_method):
+            ds_util.disk_copy(self.session, mock.sentinel.dc_ref,
+                              mock.sentinel.source_ds, mock.sentinel.dest_ds)
+            _wait_for_task.assert_called_once_with(mock.sentinel.cm)
+            _call_method.assert_called_once_with(
+                    mock.ANY, 'CopyVirtualDisk_Task', 'VirtualDiskManager',
+                    sourceName='sentinel.source_ds',
+                    destDatacenter=mock.sentinel.dc_ref,
+                    sourceDatacenter=mock.sentinel.dc_ref, force=False,
+                    destName='sentinel.dest_ds')
+
+    def test_disk_delete(self):
+        with contextlib.nested(
+            mock.patch.object(self.session, '_wait_for_task'),
+            mock.patch.object(self.session, '_call_method',
+                              return_value=mock.sentinel.cm)
+        ) as (_wait_for_task, _call_method):
+            ds_util.disk_delete(self.session,
+                                'fake-dc-ref', '[ds] tmp/disk.vmdk')
+            _wait_for_task.assert_called_once_with(mock.sentinel.cm)
+            _call_method.assert_called_once_with(
+                    mock.ANY, 'DeleteVirtualDisk_Task', 'VirtualDiskManager',
+                    datacenter='fake-dc-ref', name='[ds] tmp/disk.vmdk')
+
     def test_mkdir(self):
         def fake_call_method(module, method, *args, **kwargs):
             self.assertEqual('MakeDirectory', method)
@@ -118,7 +172,7 @@ class DsUtilTestCase(test.NoDBTestCase):
 
         with mock.patch.object(self.session, '_call_method',
                                fake_call_method):
-            ds_path = ds_util.DatastorePath('ds', 'fake/path')
+            ds_path = ds_obj.DatastorePath('ds', 'fake/path')
             ds_util.mkdir(self.session, ds_path, 'fake-dc-ref')
 
     def test_file_exists(self):
@@ -155,7 +209,7 @@ class DsUtilTestCase(test.NoDBTestCase):
                                   fake_call_method),
                 mock.patch.object(self.session, '_wait_for_task',
                                   fake_wait_for_task)):
-            ds_path = ds_util.DatastorePath('ds', 'fake/path')
+            ds_path = ds_obj.DatastorePath('ds', 'fake/path')
             file_exists = ds_util.file_exists(self.session,
                     'fake-browser', ds_path, 'fake-file')
             self.assertTrue(file_exists)
@@ -180,7 +234,7 @@ class DsUtilTestCase(test.NoDBTestCase):
                                   fake_call_method),
                 mock.patch.object(self.session, '_wait_for_task',
                                   fake_wait_for_task)):
-            ds_path = ds_util.DatastorePath('ds', 'fake/path')
+            ds_path = ds_obj.DatastorePath('ds', 'fake/path')
             file_exists = ds_util.file_exists(self.session,
                     'fake-browser', ds_path, 'fake-file')
             self.assertFalse(file_exists)
@@ -214,15 +268,19 @@ class DsUtilTestCase(test.NoDBTestCase):
                     args[1] == fake_ds_list):
                 # Start a new iterator over given datastores
                 datastores_i[0] = iter(datastores)
-                return datastores_i[0].next()
+                return next(datastores_i[0])
 
             # Continue returning results from the current iterator.
-            if (module == ds_util.vim_util and
-                    method == 'continue_to_get_objects'):
+            if (module == ds_util.vutil and
+                    method == 'continue_retrieval'):
                 try:
-                    return datastores_i[0].next()
+                    return next(datastores_i[0])
                 except StopIteration:
                     return None
+
+            if (method == 'continue_retrieval' or
+                method == 'cancel_retrieval'):
+                return
 
             # Sentinel that get_datastore's use of vim has changed
             self.fail('Unexpected vim call in get_datastore: %s' % method)
@@ -288,7 +346,7 @@ class DsUtilTestCase(test.NoDBTestCase):
         # Test with a regex that has no match
         # Checks if code raises DatastoreNotFound with a specific message
         datastore_invalid_regex = re.compile("unknown-ds")
-        exp_message = (_("Datastore regex %s did not match any datastores")
+        exp_message = ("Datastore regex %s did not match any datastores"
                        % datastore_invalid_regex.pattern)
         fake_objects = fake.FakeRetrieveResult()
         fake_objects.add_object(fake.Datastore("fake-ds0"))
@@ -391,182 +449,3 @@ class DsUtilTestCase(test.NoDBTestCase):
                                                       "normal",
                                                       "VMFS",
                                                       datastore_regex))
-
-
-class DatastoreTestCase(test.NoDBTestCase):
-    def test_ds(self):
-        ds = ds_util.Datastore(
-                "fake_ref", "ds_name", 2 * units.Gi, 1 * units.Gi)
-        self.assertEqual('ds_name', ds.name)
-        self.assertEqual('fake_ref', ds.ref)
-        self.assertEqual(2 * units.Gi, ds.capacity)
-        self.assertEqual(1 * units.Gi, ds.freespace)
-
-    def test_ds_invalid_space(self):
-        self.assertRaises(ValueError, ds_util.Datastore,
-                "fake_ref", "ds_name", 1 * units.Gi, 2 * units.Gi)
-        self.assertRaises(ValueError, ds_util.Datastore,
-                "fake_ref", "ds_name", None, 2 * units.Gi)
-
-    def test_ds_no_capacity_no_freespace(self):
-        ds = ds_util.Datastore("fake_ref", "ds_name")
-        self.assertIsNone(ds.capacity)
-        self.assertIsNone(ds.freespace)
-
-    def test_ds_invalid(self):
-        self.assertRaises(ValueError, ds_util.Datastore, None, "ds_name")
-        self.assertRaises(ValueError, ds_util.Datastore, "fake_ref", None)
-
-    def test_build_path(self):
-        ds = ds_util.Datastore("fake_ref", "ds_name")
-        ds_path = ds.build_path("some_dir", "foo.vmdk")
-        self.assertEqual('[ds_name] some_dir/foo.vmdk', str(ds_path))
-
-
-class DatastorePathTestCase(test.NoDBTestCase):
-
-    def test_ds_path(self):
-        p = ds_util.DatastorePath('dsname', 'a/b/c', 'file.iso')
-        self.assertEqual('[dsname] a/b/c/file.iso', str(p))
-        self.assertEqual('a/b/c/file.iso', p.rel_path)
-        self.assertEqual('a/b/c', p.parent.rel_path)
-        self.assertEqual('[dsname] a/b/c', str(p.parent))
-        self.assertEqual('dsname', p.datastore)
-        self.assertEqual('file.iso', p.basename)
-        self.assertEqual('a/b/c', p.dirname)
-
-    def test_ds_path_no_ds_name(self):
-        bad_args = [
-                ('', ['a/b/c', 'file.iso']),
-                (None, ['a/b/c', 'file.iso'])]
-        for t in bad_args:
-            self.assertRaises(
-                ValueError, ds_util.DatastorePath,
-                t[0], *t[1])
-
-    def test_ds_path_invalid_path_components(self):
-        bad_args = [
-            ('dsname', [None]),
-            ('dsname', ['', None]),
-            ('dsname', ['a', None]),
-            ('dsname', ['a', None, 'b']),
-            ('dsname', [None, '']),
-            ('dsname', [None, 'b'])]
-
-        for t in bad_args:
-            self.assertRaises(
-                ValueError, ds_util.DatastorePath,
-                t[0], *t[1])
-
-    def test_ds_path_no_subdir(self):
-        args = [
-            ('dsname', ['', 'x.vmdk']),
-            ('dsname', ['x.vmdk'])]
-
-        canonical_p = ds_util.DatastorePath('dsname', 'x.vmdk')
-        self.assertEqual('[dsname] x.vmdk', str(canonical_p))
-        self.assertEqual('', canonical_p.dirname)
-        self.assertEqual('x.vmdk', canonical_p.basename)
-        self.assertEqual('x.vmdk', canonical_p.rel_path)
-        for t in args:
-            p = ds_util.DatastorePath(t[0], *t[1])
-            self.assertEqual(str(canonical_p), str(p))
-
-    def test_ds_path_ds_only(self):
-        args = [
-            ('dsname', []),
-            ('dsname', ['']),
-            ('dsname', ['', ''])]
-
-        canonical_p = ds_util.DatastorePath('dsname')
-        self.assertEqual('[dsname]', str(canonical_p))
-        self.assertEqual('', canonical_p.rel_path)
-        self.assertEqual('', canonical_p.basename)
-        self.assertEqual('', canonical_p.dirname)
-        for t in args:
-            p = ds_util.DatastorePath(t[0], *t[1])
-            self.assertEqual(str(canonical_p), str(p))
-            self.assertEqual(canonical_p.rel_path, p.rel_path)
-
-    def test_ds_path_equivalence(self):
-        args = [
-            ('dsname', ['a/b/c/', 'x.vmdk']),
-            ('dsname', ['a/', 'b/c/', 'x.vmdk']),
-            ('dsname', ['a', 'b', 'c', 'x.vmdk']),
-            ('dsname', ['a/b/c', 'x.vmdk'])]
-
-        canonical_p = ds_util.DatastorePath('dsname', 'a/b/c', 'x.vmdk')
-        for t in args:
-            p = ds_util.DatastorePath(t[0], *t[1])
-            self.assertEqual(str(canonical_p), str(p))
-            self.assertEqual(canonical_p.datastore, p.datastore)
-            self.assertEqual(canonical_p.rel_path, p.rel_path)
-            self.assertEqual(str(canonical_p.parent), str(p.parent))
-
-    def test_ds_path_non_equivalence(self):
-        args = [
-            # leading slash
-            ('dsname', ['/a', 'b', 'c', 'x.vmdk']),
-            ('dsname', ['/a/b/c/', 'x.vmdk']),
-            ('dsname', ['a/b/c', '/x.vmdk']),
-            # leading space
-            ('dsname', ['a/b/c/', ' x.vmdk']),
-            ('dsname', ['a/', ' b/c/', 'x.vmdk']),
-            ('dsname', [' a', 'b', 'c', 'x.vmdk']),
-            # trailing space
-            ('dsname', ['/a/b/c/', 'x.vmdk ']),
-            ('dsname', ['a/b/c/ ', 'x.vmdk'])]
-
-        canonical_p = ds_util.DatastorePath('dsname', 'a/b/c', 'x.vmdk')
-        for t in args:
-            p = ds_util.DatastorePath(t[0], *t[1])
-            self.assertNotEqual(str(canonical_p), str(p))
-
-    def test_ds_path_hashable(self):
-        ds1 = ds_util.DatastorePath('dsname', 'path')
-        ds2 = ds_util.DatastorePath('dsname', 'path')
-
-        # If the above objects have the same hash, they will only be added to
-        # the set once
-        self.assertThat(set([ds1, ds2]), matchers.HasLength(1))
-
-    def test_equal(self):
-        a = ds_util.DatastorePath('ds_name', 'a')
-        b = ds_util.DatastorePath('ds_name', 'a')
-        self.assertEqual(a, b)
-
-    def test_join(self):
-        p = ds_util.DatastorePath('ds_name', 'a')
-        ds_path = p.join('b')
-        self.assertEqual('[ds_name] a/b', str(ds_path))
-
-        p = ds_util.DatastorePath('ds_name', 'a')
-        ds_path = p.join()
-        self.assertEqual('[ds_name] a', str(ds_path))
-
-        bad_args = [
-            [None],
-            ['', None],
-            ['a', None],
-            ['a', None, 'b']]
-        for arg in bad_args:
-            self.assertRaises(ValueError, p.join, *arg)
-
-    def test_ds_path_parse(self):
-        p = ds_util.DatastorePath.parse('[dsname]')
-        self.assertEqual('dsname', p.datastore)
-        self.assertEqual('', p.rel_path)
-
-        p = ds_util.DatastorePath.parse('[dsname] folder')
-        self.assertEqual('dsname', p.datastore)
-        self.assertEqual('folder', p.rel_path)
-
-        p = ds_util.DatastorePath.parse('[dsname] folder/file')
-        self.assertEqual('dsname', p.datastore)
-        self.assertEqual('folder/file', p.rel_path)
-
-        for p in [None, '']:
-            self.assertRaises(ValueError, ds_util.DatastorePath.parse, p)
-
-        for p in ['bad path', '/a/b/c', 'a/b/c']:
-            self.assertRaises(IndexError, ds_util.DatastorePath.parse, p)

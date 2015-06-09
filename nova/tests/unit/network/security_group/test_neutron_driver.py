@@ -17,9 +17,11 @@ from mox3 import mox
 from neutronclient.common import exceptions as n_exc
 from neutronclient.v2_0 import client
 
+from six.moves import range
+
 from nova import context
 from nova import exception
-from nova.network import neutronv2
+from nova.network.neutronv2 import api as neutronapi
 from nova.network.security_group import neutron_driver
 from nova import test
 
@@ -27,9 +29,9 @@ from nova import test
 class TestNeutronDriver(test.NoDBTestCase):
     def setUp(self):
         super(TestNeutronDriver, self).setUp()
-        self.mox.StubOutWithMock(neutronv2, 'get_client')
+        self.mox.StubOutWithMock(neutronapi, 'get_client')
         self.moxed_client = self.mox.CreateMock(client.Client)
-        neutronv2.get_client(mox.IgnoreArg()).MultipleTimes().AndReturn(
+        neutronapi.get_client(mox.IgnoreArg()).MultipleTimes().AndReturn(
             self.moxed_client)
         self.context = context.RequestContext('userid', 'my_tenantid')
         setattr(self.context,
@@ -73,6 +75,27 @@ class TestNeutronDriver(test.NoDBTestCase):
         del expected_sg['security_group']['tenant_id']
         self.assertEqual(expected_sg['security_group'], observed_sg)
 
+    def test_get_with_invalid_name(self):
+        sg_name = 'invalid_name'
+        expected_sg_id = '85cc3048-abc3-43cc-89b3-377341426ac5'
+        list_security_groups = {'security_groups':
+                                [{'name': sg_name,
+                                  'id': expected_sg_id,
+                                  'tenant_id': self.context.tenant,
+                                  'description': 'server',
+                                  'rules': []}
+                                ]}
+        self.moxed_client.list_security_groups(name=sg_name, fields='id',
+            tenant_id=self.context.tenant).AndReturn(list_security_groups)
+
+        self.moxed_client.show_security_group(expected_sg_id).AndRaise(
+            TypeError)
+        self.mox.ReplayAll()
+
+        sg_api = neutron_driver.SecurityGroupAPI()
+        self.assertRaises(exception.SecurityGroupNotFound,
+                          sg_api.get, self.context, name=sg_name)
+
     def test_create_security_group_exceed_quota(self):
         name = 'test-security-group'
         description = 'test-security-group'
@@ -106,6 +129,26 @@ class TestNeutronDriver(test.NoDBTestCase):
         sg_api = neutron_driver.SecurityGroupAPI()
         self.assertRaises(exception.SecurityGroupLimitExceeded,
                           sg_api.add_rules, self.context, None, name, [vals])
+
+    def test_create_security_group_rules_bad_request(self):
+        vals = {'protocol': 'icmp', 'cidr': '0.0.0.0/0',
+                'parent_group_id': '7ae75663-277e-4a0e-8f87-56ea4e70cb47',
+                'group_id': None, 'to_port': 255}
+        body = {'security_group_rules': [{'remote_group_id': None,
+                'direction': 'ingress', 'protocol': 'icmp',
+                'ethertype': 'IPv4', 'port_range_max': 255,
+                'security_group_id': '7ae75663-277e-4a0e-8f87-56ea4e70cb47',
+                'remote_ip_prefix': '0.0.0.0/0'}]}
+        name = 'test-security-group'
+        message = "ICMP code (port-range-max) 255 is provided but ICMP type" \
+                  " (port-range-min) is missing"
+        self.moxed_client.create_security_group_rule(
+            body).AndRaise(n_exc.NeutronClientException(status_code=400,
+                                                        message=message))
+        self.mox.ReplayAll()
+        sg_api = neutron_driver.SecurityGroupAPI()
+        self.assertRaises(exception.Invalid, sg_api.add_rules,
+                          self.context, None, name, [vals])
 
     def test_list_security_group_with_no_port_range_and_not_tcp_udp_icmp(self):
         sg1 = {'description': 'default',
@@ -160,7 +203,8 @@ class TestNeutronDriver(test.NoDBTestCase):
 
         self.moxed_client.list_ports(device_id=[server_id]).AndReturn(
             port_list)
-        self.moxed_client.list_security_groups(id=[sg2_id, sg1_id]).AndReturn(
+        self.moxed_client.list_security_groups(
+            id=mox.SameElementsAs([sg2_id, sg1_id])).AndReturn(
             security_groups_list)
         self.mox.ReplayAll()
 
@@ -180,7 +224,7 @@ class TestNeutronDriver(test.NoDBTestCase):
         device_ids = []
         ports = []
         sg_bindings = {}
-        for i in xrange(0, num_servers):
+        for i in range(0, num_servers):
             server_id = "server-%d" % i
             port_id = "port-%d" % i
             servers.append({'id': server_id})
@@ -190,12 +234,13 @@ class TestNeutronDriver(test.NoDBTestCase):
                           'security_groups': [sg1_id, sg2_id]})
             sg_bindings[server_id] = [{'name': 'wol'}, {'name': 'eor'}]
 
-        for x in xrange(0, num_servers, max_query):
+        for x in range(0, num_servers, max_query):
             self.moxed_client.list_ports(
                        device_id=device_ids[x:x + max_query]).\
                        AndReturn({'ports': ports[x:x + max_query]})
 
-        self.moxed_client.list_security_groups(id=[sg2_id, sg1_id]).AndReturn(
+        self.moxed_client.list_security_groups(
+            id=mox.SameElementsAs([sg2_id, sg1_id])).AndReturn(
             security_groups_list)
         self.mox.ReplayAll()
 
@@ -226,8 +271,9 @@ class TestNeutronDriver(test.NoDBTestCase):
 
         self.moxed_client.list_ports(device_id=['server_1']).AndReturn(
             port_list)
-        self.moxed_client.list_security_groups(id=['1', '2']).AndReturn(
-            security_groups_list)
+        self.moxed_client.\
+            list_security_groups(id=mox.SameElementsAs(['1', '2'])).AndReturn(
+                security_groups_list)
         self.mox.ReplayAll()
 
         sg_api = neutron_driver.SecurityGroupAPI()

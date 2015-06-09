@@ -17,9 +17,6 @@
 Test suites for 'common' code used throughout the OpenStack HTTP API.
 """
 
-import xml.dom.minidom as minidom
-
-from lxml import etree
 import mock
 import six
 from testtools import matchers
@@ -28,7 +25,6 @@ import webob.exc
 import webob.multidict
 
 from nova.api.openstack import common
-from nova.api.openstack import xmlutil
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import exception
@@ -40,7 +36,7 @@ NS = "{http://docs.openstack.org/compute/api/v1.1}"
 ATOMNS = "{http://www.w3.org/2005/Atom}"
 
 
-class LimiterTest(test.TestCase):
+class LimiterTest(test.NoDBTestCase):
     """Unit tests for the `nova.api.openstack.common.limited` method which
     takes in a list of items and, depending on the 'offset' and 'limit' GET
     params, returns a subset or complete set of the given items.
@@ -163,7 +159,7 @@ class LimiterTest(test.TestCase):
             webob.exc.HTTPBadRequest, common.limited, self.tiny, req)
 
 
-class SortParamUtilsTest(test.TestCase):
+class SortParamUtilsTest(test.NoDBTestCase):
 
     def test_get_sort_params_defaults(self):
         '''Verifies the default sort key and direction.'''
@@ -232,7 +228,7 @@ class SortParamUtilsTest(test.TestCase):
         self.assertEqual(0, len(params))
 
 
-class PaginationParamsTest(test.TestCase):
+class PaginationParamsTest(test.NoDBTestCase):
     """Unit tests for the `nova.api.openstack.common.get_pagination_params`
     method which takes in a request object and returns 'marker' and 'limit'
     GET params.
@@ -442,6 +438,13 @@ class MiscFunctionsTest(test.TestCase):
                 expected = 'REBUILD'
                 self.assertEqual(expected, actual)
 
+    def test_status_migrating_from_state(self):
+        for vm_state in (vm_states.ACTIVE, vm_states.PAUSED):
+            task_state = task_states.MIGRATING
+            actual = common.status_from_state(vm_state, task_state)
+            expected = 'MIGRATING'
+            self.assertEqual(expected, actual)
+
     def test_task_and_vm_state_from_status(self):
         fixture1 = ['reboot']
         actual = common.task_and_vm_state_from_status(fixture1)
@@ -546,203 +549,6 @@ class TestCollectionLinks(test.NoDBTestCase):
         href_link_mock.assert_called_once_with(req, "123",
                                                mock.sentinel.coll_key)
         self.assertThat(results, matchers.HasLength(1))
-
-
-class MetadataXMLDeserializationTest(test.TestCase):
-
-    deserializer = common.MetadataXMLDeserializer()
-
-    def test_create(self):
-        request_body = """
-        <metadata xmlns="http://docs.openstack.org/compute/api/v1.1">
-            <meta key='123'>asdf</meta>
-            <meta key='567'>jkl;</meta>
-        </metadata>"""
-        output = self.deserializer.deserialize(request_body, 'create')
-        expected = {"body": {"metadata": {"123": "asdf", "567": "jkl;"}}}
-        self.assertEqual(output, expected)
-
-    def test_create_empty(self):
-        request_body = """
-        <metadata xmlns="http://docs.openstack.org/compute/api/v1.1"/>"""
-        output = self.deserializer.deserialize(request_body, 'create')
-        expected = {"body": {"metadata": {}}}
-        self.assertEqual(output, expected)
-
-    def test_update_all(self):
-        request_body = """
-        <metadata xmlns="http://docs.openstack.org/compute/api/v1.1">
-            <meta key='123'>asdf</meta>
-            <meta key='567'>jkl;</meta>
-        </metadata>"""
-        output = self.deserializer.deserialize(request_body, 'update_all')
-        expected = {"body": {"metadata": {"123": "asdf", "567": "jkl;"}}}
-        self.assertEqual(output, expected)
-
-    def test_update(self):
-        request_body = """
-        <meta xmlns="http://docs.openstack.org/compute/api/v1.1"
-              key='123'>asdf</meta>"""
-        output = self.deserializer.deserialize(request_body, 'update')
-        expected = {"body": {"meta": {"123": "asdf"}}}
-        self.assertEqual(output, expected)
-
-
-class MetadataXMLSerializationTest(test.TestCase):
-
-    def test_xml_declaration(self):
-        serializer = common.MetadataTemplate()
-        fixture = {
-            'metadata': {
-                'one': 'two',
-                'three': 'four',
-            },
-        }
-
-        output = serializer.serialize(fixture)
-        has_dec = output.startswith("<?xml version='1.0' encoding='UTF-8'?>")
-        self.assertTrue(has_dec)
-
-    def test_index(self):
-        serializer = common.MetadataTemplate()
-        fixture = {
-            'metadata': {
-                'one': 'two',
-                'three': 'four',
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'metadata')
-        metadata_dict = fixture['metadata']
-        metadata_elems = root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 2)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = metadata_dict.items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-    def test_index_null(self):
-        serializer = common.MetadataTemplate()
-        fixture = {
-            'metadata': {
-                None: None,
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'metadata')
-        metadata_dict = fixture['metadata']
-        metadata_elems = root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 1)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = metadata_dict.items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-    def test_index_unicode(self):
-        serializer = common.MetadataTemplate()
-        fixture = {
-            'metadata': {
-                u'three': u'Jos\xe9',
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'metadata')
-        metadata_dict = fixture['metadata']
-        metadata_elems = root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 1)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = metadata_dict.items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(metadata_elem.text.strip(), meta_value)
-
-    def test_show(self):
-        serializer = common.MetaItemTemplate()
-        fixture = {
-            'meta': {
-                'one': 'two',
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        meta_dict = fixture['meta']
-        (meta_key, meta_value) = meta_dict.items()[0]
-        self.assertEqual(str(root.get('key')), str(meta_key))
-        self.assertEqual(root.text.strip(), meta_value)
-
-    def test_update_all(self):
-        serializer = common.MetadataTemplate()
-        fixture = {
-            'metadata': {
-                'key6': 'value6',
-                'key4': 'value4',
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'metadata')
-        metadata_dict = fixture['metadata']
-        metadata_elems = root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 2)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = metadata_dict.items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-
-    def test_update_item(self):
-        serializer = common.MetaItemTemplate()
-        fixture = {
-            'meta': {
-                'one': 'two',
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        meta_dict = fixture['meta']
-        (meta_key, meta_value) = meta_dict.items()[0]
-        self.assertEqual(str(root.get('key')), str(meta_key))
-        self.assertEqual(root.text.strip(), meta_value)
-
-    def test_create(self):
-        serializer = common.MetadataTemplate()
-        fixture = {
-            'metadata': {
-                'key9': 'value9',
-                'key2': 'value2',
-                'key1': 'value1',
-            },
-        }
-        output = serializer.serialize(fixture)
-        root = etree.XML(output)
-        xmlutil.validate_schema(root, 'metadata')
-        metadata_dict = fixture['metadata']
-        metadata_elems = root.findall('{0}meta'.format(NS))
-        self.assertEqual(len(metadata_elems), 3)
-        for i, metadata_elem in enumerate(metadata_elems):
-            (meta_key, meta_value) = metadata_dict.items()[i]
-            self.assertEqual(str(metadata_elem.get('key')), str(meta_key))
-            self.assertEqual(str(metadata_elem.text).strip(), str(meta_value))
-        actual = minidom.parseString(output.replace("  ", ""))
-
-        expected = minidom.parseString("""
-            <metadata xmlns="http://docs.openstack.org/compute/api/v1.1">
-                <meta key="key2">value2</meta>
-                <meta key="key9">value9</meta>
-                <meta key="key1">value1</meta>
-            </metadata>
-        """.replace("  ", "").replace("\n", ""))
-
-        self.assertEqual(expected.toxml(), actual.toxml())
-
-    def test_metadata_deserializer(self):
-        """Should throw a 400 error on corrupt xml."""
-        deserializer = common.MetadataXMLDeserializer()
-        self.assertRaises(
-                exception.MalformedRequestBody,
-                deserializer.deserialize,
-                utils.killer_xml_body())
 
 
 class LinkPrefixTest(test.NoDBTestCase):

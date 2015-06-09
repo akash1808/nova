@@ -12,14 +12,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
-from oslo.middleware import request_id
-from oslo.serialization import jsonutils
+from oslo_config import cfg
+from oslo_middleware import request_id
+from oslo_serialization import jsonutils
 import webob
 import webob.exc
 
 import nova.api.auth
-from nova.i18n import _
 from nova import test
 
 CONF = cfg.CONF
@@ -94,7 +93,7 @@ class TestKeystoneMiddlewareRoles(test.NoDBTestCase):
             elif context.roles == ['']:
                 return webob.Response(status="200 No Roles")
             else:
-                raise webob.exc.HTTPBadRequest(_("unexpected role header"))
+                raise webob.exc.HTTPBadRequest("unexpected role header")
 
         self.middleware = nova.api.auth.NovaKeystoneContext(role_check_app)
         self.request = webob.Request.blank('/')
@@ -138,7 +137,7 @@ class TestPipeLineFactory(test.NoDBTestCase):
         def __init__(self, name):
             self.name = name
 
-    class FakeLoader():
+    class FakeLoader(object):
         def get_filter(self, name):
             return TestPipeLineFactory.FakeFilter(name)
 
@@ -153,16 +152,32 @@ class TestPipeLineFactory(test.NoDBTestCase):
         self.assertEqual(app.name, pipeline.split()[-1])
         self.assertIsInstance(app, TestPipeLineFactory.FakeApp)
 
-    def test_pipeline_factory(self):
+    def test_pipeline_factory_noauthold(self):
         fake_pipeline = 'test1 test2 test3'
+        CONF.set_override('auth_strategy', 'noauth')
         app = nova.api.auth.pipeline_factory(
             TestPipeLineFactory.FakeLoader(), None, noauth=fake_pipeline)
         self._test_pipeline(fake_pipeline, app)
 
-    def test_pipeline_factory_v21(self):
+    def test_pipeline_factory_v21_noauthold(self):
         fake_pipeline = 'test1 test2 test3'
+        CONF.set_override('auth_strategy', 'noauth')
         app = nova.api.auth.pipeline_factory_v21(
             TestPipeLineFactory.FakeLoader(), None, noauth=fake_pipeline)
+        self._test_pipeline(fake_pipeline, app)
+
+    def test_pipeline_factory(self):
+        fake_pipeline = 'test1 test2 test3'
+        CONF.set_override('auth_strategy', 'noauth2')
+        app = nova.api.auth.pipeline_factory(
+            TestPipeLineFactory.FakeLoader(), None, noauth2=fake_pipeline)
+        self._test_pipeline(fake_pipeline, app)
+
+    def test_pipeline_factory_v21(self):
+        fake_pipeline = 'test1 test2 test3'
+        CONF.set_override('auth_strategy', 'noauth2')
+        app = nova.api.auth.pipeline_factory_v21(
+            TestPipeLineFactory.FakeLoader(), None, noauth2=fake_pipeline)
         self._test_pipeline(fake_pipeline, app)
 
     def test_pipeline_factory_with_rate_limits(self):
@@ -190,11 +205,3 @@ class TestPipeLineFactory(test.NoDBTestCase):
         app = nova.api.auth.pipeline_factory(
             TestPipeLineFactory.FakeLoader(), None, keystone=fake_pipeline)
         self._test_pipeline(fake_pipeline, app)
-
-    def test_pipeline_factory_compatibility_with_v3(self):
-        CONF.set_override('api_rate_limit', True)
-        CONF.set_override('auth_strategy', 'keystone')
-        fake_pipeline = 'test1 ratelimit_v3 test3'
-        app = nova.api.auth.pipeline_factory(
-            TestPipeLineFactory.FakeLoader(), None, keystone=fake_pipeline)
-        self._test_pipeline('test1 test3', app)

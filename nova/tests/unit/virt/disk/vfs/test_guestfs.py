@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import sys
+import fixtures
+import mock
 
 from nova import exception
 from nova import test
@@ -21,11 +22,11 @@ from nova.virt.disk.vfs import guestfs as vfsimpl
 
 
 class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
-
     def setUp(self):
         super(VirtDiskVFSGuestFSTest, self).setUp()
-        sys.modules['guestfs'] = fakeguestfs
-        vfsimpl.guestfs = fakeguestfs
+        self.useFixture(
+                fixtures.MonkeyPatch('nova.virt.disk.vfs.guestfs.guestfs',
+                                     fakeguestfs))
 
     def _do_test_appliance_setup_inspect(self, forcetcg):
         if forcetcg:
@@ -262,3 +263,22 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
         self.assertTrue(vfs.handle.trace_enabled)
         self.assertTrue(vfs.handle.verbose_enabled)
         self.assertIsNotNone(vfs.handle.event_callback)
+
+    def test_get_format_fs(self):
+        vfs = vfsimpl.VFSGuestFS("dummy.img")
+        vfs.setup()
+        self.assertIsNotNone(vfs.handle)
+        self.assertTrue('ext3', vfs.get_image_fs())
+        vfs.teardown()
+
+    @mock.patch.object(vfsimpl.VFSGuestFS, 'setup_os')
+    def test_setup_mount(self, setup_os):
+        vfs = vfsimpl.VFSGuestFS("img.qcow2", imgfmt='qcow2')
+        vfs.setup()
+        self.assertTrue(setup_os.called)
+
+    @mock.patch.object(vfsimpl.VFSGuestFS, 'setup_os')
+    def test_setup_mount_false(self, setup_os):
+        vfs = vfsimpl.VFSGuestFS("img.qcow2", imgfmt='qcow2')
+        vfs.setup(mount=False)
+        self.assertFalse(setup_os.called)

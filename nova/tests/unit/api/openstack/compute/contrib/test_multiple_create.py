@@ -16,8 +16,7 @@
 import datetime
 import uuid
 
-from oslo.config import cfg
-from oslo.serialization import jsonutils
+from oslo_config import cfg
 import webob
 
 from nova.api.openstack.compute import plugins
@@ -123,9 +122,6 @@ class MultiCreateExtensionTestV21(test.TestCase):
         def project_get_networks(context, user_id):
             return dict(id='1', host='localhost')
 
-        def queue_get_for(context, *args):
-            return 'network_topic'
-
         fakes.stub_out_rate_limiting(self.stubs)
         fakes.stub_out_key_pair_funcs(self.stubs)
         fake.stub_out_image_service(self.stubs)
@@ -144,6 +140,7 @@ class MultiCreateExtensionTestV21(test.TestCase):
                        server_update)
         self.stubs.Set(manager.VlanManager, 'allocate_fixed_ip',
                        fake_method)
+        self.req = fakes.HTTPRequest.blank('')
 
     def _test_create_extra(self, params, no_image=False,
                            override_controller=None):
@@ -153,14 +150,12 @@ class MultiCreateExtensionTestV21(test.TestCase):
             server.pop('imageRef', None)
         server.update(params)
         body = dict(server=server)
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         if override_controller:
-            server = override_controller.create(req, body=body).obj['server']
+            server = override_controller.create(self.req,
+                                                body=body).obj['server']
         else:
-            server = self.controller.create(req, body=body).obj['server']
+            server = self.controller.create(self.req,
+                                            body=body).obj['server']
 
     def _check_multiple_create_extension_disabled(self, **kwargs):
         # NOTE: on v2.1 API, "create a server" API doesn't add the following
@@ -236,13 +231,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavorRef': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_instance_invalid_negative_max(self):
@@ -257,13 +248,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavorRef': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_instance_with_blank_min(self):
@@ -278,13 +265,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavor_ref': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_instance_with_blank_max(self):
@@ -299,13 +282,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavor_ref': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_instance_invalid_min_greater_than_max(self):
@@ -321,13 +300,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavorRef': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_instance_invalid_alpha_min(self):
@@ -342,13 +317,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavorRef': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_instance_invalid_alpha_max(self):
@@ -363,13 +334,9 @@ class MultiCreateExtensionTestV21(test.TestCase):
                 'flavorRef': flavor_ref,
             }
         }
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
                           self.controller.create,
-                          req,
+                          self.req,
                           body=body)
 
     def test_create_multiple_instances(self):
@@ -389,11 +356,7 @@ class MultiCreateExtensionTestV21(test.TestCase):
             }
         }
 
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body=body).obj
+        res = self.controller.create(self.req, body=body).obj
 
         self.assertEqual(FAKE_UUID, res["server"]["id"])
         self._check_admin_password_len(res["server"])
@@ -416,11 +379,7 @@ class MultiCreateExtensionTestV21(test.TestCase):
             }
         }
 
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body=body).obj
+        res = self.controller.create(self.req, body=body).obj
 
         self.assertEqual(FAKE_UUID, res["server"]["id"])
         self._check_admin_password_missing(res["server"])
@@ -452,11 +411,7 @@ class MultiCreateExtensionTestV21(test.TestCase):
             }
         }
 
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
-        res = self.controller.create(req, body=body)
+        res = self.controller.create(self.req, body=body)
         reservation_id = res.obj['reservation_id']
         self.assertNotEqual(reservation_id, "")
         self.assertIsNotNone(reservation_id)
@@ -531,12 +486,8 @@ class MultiCreateExtensionTestV21(test.TestCase):
             }
         }
 
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
-                          self.controller.create, req, body=body)
+                          self.controller.create, self.req, body=body)
 
     def test_create_multiple_instance_with_non_integer_min_count(self):
         image_href = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
@@ -552,12 +503,8 @@ class MultiCreateExtensionTestV21(test.TestCase):
             }
         }
 
-        req = fakes.HTTPRequest.blank('/servers')
-        req.method = 'POST'
-        req.body = jsonutils.dumps(body)
-        req.headers["content-type"] = "application/json"
         self.assertRaises(self.validation_error,
-                          self.controller.create, req, body=body)
+                          self.controller.create, self.req, body=body)
 
 
 class MultiCreateExtensionTestV2(MultiCreateExtensionTestV21):
@@ -616,8 +563,6 @@ class MultiCreateExtensionTestV2(MultiCreateExtensionTestV21):
                 "vm_state": "",
                 "root_device_name": inst.get('root_device_name', 'vda'),
                 "security_groups": inst['security_groups'],
-                "extra": {"pci_requests": None,
-                          "numa_topology": None},
             })
 
             self.instance_cache_by_id[instance['id']] = instance

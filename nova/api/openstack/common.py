@@ -13,18 +13,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import functools
 import itertools
 import os
 import re
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+import six
 import six.moves.urllib.parse as urlparse
 import webob
 from webob import exc
 
-from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
+from nova.api.validation import parameter_types
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
@@ -32,7 +34,6 @@ from nova import exception
 from nova.i18n import _
 from nova.i18n import _LE
 from nova.i18n import _LW
-from nova.openstack.common import log as logging
 from nova import quota
 
 osapi_opts = [
@@ -55,10 +56,8 @@ QUOTAS = quota.QUOTAS
 
 CONF.import_opt('enable', 'nova.cells.opts', group='cells')
 
-# NOTE(cyeoh): A common regexp for acceptable names (user supplied)
-# that we want all new extensions to conform to unless there is a very
-# good reason not to.
-VALID_NAME_REGEX = re.compile("^(?! )[\w. _-]+(?<! )$", re.UNICODE)
+VALID_NAME_REGEX = re.compile(parameter_types.valid_name_regex, re.UNICODE)
+
 
 XML_NS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
 
@@ -104,6 +103,7 @@ _STATE_MAP = {
     },
     vm_states.PAUSED: {
         'default': 'PAUSED',
+        task_states.MIGRATING: 'MIGRATING',
     },
     vm_states.SUSPENDED: {
         'default': 'SUSPENDED',
@@ -151,8 +151,8 @@ def task_and_vm_state_from_status(statuses):
     vm_states = set()
     task_states = set()
     lower_statuses = [status.lower() for status in statuses]
-    for state, task_map in _STATE_MAP.iteritems():
-        for task_state, mapped_state in task_map.iteritems():
+    for state, task_map in six.iteritems(_STATE_MAP):
+        for task_state, mapped_state in six.iteritems(task_map):
             status_string = mapped_state
             if status_string.lower() in lower_statuses:
                 vm_states.add(state)
@@ -334,7 +334,7 @@ def check_img_metadata_properties_quota(context, metadata):
 
     #  check the key length.
     if isinstance(metadata, dict):
-        for key, value in metadata.iteritems():
+        for key, value in six.iteritems(metadata):
             if len(key) == 0:
                 expl = _("Image metadata key cannot be blank")
                 raise webob.exc.HTTPBadRequest(explanation=expl)
@@ -350,26 +350,24 @@ def dict_to_query_str(params):
     # TODO(throughnothing): we should just use urllib.urlencode instead of this
     # But currently we don't work with urlencoded url's
     param_str = ""
-    for key, val in params.iteritems():
+    for key, val in six.iteritems(params):
         param_str = param_str + '='.join([str(key), str(val)]) + '&'
 
     return param_str.rstrip('&')
 
 
 def get_networks_for_instance_from_nw_info(nw_info):
-    networks = {}
+    networks = collections.OrderedDict()
     for vif in nw_info:
         ips = vif.fixed_ips()
         floaters = vif.floating_ips()
         label = vif['network']['label']
         if label not in networks:
             networks[label] = {'ips': [], 'floating_ips': []}
-
+        for ip in itertools.chain(ips, floaters):
+            ip['mac_address'] = vif['address']
         networks[label]['ips'].extend(ips)
         networks[label]['floating_ips'].extend(floaters)
-        for ip in itertools.chain(networks[label]['ips'],
-                                  networks[label]['floating_ips']):
-            ip['mac_address'] = vif['address']
     return networks
 
 
@@ -403,92 +401,16 @@ def raise_http_conflict_for_instance_invalid_state(exc, action, server_id):
     """
     attr = exc.kwargs.get('attr')
     state = exc.kwargs.get('state')
-    not_launched = exc.kwargs.get('not_launched')
-    if attr and state:
+    if attr is not None and state is not None:
         msg = _("Cannot '%(action)s' instance %(server_id)s while it is in "
                 "%(attr)s %(state)s") % {'action': action, 'attr': attr,
                                          'state': state,
                                          'server_id': server_id}
-    elif not_launched:
-        msg = _("Cannot '%(action)' instance %(server_id)s which has never "
-                "been active") % {'action': action, 'server_id': server_id}
     else:
         # At least give some meaningful message
         msg = _("Instance %(server_id)s is in an invalid state for "
                 "'%(action)s'") % {'action': action, 'server_id': server_id}
     raise webob.exc.HTTPConflict(explanation=msg)
-
-
-class MetadataDeserializer(wsgi.MetadataXMLDeserializer):
-    def deserialize(self, text):
-        dom = xmlutil.safe_minidom_parse_string(text)
-        metadata_node = self.find_first_child_named(dom, "metadata")
-        metadata = self.extract_metadata(metadata_node)
-        return {'body': {'metadata': metadata}}
-
-
-class MetaItemDeserializer(wsgi.MetadataXMLDeserializer):
-    def deserialize(self, text):
-        dom = xmlutil.safe_minidom_parse_string(text)
-        metadata_item = self.extract_metadata(dom)
-        return {'body': {'meta': metadata_item}}
-
-
-class MetadataXMLDeserializer(wsgi.XMLDeserializer):
-
-    def extract_metadata(self, metadata_node):
-        """Marshal the metadata attribute of a parsed request."""
-        if metadata_node is None:
-            return {}
-        metadata = {}
-        for meta_node in self.find_children_named(metadata_node, "meta"):
-            key = meta_node.getAttribute("key")
-            metadata[key] = self.extract_text(meta_node)
-        return metadata
-
-    def _extract_metadata_container(self, datastring):
-        dom = xmlutil.safe_minidom_parse_string(datastring)
-        metadata_node = self.find_first_child_named(dom, "metadata")
-        metadata = self.extract_metadata(metadata_node)
-        return {'body': {'metadata': metadata}}
-
-    def create(self, datastring):
-        return self._extract_metadata_container(datastring)
-
-    def update_all(self, datastring):
-        return self._extract_metadata_container(datastring)
-
-    def update(self, datastring):
-        dom = xmlutil.safe_minidom_parse_string(datastring)
-        metadata_item = self.extract_metadata(dom)
-        return {'body': {'meta': metadata_item}}
-
-
-metadata_nsmap = {None: xmlutil.XMLNS_V11}
-
-
-class MetaItemTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        sel = xmlutil.Selector('meta', xmlutil.get_items, 0)
-        root = xmlutil.TemplateElement('meta', selector=sel)
-        root.set('key', 0)
-        root.text = 1
-        return xmlutil.MasterTemplate(root, 1, nsmap=metadata_nsmap)
-
-
-class MetadataTemplateElement(xmlutil.TemplateElement):
-    def will_render(self, datum):
-        return True
-
-
-class MetadataTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = MetadataTemplateElement('metadata', selector='metadata')
-        elem = xmlutil.SubTemplateElement(root, 'meta',
-                                          selector=xmlutil.get_items)
-        elem.set('key', 0)
-        elem.text = 1
-        return xmlutil.MasterTemplate(root, 1, nsmap=metadata_nsmap)
 
 
 def check_snapshots_enabled(f):
@@ -604,12 +526,11 @@ class ViewBuilder(object):
                                         CONF.osapi_compute_link_prefix)
 
 
-def get_instance(compute_api, context, instance_id, want_objects=False,
-                 expected_attrs=None):
+def get_instance(compute_api, context, instance_id, expected_attrs=None):
     """Fetch an instance from the compute API, handling error checking."""
     try:
         return compute_api.get(context, instance_id,
-                               want_objects=want_objects,
+                               want_objects=True,
                                expected_attrs=expected_attrs)
     except exception.InstanceNotFound as e:
         raise exc.HTTPNotFound(explanation=e.format_message())

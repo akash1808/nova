@@ -12,8 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from collections import OrderedDict
 import os
-import sys
+
+import fixtures
 
 from nova import exception
 from nova import test
@@ -23,14 +25,13 @@ from nova.virt.disk.vfs import guestfs as vfsguestfs
 
 
 class VirtDiskTest(test.NoDBTestCase):
-
     def setUp(self):
         super(VirtDiskTest, self).setUp()
-        sys.modules['guestfs'] = fakeguestfs
-        vfsguestfs.guestfs = fakeguestfs
+        self.useFixture(
+                fixtures.MonkeyPatch('nova.virt.disk.vfs.guestfs.guestfs',
+                                     fakeguestfs))
 
     def test_inject_data(self):
-
         self.assertTrue(diskapi.inject_data("/some/file", use_cow=True))
 
         self.assertTrue(diskapi.inject_data("/some/file",
@@ -147,12 +148,13 @@ class VirtDiskTest(test.NoDBTestCase):
     def test_inject_metadata(self):
         vfs = vfsguestfs.VFSGuestFS("/some/file", "qcow2")
         vfs.setup()
-
-        diskapi._inject_metadata_into_fs({"foo": "bar", "eek": "wizz"}, vfs)
+        metadata = {"foo": "bar", "eek": "wizz"}
+        metadata = OrderedDict(sorted(metadata.items()))
+        diskapi._inject_metadata_into_fs(metadata, vfs)
 
         self.assertIn("/meta.js", vfs.handle.files)
-        self.assertEqual({'content': '{"foo": "bar", ' +
-                                     '"eek": "wizz"}',
+        self.assertEqual({'content': '{"eek": "wizz", ' +
+                                     '"foo": "bar"}',
                           'gid': 100,
                           'isdir': False,
                           'mode': 0o700,

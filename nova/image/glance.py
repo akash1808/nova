@@ -25,17 +25,18 @@ import time
 
 import glanceclient
 import glanceclient.exc
-from oslo.config import cfg
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import netutils
+from oslo_utils import timeutils
 import six
+from six.moves import range
 import six.moves.urllib.parse as urlparse
 
 from nova import exception
 from nova.i18n import _, _LE
 import nova.image.download as image_xfers
-from nova.openstack.common import log as logging
-from nova import utils
 
 
 glance_opts = [
@@ -47,6 +48,7 @@ glance_opts = [
                help='Default glance port'),
     cfg.StrOpt('protocol',
                 default='http',
+                choices=('http', 'https'),
                 help='Default protocol to use when connecting to glance. '
                      'Set to https for SSL.'),
     cfg.ListOpt('api_servers',
@@ -79,7 +81,7 @@ CONF.import_group('ssl', 'nova.openstack.common.sslutils')
 def generate_glance_url():
     """Generate the URL to glance."""
     glance_host = CONF.glance.host
-    if utils.is_valid_ipv6(glance_host):
+    if netutils.is_valid_ipv6(glance_host):
         glance_host = '[%s]' % glance_host
     return "%s://%s:%d" % (CONF.glance.protocol, glance_host,
                            CONF.glance.port)
@@ -140,7 +142,7 @@ def _create_glance_client(context, host, port, use_ssl, version=1):
         # header 'X-Auth-Token' and 'token'
         params['token'] = context.auth_token
         params['identity_headers'] = generate_identity_headers(context)
-    if utils.is_valid_ipv6(host):
+    if netutils.is_valid_ipv6(host):
         # if so, it is ipv6 address, need to wrap it with '[]'
         host = '[%s]' % host
     endpoint = '%s://%s:%s' % (scheme, host, port)
@@ -198,7 +200,7 @@ class GlanceClientWrapper(object):
         """Create a client that will be used for one call."""
         if self.api_servers is None:
             self.api_servers = get_api_servers()
-        self.host, self.port, self.use_ssl = self.api_servers.next()
+        self.host, self.port, self.use_ssl = next(self.api_servers)
         return _create_glance_client(context,
                                      self.host, self.port,
                                      self.use_ssl, version)
@@ -212,7 +214,7 @@ class GlanceClientWrapper(object):
                 glanceclient.exc.CommunicationError)
         num_attempts = 1 + CONF.glance.num_retries
 
-        for attempt in xrange(1, num_attempts + 1):
+        for attempt in range(1, num_attempts + 1):
             client = self.client or self._create_onetime_client(context,
                                                                 version)
             try:
@@ -251,7 +253,7 @@ class GlanceImageService(object):
         self._download_handlers = {}
         download_modules = image_xfers.load_transfer_modules()
 
-        for scheme, mod in download_modules.iteritems():
+        for scheme, mod in six.iteritems(download_modules):
             if scheme not in CONF.glance.allowed_direct_url_schemes:
                 continue
 
@@ -343,8 +345,8 @@ class GlanceImageService(object):
                                 "using %s") % o.scheme
                         LOG.info(msg)
                         return
-                    except Exception as ex:
-                        LOG.exception(ex)
+                    except Exception:
+                        LOG.exception(_LE("Download image error"))
 
         try:
             image_chunks = self._client.call(context, 1, 'data', image_id)
@@ -588,14 +590,14 @@ def _reraise_translated_image_exception(image_id):
     """Transform the exception for the image but keep its traceback intact."""
     exc_type, exc_value, exc_trace = sys.exc_info()
     new_exc = _translate_image_exception(image_id, exc_value)
-    raise new_exc, None, exc_trace
+    six.reraise(new_exc, None, exc_trace)
 
 
 def _reraise_translated_exception():
     """Transform the exception but keep its traceback intact."""
     exc_type, exc_value, exc_trace = sys.exc_info()
     new_exc = _translate_plain_exception(exc_value)
-    raise new_exc, None, exc_trace
+    six.reraise(new_exc, None, exc_trace)
 
 
 def _translate_image_exception(image_id, exc_value):

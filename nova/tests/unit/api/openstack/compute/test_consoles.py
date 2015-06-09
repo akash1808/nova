@@ -17,8 +17,7 @@
 import datetime
 import uuid as stdlib_uuid
 
-from lxml import etree
-from oslo.utils import timeutils
+from oslo_utils import timeutils
 import webob
 
 from nova.api.openstack.compute import consoles as consoles_v2
@@ -27,6 +26,8 @@ from nova.compute import vm_states
 from nova import console
 from nova import db
 from nova import exception
+from nova.openstack.common import policy as common_policy
+from nova import policy
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import matchers
@@ -264,50 +265,42 @@ class ConsolesControllerTestV21(test.NoDBTestCase):
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
                           req, self.uuid, '20')
 
+    def _test_fail_policy(self, rule, action, data=None):
+        rules = {
+            rule: common_policy.parse_rule("!"),
+        }
+
+        policy.set_rules(rules)
+        req = fakes.HTTPRequest.blank(self.url + '/20')
+
+        if data is not None:
+            self.assertRaises(exception.PolicyNotAuthorized, action,
+                              req, self.uuid, data)
+        else:
+            self.assertRaises(exception.PolicyNotAuthorized, action,
+                              req, self.uuid)
+
+    def test_delete_console_fail_policy(self):
+        self._test_fail_policy("os_compute_api:os-consoles:delete",
+                               self.controller.delete, data='20')
+
+    def test_create_console_fail_policy(self):
+        self._test_fail_policy("os_compute_api:os-consoles:create",
+                               self.controller.create, data='20')
+
+    def test_index_console_fail_policy(self):
+        self._test_fail_policy("os_compute_api:os-consoles:index",
+                               self.controller.index)
+
+    def test_show_console_fail_policy(self):
+        self._test_fail_policy("os_compute_api:os-consoles:show",
+                               self.controller.show, data='20')
+
 
 class ConsolesControllerTestV2(ConsolesControllerTestV21):
     def _set_up_controller(self):
         self.controller = consoles_v2.Controller()
 
-
-class TestConsolesXMLSerializer(test.NoDBTestCase):
-    def test_show(self):
-        fixture = {'console': {'id': 20,
-                               'password': 'fake_password',
-                               'port': 'fake_port',
-                               'host': 'fake_hostname',
-                               'console_type': 'fake_type'}}
-
-        output = consoles_v2.ConsoleTemplate().serialize(fixture)
-        res_tree = etree.XML(output)
-
-        self.assertEqual(res_tree.tag, 'console')
-        self.assertEqual(res_tree.xpath('id')[0].text, '20')
-        self.assertEqual(res_tree.xpath('port')[0].text, 'fake_port')
-        self.assertEqual(res_tree.xpath('host')[0].text, 'fake_hostname')
-        self.assertEqual(res_tree.xpath('password')[0].text, 'fake_password')
-        self.assertEqual(res_tree.xpath('console_type')[0].text, 'fake_type')
-
-    def test_index(self):
-        fixture = {'consoles': [{'console': {'id': 10,
-                                             'console_type': 'fake_type'}},
-                                {'console': {'id': 11,
-                                             'console_type': 'fake_type2'}}]}
-
-        output = consoles_v2.ConsolesTemplate().serialize(fixture)
-        res_tree = etree.XML(output)
-
-        self.assertEqual(res_tree.tag, 'consoles')
-        self.assertEqual(len(res_tree), 2)
-        self.assertEqual(res_tree[0].tag, 'console')
-        self.assertEqual(res_tree[1].tag, 'console')
-        self.assertEqual(len(res_tree[0]), 1)
-        self.assertEqual(res_tree[0][0].tag, 'console')
-        self.assertEqual(len(res_tree[1]), 1)
-        self.assertEqual(res_tree[1][0].tag, 'console')
-        self.assertEqual(res_tree[0][0].xpath('id')[0].text, '10')
-        self.assertEqual(res_tree[1][0].xpath('id')[0].text, '11')
-        self.assertEqual(res_tree[0][0].xpath('console_type')[0].text,
-                         'fake_type')
-        self.assertEqual(res_tree[1][0].xpath('console_type')[0].text,
-                         'fake_type2')
+    def _test_fail_policy(self, rule, action, data=None):
+        # V2 API don't have policy
+        pass

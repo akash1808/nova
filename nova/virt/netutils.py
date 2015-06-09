@@ -23,7 +23,7 @@ import os
 
 import jinja2
 import netaddr
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova.network import model
 from nova import paths
@@ -60,8 +60,8 @@ def _get_first_network(network, version):
     # of a list since we don't want to evaluate the whole list as we can
     # have a lot of subnets
     try:
-        return (i for i in network['subnets']
-                if i['version'] == version).next()
+        return next(i for i in network['subnets']
+                    if i['version'] == version)
     except StopIteration:
         pass
 
@@ -107,11 +107,13 @@ def get_injected_network_template(network_info, use_ipv6=None, template=None,
         if not network.get_meta('injected'):
             continue
 
+        hwaddress = vif.get('address')
         address = None
         netmask = None
         gateway = ''
         broadcast = None
         dns = None
+        routes = []
         if subnet_v4:
             if subnet_v4.get_meta('dhcp_server') is not None:
                 continue
@@ -124,6 +126,13 @@ def get_injected_network_template(network_info, use_ipv6=None, template=None,
                     gateway = subnet_v4['gateway']['address']
                 broadcast = str(subnet_v4.as_netaddr().broadcast)
                 dns = ' '.join([i['address'] for i in subnet_v4['dns']])
+                for route_ref in subnet_v4['routes']:
+                    (net, mask) = get_net_and_mask(route_ref['cidr'])
+                    route = {'gateway': str(route_ref['gateway']['address']),
+                             'cidr': str(route_ref['cidr']),
+                             'network': net,
+                             'netmask': mask}
+                    routes.append(route)
 
         address_v6 = None
         gateway_v6 = ''
@@ -144,11 +153,13 @@ def get_injected_network_template(network_info, use_ipv6=None, template=None,
                 dns_v6 = ' '.join([i['address'] for i in subnet_v6['dns']])
 
         net_info = {'name': 'eth%d' % ifc_num,
+                    'hwaddress': hwaddress,
                     'address': address,
                     'netmask': netmask,
                     'gateway': gateway,
                     'broadcast': broadcast,
                     'dns': dns,
+                    'routes': routes,
                     'address_v6': address_v6,
                     'gateway_v6': gateway_v6,
                     'netmask_v6': netmask_v6,
@@ -159,7 +170,7 @@ def get_injected_network_template(network_info, use_ipv6=None, template=None,
     if not nets:
         return
 
-    tmpl_path, tmpl_file = os.path.split(CONF.injected_network_template)
+    tmpl_path, tmpl_file = os.path.split(template)
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(tmpl_path),
                              trim_blocks=True)
     template = env.get_template(tmpl_file)

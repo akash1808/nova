@@ -13,7 +13,7 @@
 #    under the License.
 
 import netaddr
-from oslo.config import cfg
+from oslo_config import cfg
 import six
 import webob.exc
 
@@ -31,7 +31,7 @@ CONF.import_opt('public_interface', 'nova.network.linux_net')
 
 
 ALIAS = 'os-floating-ips-bulk'
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class FloatingIPBulkController(wsgi.Controller):

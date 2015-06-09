@@ -13,8 +13,8 @@
 #    under the License.
 
 import mock
-from oslo.serialization import jsonutils
-from oslo.utils import timeutils
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 
 from nova import db
 from nova import exception
@@ -22,6 +22,7 @@ from nova import objects
 from nova.objects import compute_node
 from nova.objects import hv_spec
 from nova.objects import service
+from nova.tests.unit import fake_pci_device_pools
 from nova.tests.unit.objects import test_objects
 
 NOW = timeutils.utcnow().replace(microsecond=0)
@@ -32,15 +33,20 @@ fake_stats_db_format = jsonutils.dumps(fake_stats)
 fake_host_ip = '127.0.0.1'
 fake_numa_topology = objects.NUMATopology(
         cells=[objects.NUMACell(id=0, cpuset=set([1, 2]), memory=512,
-                                cpu_usage=0, memory_usage=0),
+                                cpu_usage=0, memory_usage=0,
+                                mempages=[], pinned_cpus=set([]),
+                                siblings=[]),
                objects.NUMACell(id=1, cpuset=set([3, 4]), memory=512,
-                                cpu_usage=0, memory_usage=0)])
+                                cpu_usage=0, memory_usage=0,
+                                mempages=[], pinned_cpus=set([]),
+                                siblings=[])])
 fake_numa_topology_db_format = fake_numa_topology._to_json()
-fake_hv_spec = hv_spec.HVSpec(arch='foo', hv_type='bar', vm_mode='foobar')
+fake_hv_spec = hv_spec.HVSpec(arch='x86_64', hv_type='kvm', vm_mode='hvm')
 fake_supported_hv_specs = [fake_hv_spec]
 # for backward compatibility, each supported instance object
 # is stored as a list in the database
 fake_supported_hv_specs_db_format = jsonutils.dumps([fake_hv_spec.to_list()])
+fake_pci = jsonutils.dumps(fake_pci_device_pools.fake_pool_list_primitive)
 fake_compute_node = {
     'created_at': NOW,
     'updated_at': None,
@@ -69,6 +75,7 @@ fake_compute_node = {
     'host_ip': fake_host_ip,
     'numa_topology': fake_numa_topology_db_format,
     'supported_instances': fake_supported_hv_specs_db_format,
+    'pci_stats': fake_pci,
     }
 # FIXME(sbauza) : For compatibility checking, to be removed once we are sure
 # that all computes are running latest DB version with host field in it.
@@ -79,15 +86,22 @@ del fake_old_compute_node['host']
 class _TestComputeNodeObject(object):
     def supported_hv_specs_comparator(self, expected, obj_val):
         obj_val = [inst.to_list() for inst in obj_val]
-        self.json_comparator(expected, obj_val)
+        self.assertJsonEqual(expected, obj_val)
+
+    def pci_device_pools_comparator(self, expected, obj_val):
+        obj_val = obj_val.obj_to_primitive()
+        self.assertJsonEqual(expected, obj_val)
 
     def comparators(self):
-        return {'stats': self.json_comparator,
+        return {'stats': self.assertJsonEqual,
                 'host_ip': self.str_comparator,
-                'supported_hv_specs': self.supported_hv_specs_comparator}
+                'supported_hv_specs': self.supported_hv_specs_comparator,
+                'pci_device_pools': self.pci_device_pools_comparator,
+                }
 
     def subs(self):
-        return {'supported_hv_specs': 'supported_instances'}
+        return {'supported_hv_specs': 'supported_instances',
+                'pci_device_pools': 'pci_stats'}
 
     def test_get_by_id(self):
         self.mox.StubOutWithMock(db, 'compute_node_get')
@@ -116,9 +130,9 @@ class _TestComputeNodeObject(object):
                          comparators=self.comparators())
 
     def test_get_by_service_id(self):
-        self.mox.StubOutWithMock(db, 'compute_node_get_by_service_id')
-        db.compute_node_get_by_service_id(self.context, 456).AndReturn(
-            fake_compute_node)
+        self.mox.StubOutWithMock(db, 'compute_nodes_get_by_service_id')
+        db.compute_nodes_get_by_service_id(self.context, 456).AndReturn(
+            [fake_compute_node])
         self.mox.ReplayAll()
         compute = compute_node.ComputeNode.get_by_service_id(self.context, 456)
         self.compare_obj(compute, fake_compute_node,
@@ -136,7 +150,7 @@ class _TestComputeNodeObject(object):
                          comparators=self.comparators())
 
     @mock.patch('nova.objects.Service.get_by_id')
-    @mock.patch('nova.db.compute_node_get_by_service_id')
+    @mock.patch('nova.db.compute_nodes_get_by_service_id')
     @mock.patch('nova.objects.Service.get_by_compute_host')
     @mock.patch.object(db, 'compute_node_get_by_host_and_nodename')
     def test_get_by_host_and_nodename_with_old_compute(self, cn_get_by_h_and_n,
@@ -148,7 +162,7 @@ class _TestComputeNodeObject(object):
         fake_service = service.Service(id=123)
         fake_service.host = 'fake'
         svc_get_by_ch.return_value = fake_service
-        cn_get_by_svc_id.return_value = fake_old_compute_node
+        cn_get_by_svc_id.return_value = [fake_old_compute_node]
         svc_get_by_id.return_value = fake_service
 
         compute = compute_node.ComputeNode.get_by_host_and_nodename(
@@ -157,6 +171,80 @@ class _TestComputeNodeObject(object):
         self.compare_obj(compute, fake_compute_node,
                          subs=self.subs(),
                          comparators=self.comparators())
+
+    @mock.patch('nova.objects.Service.get_by_id')
+    @mock.patch('nova.db.compute_nodes_get_by_service_id')
+    @mock.patch('nova.objects.Service.get_by_compute_host')
+    @mock.patch.object(db, 'compute_node_get_by_host_and_nodename')
+    def test_get_by_host_and_nodename_not_found(self, cn_get_by_h_and_n,
+                                                svc_get_by_ch,
+                                                cn_get_by_svc_id,
+                                                svc_get_by_id):
+        cn_get_by_h_and_n.side_effect = exception.ComputeHostNotFound(
+            host='fake')
+        fake_service = service.Service(id=123)
+        fake_service.host = 'fake'
+        another_node = fake_old_compute_node.copy()
+        another_node['hypervisor_hostname'] = 'elsewhere'
+        svc_get_by_ch.return_value = fake_service
+        cn_get_by_svc_id.return_value = [another_node]
+        svc_get_by_id.return_value = fake_service
+
+        self.assertRaises(exception.ComputeHostNotFound,
+                          compute_node.ComputeNode.get_by_host_and_nodename,
+                          self.context, 'fake', 'vm.danplanet.com')
+
+    @mock.patch('nova.objects.Service.get_by_id')
+    @mock.patch('nova.db.compute_nodes_get_by_service_id')
+    @mock.patch('nova.objects.Service.get_by_compute_host')
+    @mock.patch.object(db, 'compute_node_get_by_host_and_nodename')
+    def test_get_by_host_and_nodename_good_and_bad(self, cn_get_by_h_and_n,
+                                                   svc_get_by_ch,
+                                                   cn_get_by_svc_id,
+                                                   svc_get_by_id):
+        cn_get_by_h_and_n.side_effect = exception.ComputeHostNotFound(
+            host='fake')
+        fake_service = service.Service(id=123)
+        fake_service.host = 'fake'
+        bad_node = fake_old_compute_node.copy()
+        bad_node['hypervisor_hostname'] = 'elsewhere'
+        good_node = fake_old_compute_node.copy()
+        svc_get_by_ch.return_value = fake_service
+        cn_get_by_svc_id.return_value = [bad_node, good_node]
+        svc_get_by_id.return_value = fake_service
+
+        compute = compute_node.ComputeNode.get_by_host_and_nodename(
+            self.context, 'fake', 'vm.danplanet.com')
+        # NOTE(sbauza): Result is still converted to new style Compute
+        self.compare_obj(compute, good_node,
+                         subs=self.subs(),
+                         comparators=self.comparators())
+
+    @mock.patch('nova.db.compute_node_get_all_by_host')
+    def test_get_first_node_by_host_for_old_compat(
+            self, cn_get_all_by_host):
+        another_node = fake_compute_node.copy()
+        another_node['hypervisor_hostname'] = 'neverland'
+        cn_get_all_by_host.return_value = [fake_compute_node, another_node]
+
+        compute = (
+            compute_node.ComputeNode.get_first_node_by_host_for_old_compat(
+                self.context, 'fake')
+        )
+        self.compare_obj(compute, fake_compute_node,
+                         subs=self.subs(),
+                         comparators=self.comparators())
+
+    @mock.patch('nova.objects.ComputeNodeList.get_all_by_host')
+    def test_get_first_node_by_host_for_old_compat_not_found(
+            self, cn_get_all_by_host):
+        cn_get_all_by_host.side_effect = exception.ComputeHostNotFound(
+            host='fake')
+
+        self.assertRaises(
+            exception.ComputeHostNotFound,
+            compute_node.ComputeNode.get_first_node_by_host_for_old_compat,
+            self.context, 'fake')
 
     def test_create(self):
         self.mox.StubOutWithMock(db, 'compute_node_create')
@@ -169,13 +257,13 @@ class _TestComputeNodeObject(object):
                 'supported_instances': fake_supported_hv_specs_db_format,
             }).AndReturn(fake_compute_node)
         self.mox.ReplayAll()
-        compute = compute_node.ComputeNode()
+        compute = compute_node.ComputeNode(context=self.context)
         compute.service_id = 456
         compute.stats = fake_stats
         # NOTE (pmurray): host_ip is coerced to an IPAddress
         compute.host_ip = fake_host_ip
         compute.supported_hv_specs = fake_supported_hv_specs
-        compute.create(self.context)
+        compute.create()
         self.compare_obj(compute, fake_compute_node,
                          subs=self.subs(),
                          comparators=self.comparators())
@@ -185,9 +273,9 @@ class _TestComputeNodeObject(object):
         db.compute_node_create(self.context, {'service_id': 456}).AndReturn(
             fake_compute_node)
         self.mox.ReplayAll()
-        compute = compute_node.ComputeNode()
+        compute = compute_node.ComputeNode(context=self.context)
         compute.service_id = 456
-        compute.create(self.context)
+        compute.create()
         self.assertRaises(exception.ObjectActionError, compute.create,
                           self.context)
 
@@ -202,14 +290,14 @@ class _TestComputeNodeObject(object):
                 'supported_instances': fake_supported_hv_specs_db_format,
             }).AndReturn(fake_compute_node)
         self.mox.ReplayAll()
-        compute = compute_node.ComputeNode()
+        compute = compute_node.ComputeNode(context=self.context)
         compute.id = 123
         compute.vcpus_used = 3
         compute.stats = fake_stats
         # NOTE (pmurray): host_ip is coerced to an IPAddress
         compute.host_ip = fake_host_ip
         compute.supported_hv_specs = fake_supported_hv_specs
-        compute.save(self.context)
+        compute.save()
         self.compare_obj(compute, fake_compute_node,
                          subs=self.subs(),
                          comparators=self.comparators())
@@ -217,8 +305,8 @@ class _TestComputeNodeObject(object):
     @mock.patch.object(db, 'compute_node_create',
                        return_value=fake_compute_node)
     def test_set_id_failure(self, db_mock):
-        compute = compute_node.ComputeNode()
-        compute.create(self.context)
+        compute = compute_node.ComputeNode(context=self.context)
+        compute.create()
         self.assertRaises(exception.ReadOnlyFieldError, setattr,
                           compute, 'id', 124)
 
@@ -226,9 +314,9 @@ class _TestComputeNodeObject(object):
         self.mox.StubOutWithMock(db, 'compute_node_delete')
         db.compute_node_delete(self.context, 123)
         self.mox.ReplayAll()
-        compute = compute_node.ComputeNode()
+        compute = compute_node.ComputeNode(context=self.context)
         compute.id = 123
-        compute.destroy(self.context)
+        compute.destroy()
 
     def test_service(self):
         self.mox.StubOutWithMock(service.Service, 'get_by_id')
@@ -264,9 +352,9 @@ class _TestComputeNodeObject(object):
                          subs=self.subs(),
                          comparators=self.comparators())
 
-    @mock.patch('nova.db.service_get')
-    def test_get_by_service(self, service_get):
-        service_get.return_value = {'compute_node': [fake_compute_node]}
+    @mock.patch('nova.db.compute_nodes_get_by_service_id')
+    def test_get_by_service(self, cn_get_by_svc_id):
+        cn_get_by_svc_id.return_value = [fake_compute_node]
         fake_service = service.Service(id=123)
         computes = compute_node.ComputeNodeList.get_by_service(self.context,
                                                                fake_service)
@@ -286,7 +374,7 @@ class _TestComputeNodeObject(object):
                          comparators=self.comparators())
 
     @mock.patch('nova.objects.Service.get_by_id')
-    @mock.patch('nova.db.compute_node_get_by_service_id')
+    @mock.patch('nova.db.compute_nodes_get_by_service_id')
     @mock.patch('nova.objects.Service.get_by_compute_host')
     @mock.patch('nova.db.compute_node_get_all_by_host')
     def test_get_all_by_host_with_old_compute(self, cn_get_all_by_host,
@@ -298,7 +386,7 @@ class _TestComputeNodeObject(object):
         fake_service = service.Service(id=123)
         fake_service.host = 'fake'
         svc_get_by_ch.return_value = fake_service
-        cn_get_by_svc_id.return_value = fake_old_compute_node
+        cn_get_by_svc_id.return_value = [fake_old_compute_node]
         svc_get_by_id.return_value = fake_service
 
         computes = compute_node.ComputeNodeList.get_all_by_host(self.context,
@@ -324,6 +412,12 @@ class _TestComputeNodeObject(object):
         compute = compute_node.ComputeNode()
         primitive = compute.obj_to_primitive(target_version='1.6')
         self.assertNotIn('host', primitive)
+
+    def test_compat_pci_device_pools(self):
+        compute = compute_node.ComputeNode()
+        compute.pci_device_pools = fake_pci_device_pools.fake_pool_list
+        primitive = compute.obj_to_primitive(target_version='1.8')
+        self.assertNotIn('pci_device_pools', primitive)
 
 
 class TestComputeNodeObject(test_objects._LocalTest,

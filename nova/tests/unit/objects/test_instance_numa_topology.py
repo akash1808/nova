@@ -10,10 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
 import uuid
 
 import mock
-from oslo.serialization import jsonutils
+from oslo_serialization import jsonutils
 
 from nova import exception
 from nova import objects
@@ -46,19 +47,25 @@ fake_old_db_topology = dict(fake_db_topology)  # copy
 fake_old_db_topology['numa_topology'] = jsonutils.dumps(fake_numa_topology)
 
 
+def get_fake_obj_numa_topology(context):
+    fake_obj_numa_topology_cpy = fake_obj_numa_topology.obj_clone()
+    fake_obj_numa_topology_cpy._context = context
+    return fake_obj_numa_topology_cpy
+
+
 class _TestInstanceNUMATopology(object):
     @mock.patch('nova.db.instance_extra_update_by_uuid')
     def test_create(self, mock_update):
-        topo_obj = fake_obj_numa_topology
+        topo_obj = get_fake_obj_numa_topology(self.context)
         topo_obj.instance_uuid = fake_db_topology['instance_uuid']
-        topo_obj.create(self.context)
+        topo_obj.create()
         self.assertEqual(1, len(mock_update.call_args_list))
 
     @mock.patch('nova.db.instance_extra_update_by_uuid')
     def test_save(self, mock_update):
-        topo_obj = fake_obj_numa_topology
+        topo_obj = get_fake_obj_numa_topology(self.context)
         topo_obj.instance_uuid = fake_db_topology['instance_uuid']
-        topo_obj._save(self.context)
+        topo_obj._save()
         self.assertEqual(1, len(mock_update.call_args_list))
 
     def _test_get_by_instance_uuid(self):
@@ -93,9 +100,13 @@ class _TestInstanceNUMATopology(object):
             self.context, 'fake_uuid')
 
     def test_siblings(self):
+        inst_cell = objects.InstanceNUMACell(
+                cpuset=set([0, 1, 2]))
+        self.assertEqual([], inst_cell.siblings)
+
         topo = objects.VirtCPUTopology(sockets=1, cores=3, threads=0)
         inst_cell = objects.InstanceNUMACell(
-                cpuset=set([0, 1, 2]), topology=topo)
+                cpuset=set([0, 1, 2]), cpu_topology=topo)
         self.assertEqual([], inst_cell.siblings)
 
         # One thread actually means no threads
@@ -129,6 +140,24 @@ class _TestInstanceNUMATopology(object):
                                              cpu_pinning=None)
         inst_cell.pin_vcpus((0, 14), (1, 15), (2, 16), (3, 17))
         self.assertEqual({0: 14, 1: 15, 2: 16, 3: 17}, inst_cell.cpu_pinning)
+
+    def test_default_behavior(self):
+        inst_cell = objects.InstanceNUMACell()
+        self.assertEqual(0, len(inst_cell.obj_get_changes()))
+
+    def test_cpu_pinning_requested_cell(self):
+        inst_cell = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
+                                             cpu_pinning=None)
+        self.assertFalse(inst_cell.cpu_pinning_requested)
+        inst_cell.cpu_pinning = {}
+        self.assertTrue(inst_cell.cpu_pinning_requested)
+
+    def test_cpu_pinning_requested(self):
+        fake_topo_obj = copy.deepcopy(fake_obj_numa_topology)
+        self.assertFalse(fake_topo_obj.cpu_pinning_requested)
+        for cell in fake_topo_obj.cells:
+            cell.cpu_pinning = dict(zip(*map(list, [cell.cpuset] * 2)))
+        self.assertTrue(fake_topo_obj.cpu_pinning_requested)
 
 
 class TestInstanceNUMATopology(test_objects._LocalTest,

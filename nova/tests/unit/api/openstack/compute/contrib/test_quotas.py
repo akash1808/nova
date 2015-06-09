@@ -16,14 +16,12 @@
 
 import copy
 
-from lxml import etree
 import mock
 import webob
 
 from nova.api.openstack.compute.contrib import quotas as quotas_v2
 from nova.api.openstack.compute.plugins.v3 import quota_sets as quotas_v21
 from nova.api.openstack import extensions
-from nova.api.openstack import wsgi
 from nova import context as context_maker
 from nova import exception
 from nova import quota
@@ -50,18 +48,6 @@ class BaseQuotaSetsTest(test.TestCase):
         # NOTE(oomichi): If a test is for v2.0 API, this method returns
         # True. Otherwise(v2.1 API test), returns False.
         return (self.plugin == quotas_v2)
-
-    def get_update_expected_response(self, base_body):
-        # NOTE(oomichi): "id" parameter is added to a response of
-        # "update quota" API since v2.1 API, because it makes the
-        # API consistent and it is not backwards incompatible change.
-        # This method adds "id" for an expected body of a response.
-        if self._is_v20_api_test():
-            expected_body = base_body
-        else:
-            expected_body = copy.deepcopy(base_body)
-            expected_body['quota_set'].update({'id': 'update_me'})
-        return expected_body
 
     def setup_mock_for_show(self):
         if self._is_v20_api_test():
@@ -211,12 +197,41 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
             'cores': 50
         })
         body = {'quota_set': self.default_quotas}
-        expected_body = self.get_update_expected_response(body)
 
         req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
                                       use_admin_context=True)
         res_dict = self.controller.update(req, 'update_me', body=body)
-        self.assertEqual(expected_body, res_dict)
+        self.assertEqual(body, res_dict)
+
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_quotas_update_with_good_data_as_admin(self, mock_createlimit):
+        self.setup_mock_for_update()
+        self.default_quotas.update({})
+        body = {'quota_set': self.default_quotas}
+
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.controller.update(req, 'update_me', body=body)
+        self.assertEqual(len(self.default_quotas),
+                         len(mock_createlimit.mock_calls))
+
+    @mock.patch('nova.api.validation.validators._SchemaValidator.validate')
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_quotas_update_with_bad_data_as_admin(self, mock_createlimit,
+                                                  mock_validate):
+        self.setup_mock_for_update()
+        self.default_quotas.update({
+            'instances': 50,
+            'cores': -50
+        })
+        body = {'quota_set': self.default_quotas}
+
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body=body)
+        self.assertEqual(0,
+                         len(mock_createlimit.mock_calls))
 
     def test_quotas_update_zero_value_as_admin(self):
         self.setup_mock_for_update()
@@ -232,12 +247,11 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
         if self.include_server_group_quotas:
             body['quota_set']['server_groups'] = 10
             body['quota_set']['server_group_members'] = 10
-        expected_body = self.get_update_expected_response(body)
 
         req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
                                       use_admin_context=True)
         res_dict = self.controller.update(req, 'update_me', body=body)
-        self.assertEqual(expected_body, res_dict)
+        self.assertEqual(body, res_dict)
 
     def test_quotas_update_as_user(self):
         self.setup_mock_for_update()
@@ -323,71 +337,6 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
         self.assertEqual(202, self.get_delete_status_int(res))
 
 
-class QuotaXMLSerializerTest(test.TestCase):
-    def setUp(self):
-        super(QuotaXMLSerializerTest, self).setUp()
-        self.serializer = quotas_v2.QuotaTemplate()
-        self.deserializer = wsgi.XMLDeserializer()
-
-    def test_serializer(self):
-        exemplar = dict(quota_set=dict(
-                id='project_id',
-                metadata_items=10,
-                injected_file_path_bytes=255,
-                injected_file_content_bytes=20,
-                ram=50,
-                floating_ips=60,
-                fixed_ips=-1,
-                instances=70,
-                injected_files=80,
-                security_groups=10,
-                security_group_rules=20,
-                key_pairs=100,
-                cores=90))
-        text = self.serializer.serialize(exemplar)
-
-        tree = etree.fromstring(text)
-
-        self.assertEqual('quota_set', tree.tag)
-        self.assertEqual('project_id', tree.get('id'))
-        self.assertEqual(len(exemplar['quota_set']) - 1, len(tree))
-        for child in tree:
-            self.assertIn(child.tag, exemplar['quota_set'])
-            self.assertEqual(int(child.text), exemplar['quota_set'][child.tag])
-
-    def test_deserializer(self):
-        exemplar = dict(quota_set=dict(
-                metadata_items='10',
-                injected_file_content_bytes='20',
-                ram='50',
-                floating_ips='60',
-                fixed_ips='-1',
-                instances='70',
-                injected_files='80',
-                security_groups='10',
-                security_group_rules='20',
-                key_pairs='100',
-                cores='90'))
-        intext = ("<?xml version='1.0' encoding='UTF-8'?>\n"
-                  '<quota_set>'
-                  '<metadata_items>10</metadata_items>'
-                  '<injected_file_content_bytes>20'
-                  '</injected_file_content_bytes>'
-                  '<ram>50</ram>'
-                  '<floating_ips>60</floating_ips>'
-                  '<fixed_ips>-1</fixed_ips>'
-                  '<instances>70</instances>'
-                  '<injected_files>80</injected_files>'
-                  '<security_groups>10</security_groups>'
-                  '<security_group_rules>20</security_group_rules>'
-                  '<key_pairs>100</key_pairs>'
-                  '<cores>90</cores>'
-                  '</quota_set>')
-
-        result = self.deserializer.deserialize(intext)['body']
-        self.assertEqual(result, exemplar)
-
-
 class ExtendedQuotasTestV21(BaseQuotaSetsTest):
     plugin = quotas_v21
 
@@ -414,7 +363,7 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
         if usages:
             return self.fake_quotas
         else:
-            return dict((k, v['limit']) for k, v in self.fake_quotas.items())
+            return {k: v['limit'] for k, v in self.fake_quotas.items()}
 
     def fake_get_settable_quotas(self, context, project_id, user_id=None):
         return {
@@ -458,6 +407,33 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
         self.controller.update(req, 'update_me', body=body)
         mock.patch.stopall()
 
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_quotas_update_good_data(self, mock_createlimit):
+        body = {'quota_set': {'cores': 1,
+                              'instances': 1}}
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.controller.update(req, 'update_me', body=body)
+        self.assertEqual(2,
+                         len(mock_createlimit.mock_calls))
+
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_quotas_update_bad_data(self, mock_createlimit):
+        patcher = mock.patch.object(quota.QUOTAS, 'get_settable_quotas')
+        get_settable_quotas = patcher.start()
+
+        body = {'quota_set': {'cores': 10,
+                              'instances': 1}}
+
+        get_settable_quotas.side_effect = self.fake_get_settable_quotas
+        req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+                                      use_admin_context=True)
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body=body)
+        mock.patch.stopall()
+        self.assertEqual(0,
+                         len(mock_createlimit.mock_calls))
+
 
 class UserQuotasTestV21(BaseQuotaSetsTest):
     plugin = quotas_v21
@@ -500,13 +476,11 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
             body['quota_set']['server_groups'] = 10
             body['quota_set']['server_group_members'] = 10
 
-        expected_body = self.get_update_expected_response(body)
-
         url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
         req = fakes.HTTPRequest.blank(url, use_admin_context=True)
         res_dict = self.controller.update(req, 'update_me', body=body)
 
-        self.assertEqual(expected_body, res_dict)
+        self.assertEqual(body, res_dict)
 
     def test_user_quotas_update_as_user(self):
         self.setup_mock_for_update()
@@ -556,6 +530,31 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
         res = self.controller.delete(self.req, 1234)
         self.mox.VerifyAll()
         self.assertEqual(202, self.get_delete_status_int(res))
+
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_user_quotas_update_good_data(self, mock_createlimit):
+        self.setup_mock_for_update()
+        body = {'quota_set': {'instances': 1,
+                              'cores': 1}}
+
+        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
+        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
+        self.controller.update(req, 'update_me', body=body)
+        self.assertEqual(2,
+                         len(mock_createlimit.mock_calls))
+
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_user_quotas_update_bad_data(self, mock_createlimit):
+        self.setup_mock_for_update()
+        body = {'quota_set': {'instances': 20,
+                              'cores': 1}}
+
+        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
+        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          req, 'update_me', body=body)
+        self.assertEqual(0,
+                         len(mock_createlimit.mock_calls))
 
 
 class QuotaSetsTestV2(QuotaSetsTestV21):

@@ -13,16 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import six
 import webob
 
+from nova.api.openstack.compute.schemas.v3 import quota_classes
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
+from nova.api import validation
 import nova.context
 from nova import db
 from nova import exception
-from nova.i18n import _
 from nova import quota
-from nova import utils
 
 
 QUOTAS = quota.QUOTAS
@@ -33,7 +34,7 @@ EXTENDED_QUOTAS = {'server_groups': 'os-server-group-quotas',
                    'server_group_members': 'os-server-group-quotas'}
 
 
-authorize = extensions.extension_authorizer('compute', 'v3:' + ALIAS)
+authorize = extensions.os_compute_authorizer(ALIAS)
 
 
 class QuotaClassSetsController(wsgi.Controller):
@@ -72,35 +73,14 @@ class QuotaClassSetsController(wsgi.Controller):
         except exception.Forbidden:
             raise webob.exc.HTTPForbidden()
 
-    @extensions.expected_errors((400, 403))
+    @extensions.expected_errors((403))
+    @validation.schema(quota_classes.update)
     def update(self, req, id, body):
         context = req.environ['nova.context']
         authorize(context)
         quota_class = id
-        bad_keys = []
 
-        if not self.is_valid_body(body, 'quota_class_set'):
-            msg = _("quota_class_set not specified")
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-        quota_class_set = body['quota_class_set']
-        for key in quota_class_set.keys():
-            if key not in self.supported_quotas:
-                bad_keys.append(key)
-                continue
-            try:
-                value = utils.validate_integer(
-                        body['quota_class_set'][key], key)
-            except exception.InvalidInput as e:
-                raise webob.exc.HTTPBadRequest(
-                    explanation=e.format_message())
-
-        if bad_keys:
-            msg = _("Bad key(s) %s in quota_set") % ",".join(bad_keys)
-            raise webob.exc.HTTPBadRequest(explanation=msg)
-
-        for key in quota_class_set.keys():
-            value = utils.validate_integer(
-                        body['quota_class_set'][key], key)
+        for key, value in six.iteritems(body['quota_class_set']):
             try:
                 db.quota_class_update(context, quota_class, key, value)
             except exception.QuotaClassNotFound:

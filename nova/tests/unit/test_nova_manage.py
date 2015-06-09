@@ -23,11 +23,14 @@ from nova.cmd import manage
 from nova import context
 from nova import db
 from nova.db import migration
+from nova.db.sqlalchemy import migration as sqla_migration
 from nova import exception
-from nova.i18n import _
+from nova import objects
 from nova import test
 from nova.tests.unit.db import fakes as db_fakes
+from nova.tests.unit import fake_instance
 from nova.tests.unit.objects import test_network
+from nova.tests.unit import test_flavors
 
 
 class FixedIpCommandsTestCase(test.TestCase):
@@ -217,15 +220,15 @@ class NetworkCommandsTestCase(test.TestCase):
         _fmt = "\t".join(["%(id)-5s", "%(cidr)-18s", "%(cidr_v6)-15s",
                           "%(dhcp_start)-15s", "%(dns1)-15s", "%(dns2)-15s",
                           "%(vlan)-15s", "%(project_id)-15s", "%(uuid)-15s"])
-        head = _fmt % {'id': _('id'),
-                       'cidr': _('IPv4'),
-                       'cidr_v6': _('IPv6'),
-                       'dhcp_start': _('start address'),
-                       'dns1': _('DNS1'),
-                       'dns2': _('DNS2'),
-                       'vlan': _('VlanID'),
-                       'project_id': _('project'),
-                       'uuid': _("uuid")}
+        head = _fmt % {'id': 'id',
+                       'cidr': 'IPv4',
+                       'cidr_v6': 'IPv6',
+                       'dhcp_start': 'start address',
+                       'dns1': 'DNS1',
+                       'dns2': 'DNS2',
+                       'vlan': 'VlanID',
+                       'project_id': 'project',
+                       'uuid': "uuid"}
         body = _fmt % {'id': self.net['id'],
                        'cidr': self.net['cidr'],
                        'cidr_v6': self.net['cidr_v6'],
@@ -323,10 +326,53 @@ class ProjectCommandsTestCase(test.TestCase):
         sys.stdout = sys.__stdout__
         result = output.getvalue()
         print_format = "%-36s %-10s" % ('instances', 'unlimited')
-        self.assertEqual((print_format in result), True)
+        self.assertIn(print_format, result)
 
     def test_quota_update_invalid_key(self):
         self.assertEqual(2, self.commands.quota('admin', 'volumes1', '10'))
+
+
+class VmCommandsTestCase(test.TestCase):
+    def setUp(self):
+        super(VmCommandsTestCase, self).setUp()
+        self.commands = manage.VmCommands()
+        self.fake_flavor = objects.Flavor(**test_flavors.DEFAULT_FLAVORS[0])
+
+    def test_list_without_host(self):
+        output = StringIO.StringIO()
+        sys.stdout = output
+        with mock.patch.object(objects.InstanceList, 'get_by_filters') as get:
+            get.return_value = objects.InstanceList(
+                objects=[fake_instance.fake_instance_obj(
+                    context.get_admin_context(), host='foo-host',
+                    instance_type=self.fake_flavor,
+                    expected_attrs=('flavor'))])
+            self.commands.list()
+
+        sys.stdout = sys.__stdout__
+        result = output.getvalue()
+
+        self.assertIn('node', result)   # check the header line
+        self.assertIn('m1.tiny', result)    # flavor.name
+        self.assertIn('foo-host', result)
+
+    def test_list_with_host(self):
+        output = StringIO.StringIO()
+        sys.stdout = output
+        with mock.patch.object(objects.InstanceList, 'get_by_host') as get:
+            get.return_value = objects.InstanceList(
+                objects=[fake_instance.fake_instance_obj(
+                    context.get_admin_context(),
+                    instance_type=self.fake_flavor,
+                    expected_attrs=('flavor'))])
+            self.commands.list(host='fake-host')
+
+        sys.stdout = sys.__stdout__
+        result = output.getvalue()
+
+        self.assertIn('node', result)   # check the header line
+        self.assertIn('m1.tiny', result)    # flavor.name
+        self.assertIn('fake-host', result)
 
 
 class DBCommandsTestCase(test.TestCase):
@@ -366,6 +412,35 @@ class DBCommandsTestCase(test.TestCase):
 
     def test_null_instance_uuid_scan_delete(self):
         self._test_null_instance_uuid_scan(delete=True)
+
+    def test_migrate_flavor_data_negative(self):
+        self.assertEqual(1, self.commands.migrate_flavor_data(-1))
+
+    @mock.patch.object(sqla_migration, 'db_version', return_value=2)
+    def test_version(self, sqla_migrate):
+        self.commands.version()
+        sqla_migrate.assert_called_once_with(database='main')
+
+    @mock.patch.object(sqla_migration, 'db_sync')
+    def test_sync(self, sqla_sync):
+        self.commands.sync(version=4)
+        sqla_sync.assert_called_once_with(version=4, database='main')
+
+
+class ApiDbCommandsTestCase(test.TestCase):
+    def setUp(self):
+        super(ApiDbCommandsTestCase, self).setUp()
+        self.commands = manage.ApiDbCommands()
+
+    @mock.patch.object(sqla_migration, 'db_version', return_value=2)
+    def test_version(self, sqla_migrate):
+        self.commands.version()
+        sqla_migrate.assert_called_once_with(database='api')
+
+    @mock.patch.object(sqla_migration, 'db_sync')
+    def test_sync(self, sqla_sync):
+        self.commands.sync(version=4)
+        sqla_sync.assert_called_once_with(version=4, database='api')
 
 
 class ServiceCommandsTestCase(test.TestCase):
@@ -470,6 +545,29 @@ class CellCommandsTestCase(test.TestCase):
                              broker_hosts='127.0.0.1:5432,127.0.0.2:9999',
                              woffset=0, wscale=0,
                              username="guest", password="devstack")
+        exp_values = {'name': "test",
+                      'is_parent': False,
+                      'transport_url': cell_tp_url,
+                      'weight_offset': 0.0,
+                      'weight_scale': 0.0}
+        mock_db_cell_create.assert_called_once_with(ctxt, exp_values)
+
+    @mock.patch.object(context, 'get_admin_context')
+    @mock.patch.object(db, 'cell_create')
+    def test_create_broker_hosts_with_url_decoding_fix(self,
+                                                       mock_db_cell_create,
+                                                       mock_ctxt):
+        """Test the create function when broker_hosts is
+        passed
+        """
+        cell_tp_url = "fake://the=user:the=password@127.0.0.1:5432/"
+        ctxt = mock.sentinel
+        mock_ctxt.return_value = mock.sentinel
+        self.commands.create("test",
+                             broker_hosts='127.0.0.1:5432',
+                             woffset=0, wscale=0,
+                             username="the=user",
+                             password="the=password")
         exp_values = {'name': "test",
                       'is_parent': False,
                       'transport_url': cell_tp_url,

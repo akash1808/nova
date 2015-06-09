@@ -13,12 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from lxml import etree
-
 from nova.api.openstack.compute.contrib import floating_ip_pools as fipp_v2
 from nova.api.openstack.compute.plugins.v3 import floating_ip_pools as\
                                                       fipp_v21
 from nova import context
+from nova import exception
 from nova import network
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -30,7 +29,6 @@ def fake_get_floating_ip_pools(self, context):
 
 class FloatingIpPoolTestV21(test.NoDBTestCase):
     floating_ip_pools = fipp_v21
-    url = '/v2/fake/os-floating-ip-pools'
 
     def setUp(self):
         super(FloatingIpPoolTestV21, self).setUp()
@@ -39,6 +37,7 @@ class FloatingIpPoolTestV21(test.NoDBTestCase):
 
         self.context = context.RequestContext('fake', 'fake')
         self.controller = self.floating_ip_pools.FloatingIPPoolsController()
+        self.req = fakes.HTTPRequest.blank('')
 
     def test_translate_floating_ip_pools_view(self):
         pools = fake_get_floating_ip_pools(None, self.context)
@@ -50,8 +49,7 @@ class FloatingIpPoolTestV21(test.NoDBTestCase):
                          pools[1])
 
     def test_floating_ips_pools_list(self):
-        req = fakes.HTTPRequest.blank(self.url)
-        res_dict = self.controller.index(req)
+        res_dict = self.controller.index(self.req)
 
         pools = fake_get_floating_ip_pools(None, self.context)
         response = {'floating_ip_pools': [{'name': name} for name in pools]}
@@ -62,22 +60,19 @@ class FloatingIpPoolTestV2(FloatingIpPoolTestV21):
     floating_ip_pools = fipp_v2
 
 
-class FloatingIpPoolSerializerTestV2(test.NoDBTestCase):
-    floating_ip_pools = fipp_v2
+class FloatingIPPoolsPolicyEnforcementV21(test.NoDBTestCase):
 
-    def test_index_serializer(self):
-        serializer = self.floating_ip_pools.FloatingIPPoolsTemplate()
-        text = serializer.serialize(dict(
-                floating_ip_pools=[
-                    dict(name='nova'),
-                    dict(name='other')
-                ]))
+    def setUp(self):
+        super(FloatingIPPoolsPolicyEnforcementV21, self).setUp()
+        self.controller = fipp_v21.FloatingIPPoolsController()
+        self.req = fakes.HTTPRequest.blank('')
 
-        tree = etree.fromstring(text)
-
-        self.assertEqual('floating_ip_pools', tree.tag)
-        self.assertEqual(2, len(tree))
-        self.assertEqual('floating_ip_pool', tree[0].tag)
-        self.assertEqual('floating_ip_pool', tree[1].tag)
-        self.assertEqual('nova', tree[0].get('name'))
-        self.assertEqual('other', tree[1].get('name'))
+    def test_change_password_policy_failed(self):
+        rule_name = "os_compute_api:os-floating-ip-pools"
+        rule = {rule_name: "project:non_fake"}
+        self.policy.set_rules(rule)
+        exc = self.assertRaises(
+            exception.PolicyNotAuthorized, self.controller.index, self.req)
+        self.assertEqual(
+            "Policy doesn't allow %s to be performed." %
+            rule_name, exc.format_message())

@@ -18,108 +18,31 @@ import hashlib
 import importlib
 import os
 import os.path
+import socket
 import StringIO
+import struct
 import tempfile
 
+import eventlet
 import mock
 from mox3 import mox
 import netaddr
-from oslo.config import cfg
-from oslo.utils import timeutils
 from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_context import context as common_context
+from oslo_context import fixture as context_fixture
+from oslo_utils import encodeutils
+from oslo_utils import timeutils
+import six
+
 
 import nova
+from nova import context
 from nova import exception
 from nova import test
 from nova import utils
 
 CONF = cfg.CONF
-
-
-class GetMyIP4AddressTestCase(test.NoDBTestCase):
-    def test_get_my_ipv4_address_with_no_ipv4(self):
-        response = """172.16.0.0/16 via 172.16.251.13 dev tun1
-172.16.251.1 via 172.16.251.13 dev tun1
-172.16.251.13 dev tun1  proto kernel  scope link  src 172.16.251.14
-172.24.0.0/16 via 172.16.251.13 dev tun1
-192.168.122.0/24 dev virbr0  proto kernel  scope link  src 192.168.122.1"""
-
-        def fake_execute(*args, **kwargs):
-            return response, None
-
-        self.stubs.Set(utils, 'execute', fake_execute)
-        address = utils.get_my_ipv4_address()
-        self.assertEqual(address, '127.0.0.1')
-
-    def test_get_my_ipv4_address_bad_process(self):
-        def fake_execute(*args, **kwargs):
-            raise processutils.ProcessExecutionError()
-
-        self.stubs.Set(utils, 'execute', fake_execute)
-        address = utils.get_my_ipv4_address()
-        self.assertEqual(address, '127.0.0.1')
-
-    def test_get_my_ipv4_address_with_single_interface(self):
-        response_route = """default via 192.168.1.1 dev wlan0  proto static
-192.168.1.0/24 dev wlan0  proto kernel  scope link  src 192.168.1.137  metric 9
-"""
-        response_addr = """
-1: lo    inet 127.0.0.1/8 scope host lo
-3: wlan0    inet 192.168.1.137/24 brd 192.168.1.255 scope global wlan0
-"""
-
-        def fake_execute(*args, **kwargs):
-            if 'route' in args:
-                return response_route, None
-            return response_addr, None
-
-        self.stubs.Set(utils, 'execute', fake_execute)
-        address = utils.get_my_ipv4_address()
-        self.assertEqual(address, '192.168.1.137')
-
-    def test_get_my_ipv4_address_with_multi_ipv4_on_single_interface(self):
-        response_route = """
-172.18.56.0/24 dev customer  proto kernel  scope link  src 172.18.56.22
-169.254.0.0/16 dev customer  scope link  metric 1031
-default via 172.18.56.1 dev customer
-"""
-        response_addr = (""
-"31: customer    inet 172.18.56.22/24 brd 172.18.56.255 scope global"
-" customer\n"
-"31: customer    inet 172.18.56.32/24 brd 172.18.56.255 scope global "
-"secondary customer")
-
-        def fake_execute(*args, **kwargs):
-            if 'route' in args:
-                return response_route, None
-            return response_addr, None
-
-        self.stubs.Set(utils, 'execute', fake_execute)
-        address = utils.get_my_ipv4_address()
-        self.assertEqual(address, '172.18.56.22')
-
-    def test_get_my_ipv4_address_with_multiple_interfaces(self):
-        response_route = """
-169.1.9.0/24 dev eth1  proto kernel  scope link  src 169.1.9.10
-172.17.248.0/21 dev eth0  proto kernel  scope link  src 172.17.255.9
-169.254.0.0/16 dev eth0  scope link  metric 1002
-169.254.0.0/16 dev eth1  scope link  metric 1003
-default via 172.17.248.1 dev eth0  proto static
-"""
-        response_addr = """
-1: lo    inet 127.0.0.1/8 scope host lo
-2: eth0    inet 172.17.255.9/21 brd 172.17.255.255 scope global eth0
-3: eth1    inet 169.1.9.10/24 scope global eth1
-"""
-
-        def fake_execute(*args, **kwargs):
-            if 'route' in args:
-                return response_route, None
-            return response_addr, None
-
-        self.stubs.Set(utils, 'execute', fake_execute)
-        address = utils.get_my_ipv4_address()
-        self.assertEqual(address, '172.17.255.9')
 
 
 class GenericUtilsTestCase(test.NoDBTestCase):
@@ -240,24 +163,6 @@ class GenericUtilsTestCase(test.NoDBTestCase):
         self.assertEqual('&lt;', utils.xhtml_escape('<'))
         self.assertEqual('&lt;foo&gt;', utils.xhtml_escape('<foo>'))
 
-    def test_is_valid_ipv4(self):
-        self.assertTrue(utils.is_valid_ipv4('127.0.0.1'))
-        self.assertFalse(utils.is_valid_ipv4('::1'))
-        self.assertFalse(utils.is_valid_ipv4('bacon'))
-        self.assertFalse(utils.is_valid_ipv4(""))
-        self.assertFalse(utils.is_valid_ipv4(10))
-
-    def test_is_valid_ipv6(self):
-        self.assertTrue(utils.is_valid_ipv6("::1"))
-        self.assertTrue(utils.is_valid_ipv6(
-                            "abcd:ef01:2345:6789:abcd:ef01:192.168.254.254"))
-        self.assertTrue(utils.is_valid_ipv6(
-                                    "0000:0000:0000:0000:0000:0000:0000:0001"))
-        self.assertFalse(utils.is_valid_ipv6("foo"))
-        self.assertFalse(utils.is_valid_ipv6("127.0.0.1"))
-        self.assertFalse(utils.is_valid_ipv6(""))
-        self.assertFalse(utils.is_valid_ipv6(10))
-
     def test_is_valid_ipv6_cidr(self):
         self.assertTrue(utils.is_valid_ipv6_cidr("2600::/64"))
         self.assertTrue(utils.is_valid_ipv6_cidr(
@@ -295,11 +200,88 @@ class GenericUtilsTestCase(test.NoDBTestCase):
                           utils.get_shortened_ipv6_cidr,
                           "failure")
 
+    def test_safe_ip_format(self):
+        self.assertEqual("[::1]", utils.safe_ip_format("::1"))
+        self.assertEqual("127.0.0.1", utils.safe_ip_format("127.0.0.1"))
+        self.assertEqual("[::ffff:127.0.0.1]", utils.safe_ip_format(
+                         "::ffff:127.0.0.1"))
+        self.assertEqual("localhost", utils.safe_ip_format("localhost"))
+
     def test_get_hash_str(self):
         base_str = "foo"
         value = hashlib.md5(base_str).hexdigest()
         self.assertEqual(
             value, utils.get_hash_str(base_str))
+
+    def test_use_rootwrap(self):
+        self.flags(disable_rootwrap=False, group='workarounds')
+        self.flags(rootwrap_config='foo')
+        cmd = utils._get_root_helper()
+        self.assertEqual('sudo nova-rootwrap foo', cmd)
+
+    def test_use_sudo(self):
+        self.flags(disable_rootwrap=True, group='workarounds')
+        cmd = utils._get_root_helper()
+        self.assertEqual('sudo', cmd)
+
+    def test_ssh_execute(self):
+        expected_args = ('ssh', '-o', 'BatchMode=yes',
+                         'remotehost', 'ls', '-l')
+        with mock.patch('nova.utils.execute') as mock_method:
+            utils.ssh_execute('remotehost', 'ls', '-l')
+        mock_method.assert_called_once_with(*expected_args)
+
+
+class VPNPingTestCase(test.NoDBTestCase):
+    """Unit tests for utils.vpn_ping()."""
+    def setUp(self):
+        super(VPNPingTestCase, self).setUp()
+        self.port = 'fake'
+        self.address = 'fake'
+        self.session_id = 0x1234
+        self.fmt = '!BQxxxxxQxxxx'
+
+    def fake_reply_packet(self, pkt_id=0x40):
+        return struct.pack(self.fmt, pkt_id, 0x0, self.session_id)
+
+    def setup_socket(sefl, mock_socket, return_value, side_effect=None):
+        socket_obj = mock.MagicMock()
+        if side_effect is not None:
+            socket_obj.recv.side_effect = side_effect
+        else:
+            socket_obj.recv.return_value = return_value
+        mock_socket.return_value = socket_obj
+
+    @mock.patch.object(socket, 'socket')
+    def test_vpn_ping_timeout(self, mock_socket):
+        """Server doesn't reply within timeout."""
+        self.setup_socket(mock_socket, None, socket.timeout)
+        rc = utils.vpn_ping(self.address, self.port,
+                            session_id=self.session_id)
+        self.assertFalse(rc)
+
+    @mock.patch.object(socket, 'socket')
+    def test_vpn_ping_bad_len(self, mock_socket):
+        """Test a short/invalid server reply."""
+        self.setup_socket(mock_socket, 'fake_reply')
+        rc = utils.vpn_ping(self.address, self.port,
+                            session_id=self.session_id)
+        self.assertFalse(rc)
+
+    @mock.patch.object(socket, 'socket')
+    def test_vpn_ping_bad_id(self, mock_socket):
+        """Server sends an unknown packet ID."""
+        self.setup_socket(mock_socket, self.fake_reply_packet(pkt_id=0x41))
+        rc = utils.vpn_ping(self.address, self.port,
+                            session_id=self.session_id)
+        self.assertFalse(rc)
+
+    @mock.patch.object(socket, 'socket')
+    def test_vpn_ping_ok(self, mock_socket):
+        self.setup_socket(mock_socket, self.fake_reply_packet())
+        rc = utils.vpn_ping(self.address, self.port,
+                            session_id=self.session_id)
+        self.assertTrue(rc)
 
 
 class MonkeyPatchTestCase(test.NoDBTestCase):
@@ -593,27 +575,6 @@ class LastBytesTestCase(test.NoDBTestCase):
         self.assertEqual((content, 0), utils.last_bytes(flo, 1000))
 
 
-class IntLikeTestCase(test.NoDBTestCase):
-
-    def test_is_int_like(self):
-        self.assertTrue(utils.is_int_like(1))
-        self.assertTrue(utils.is_int_like("1"))
-        self.assertTrue(utils.is_int_like("514"))
-        self.assertTrue(utils.is_int_like("0"))
-
-        self.assertFalse(utils.is_int_like(1.1))
-        self.assertFalse(utils.is_int_like("1.1"))
-        self.assertFalse(utils.is_int_like("1.1.1"))
-        self.assertFalse(utils.is_int_like(None))
-        self.assertFalse(utils.is_int_like("0."))
-        self.assertFalse(utils.is_int_like("aaaaaa"))
-        self.assertFalse(utils.is_int_like("...."))
-        self.assertFalse(utils.is_int_like("1g"))
-        self.assertFalse(
-            utils.is_int_like("0cc3346e-9fef-4445-abe6-5d2b2690ec64"))
-        self.assertFalse(utils.is_int_like("a1"))
-
-
 class MetadataToDictTestCase(test.NoDBTestCase):
     def test_metadata_to_dict(self):
         self.assertEqual(utils.metadata_to_dict(
@@ -627,9 +588,9 @@ class MetadataToDictTestCase(test.NoDBTestCase):
     def test_dict_to_metadata(self):
         expected = [{'key': 'foo1', 'value': 'bar1'},
                     {'key': 'foo2', 'value': 'bar2'}]
-        self.assertEqual(utils.dict_to_metadata(dict(foo1='bar1',
-                                                     foo2='bar2')),
-                         expected)
+        self.assertEqual(sorted(utils.dict_to_metadata(dict(foo1='bar1',
+                                                     foo2='bar2'))),
+                         sorted(expected))
 
     def test_dict_to_metadata_empty(self):
         self.assertEqual(utils.dict_to_metadata({}), [])
@@ -865,7 +826,7 @@ class GetSystemMetadataFromImageTestCase(test.NoDBTestCase):
         sys_meta = utils.get_system_metadata_from_image(image)
 
         # Verify that we inherit all the image properties
-        for key, expected in image["properties"].iteritems():
+        for key, expected in six.iteritems(image["properties"]):
             sys_key = "%s%s" % (utils.SM_IMAGE_PROP_PREFIX, key)
             self.assertEqual(sys_meta[sys_key], expected)
 
@@ -922,7 +883,7 @@ class GetImageFromSystemMetadataTestCase(test.NoDBTestCase):
         # Verify that we inherit the rest of metadata as properties
         self.assertIn("properties", image)
 
-        for key, value in image["properties"].iteritems():
+        for key, value in six.iteritems(image["properties"]):
             sys_key = "%s%s" % (utils.SM_IMAGE_PROP_PREFIX, key)
             self.assertEqual(image["properties"][key], sys_meta[sys_key])
 
@@ -972,3 +933,154 @@ class ConstantTimeCompareTestCase(test.NoDBTestCase):
         self.assertTrue(utils.constant_time_compare("abcd1234", "abcd1234"))
         self.assertFalse(utils.constant_time_compare("abcd1234", "a"))
         self.assertFalse(utils.constant_time_compare("abcd1234", "ABCD234"))
+
+
+class ResourceFilterTestCase(test.NoDBTestCase):
+    def _assert_filtering(self, res_list, filts, expected_tags):
+        actual_tags = utils.filter_and_format_resource_metadata('instance',
+                res_list, filts, 'metadata')
+        self.assertJsonEqual(expected_tags, actual_tags)
+
+    def test_filter_and_format_resource_metadata(self):
+        # Create some tags
+        # One overlapping pair, and one different key value pair
+        # i1 : foo=bar, bax=wibble
+        # i2 : foo=bar, baz=quux
+
+        # resources
+        i1 = {
+                'uuid': '1',
+                'metadata': {'foo': 'bar', 'bax': 'wibble'},
+            }
+        i2 = {
+                'uuid': '2',
+                'metadata': {'foo': 'bar', 'baz': 'quux'},
+            }
+
+        # Resources list
+        rl = [i1, i2]
+
+        # tags
+        i11 = {'instance_id': '1', 'key': 'foo', 'value': 'bar'}
+        i12 = {'instance_id': '1', 'key': 'bax', 'value': 'wibble'}
+        i21 = {'instance_id': '2', 'key': 'foo', 'value': 'bar'}
+        i22 = {'instance_id': '2', 'key': 'baz', 'value': 'quux'}
+
+        # No filter
+        self._assert_filtering(rl, [], [i11, i12, i21, i22])
+        self._assert_filtering(rl, {}, [i11, i12, i21, i22])
+
+        # Key search
+
+        # Both should have tags with key 'foo' and value 'bar'
+        self._assert_filtering(rl, {'key': 'foo', 'value': 'bar'}, [i11, i21])
+
+        # Both should have tags with key 'foo'
+        self._assert_filtering(rl, {'key': 'foo'}, [i11, i21])
+
+        # Only i2 should have tags with key 'baz' and value 'quux'
+        self._assert_filtering(rl, {'key': 'baz', 'value': 'quux'}, [i22])
+
+        # Only i2 should have tags with value 'quux'
+        self._assert_filtering(rl, {'value': 'quux'}, [i22])
+
+        # Empty list should be returned when no tags match
+        self._assert_filtering(rl, {'key': 'split', 'value': 'banana'}, [])
+
+        # Multiple values
+
+        # Only i2 should have tags with key 'baz' and values in the set
+        # ['quux', 'wibble']
+        self._assert_filtering(rl, {'key': 'baz', 'value': ['quux', 'wibble']},
+                [i22])
+
+        # But when specified as two different filters, no tags should be
+        # returned. This is because, the filter will mean "return tags which
+        # have (key=baz AND value=quux) AND (key=baz AND value=wibble)
+        self._assert_filtering(rl, [{'key': 'baz', 'value': 'quux'},
+            {'key': 'baz', 'value': 'wibble'}], [])
+
+        # Test for regex
+        self._assert_filtering(rl, {'value': '\\Aqu..*\\Z(?s)'}, [i22])
+
+        # Make sure bug #1365887 is fixed
+        i1['metadata']['key3'] = 'a'
+        self._assert_filtering(rl, {'value': 'banana'}, [])
+
+
+class SafeTruncateTestCase(test.NoDBTestCase):
+    def test_exception_to_dict_with_long_message_3_bytes(self):
+        # Generate Chinese byte string whose length is 300. This Chinese UTF-8
+        # character occupies 3 bytes. After truncating, the byte string length
+        # should be 255.
+        msg = encodeutils.safe_decode('\xe8\xb5\xb5' * 100)
+        truncated_msg = utils.safe_truncate(msg, 255)
+        byte_message = encodeutils.safe_encode(truncated_msg)
+        self.assertEqual(255, len(byte_message))
+
+    def test_exception_to_dict_with_long_message_2_bytes(self):
+        # Generate Russian byte string whose length is 300. This Russian UTF-8
+        # character occupies 2 bytes. After truncating, the byte string length
+        # should be 254.
+        msg = encodeutils.safe_decode('\xd0\x92' * 150)
+        truncated_msg = utils.safe_truncate(msg, 255)
+        byte_message = encodeutils.safe_encode(truncated_msg)
+        self.assertEqual(254, len(byte_message))
+
+
+class SpawnNTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(SpawnNTestCase, self).setUp()
+        self.useFixture(context_fixture.ClearRequestContext())
+
+    def test_spawn_n_no_context(self):
+        self.assertIsNone(common_context.get_current())
+
+        def _fake_spawn(func, *args, **kwargs):
+            # call the method to ensure no error is raised
+            func(*args, **kwargs)
+            self.assertEqual('test', args[0])
+
+        def fake(arg):
+            pass
+
+        with mock.patch.object(eventlet, 'spawn_n', _fake_spawn):
+            utils.spawn_n(fake, 'test')
+        self.assertIsNone(common_context.get_current())
+
+    def test_spawn_n_context(self):
+        self.assertIsNone(common_context.get_current())
+        ctxt = context.RequestContext('user', 'project')
+
+        def _fake_spawn(func, *args, **kwargs):
+            # call the method to ensure no error is raised
+            func(*args, **kwargs)
+            self.assertEqual(ctxt, args[0])
+            self.assertEqual('test', kwargs['kwarg1'])
+
+        def fake(context, kwarg1=None):
+            pass
+
+        with mock.patch.object(eventlet, 'spawn_n', _fake_spawn):
+            utils.spawn_n(fake, ctxt, kwarg1='test')
+        self.assertEqual(ctxt, common_context.get_current())
+
+    def test_spawn_n_context_different_from_passed(self):
+        self.assertIsNone(common_context.get_current())
+        ctxt = context.RequestContext('user', 'project')
+        ctxt_passed = context.RequestContext('user', 'project',
+                overwrite=False)
+        self.assertEqual(ctxt, common_context.get_current())
+
+        def _fake_spawn(func, *args, **kwargs):
+            # call the method to ensure no error is raised
+            func(*args, **kwargs)
+            self.assertEqual(ctxt_passed, args[0])
+            self.assertEqual('test', kwargs['kwarg1'])
+
+        def fake(context, kwarg1=None):
+            pass
+
+        with mock.patch.object(eventlet, 'spawn_n', _fake_spawn):
+            utils.spawn_n(fake, ctxt_passed, kwarg1='test')
+        self.assertEqual(ctxt, common_context.get_current())

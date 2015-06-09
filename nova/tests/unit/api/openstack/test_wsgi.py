@@ -13,6 +13,7 @@
 import inspect
 
 import mock
+import six
 import webob
 
 from nova.api.openstack import api_version_request as api_version
@@ -23,9 +24,12 @@ from nova import i18n
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import utils
+from oslo_serialization import jsonutils
 
 
 class RequestTest(test.NoDBTestCase):
+    header_name = 'X-OpenStack-Nova-API-Version'
+
     def test_content_type_missing(self):
         request = wsgi.Request.blank('/tests/123', method='POST')
         request.body = "<body />"
@@ -44,51 +48,6 @@ class RequestTest(test.NoDBTestCase):
         result = request.get_content_type()
         self.assertEqual(result, "application/json")
 
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_content_type_from_accept(self):
-        for content_type in ('application/xml',
-                             'application/vnd.openstack.compute+xml',
-                             'application/json',
-                             'application/vnd.openstack.compute+json'):
-            request = wsgi.Request.blank('/tests/123')
-            request.headers["Accept"] = content_type
-            result = request.best_match_content_type()
-            self.assertEqual(result, content_type)
-
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_content_type_from_accept_best(self):
-        request = wsgi.Request.blank('/tests/123')
-        request.headers["Accept"] = "application/xml, application/json"
-        result = request.best_match_content_type()
-        self.assertEqual(result, "application/json")
-
-        request = wsgi.Request.blank('/tests/123')
-        request.headers["Accept"] = ("application/json; q=0.3, "
-                                     "application/xml; q=0.9")
-        result = request.best_match_content_type()
-        self.assertEqual(result, "application/xml")
-
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_content_type_from_query_extension(self):
-        request = wsgi.Request.blank('/tests/123.xml')
-        result = request.best_match_content_type()
-        self.assertEqual(result, "application/xml")
-
-        request = wsgi.Request.blank('/tests/123.json')
-        result = request.best_match_content_type()
-        self.assertEqual(result, "application/json")
-
-        request = wsgi.Request.blank('/tests/123.invalid')
-        result = request.best_match_content_type()
-        self.assertEqual(result, "application/json")
-
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_content_type_accept_and_query_extension(self):
-        request = wsgi.Request.blank('/tests/123.xml')
-        request.headers["Accept"] = "application/json"
-        result = request.best_match_content_type()
-        self.assertEqual(result, "application/xml")
-
     def test_content_type_accept_default(self):
         request = wsgi.Request.blank('/tests/123.unsupported')
         request.headers["Accept"] = "application/unsupported1"
@@ -98,7 +57,7 @@ class RequestTest(test.NoDBTestCase):
     def test_cache_and_retrieve_instances(self):
         request = wsgi.Request.blank('/foo')
         instances = []
-        for x in xrange(3):
+        for x in range(3):
             instances.append({'uuid': 'uuid%s' % x})
         # Store 2
         request.cache_db_instances(instances[:2])
@@ -119,7 +78,7 @@ class RequestTest(test.NoDBTestCase):
     def test_cache_and_retrieve_compute_nodes(self):
         request = wsgi.Request.blank('/foo')
         compute_nodes = []
-        for x in xrange(3):
+        for x in range(3):
             compute_nodes.append({'id': 'id%s' % x})
         # Store 2
         request.cache_db_compute_nodes(compute_nodes[:2])
@@ -204,14 +163,24 @@ class RequestTest(test.NoDBTestCase):
         mock_maxver.return_value = api_version.APIVersionRequest("2.14")
 
         request = wsgi.Request.blank('/')
-        request.headers = {'X-OpenStack-Compute-API-Version': '2.14'}
+        request.headers = {self.header_name: '2.14'}
         request.set_api_version_request()
         self.assertEqual(api_version.APIVersionRequest("2.14"),
                          request.api_version_request)
 
+    @mock.patch("nova.api.openstack.api_version_request.max_api_version")
+    def test_api_version_request_header_latest(self, mock_maxver):
+        mock_maxver.return_value = api_version.APIVersionRequest("3.5")
+
+        request = wsgi.Request.blank('/')
+        request.headers = {self.header_name: 'latest'}
+        request.set_api_version_request()
+        self.assertEqual(api_version.APIVersionRequest("3.5"),
+                         request.api_version_request)
+
     def test_api_version_request_header_invalid(self):
         request = wsgi.Request.blank('/')
-        request.headers = {'X-OpenStack-Compute-API-Version': '2.1.3'}
+        request.headers = {self.header_name: '2.1.3'}
 
         self.assertRaises(exception.InvalidAPIVersionString,
                           request.set_api_version_request)
@@ -240,24 +209,6 @@ class DictSerializerTest(test.NoDBTestCase):
     def test_dispatch_default(self):
         serializer = wsgi.DictSerializer()
         self.assertEqual(serializer.serialize({}, 'update'), '')
-
-
-class XMLDictSerializerTest(test.NoDBTestCase):
-    def test_xml(self):
-        input_dict = dict(servers=dict(a=(2, 3)))
-        expected_xml = '<serversxmlns="asdf"><a>(2,3)</a></servers>'
-        serializer = wsgi.XMLDictSerializer(xmlns="asdf")
-        result = serializer.serialize(input_dict)
-        result = result.replace('\n', '').replace(' ', '')
-        self.assertEqual(result, expected_xml)
-
-    def test_xml_contains_unicode(self):
-        input_dict = dict(test=u'\u89e3\u7801')
-        expected_xml = '<test>\xe8\xa7\xa3\xe7\xa0\x81</test>'
-        serializer = wsgi.XMLDictSerializer()
-        result = serializer.serialize(input_dict)
-        result = result.replace('\n', '').replace(' ', '')
-        self.assertEqual(expected_xml, result)
 
 
 class JSONDictSerializerTest(test.NoDBTestCase):
@@ -328,51 +279,8 @@ class JSONDeserializerTest(test.NoDBTestCase):
                           deserializer.deserialize, data)
 
 
-class XMLDeserializerTest(test.NoDBTestCase):
-    def test_xml(self):
-        xml = """
-            <a a1="1" a2="2">
-              <bs><b>1</b><b>2</b><b>3</b><b><c c1="1"/></b></bs>
-              <d><e>1</e></d>
-              <f>1</f>
-            </a>
-            """.strip()
-        as_dict = {
-            'body': {
-                'a': {
-                    'a1': '1',
-                    'a2': '2',
-                    'bs': ['1', '2', '3', {'c': {'c1': '1'}}],
-                    'd': {'e': '1'},
-                    'f': '1',
-                },
-            },
-        }
-        metadata = {'plurals': {'bs': 'b', 'ts': 't'}}
-        deserializer = wsgi.XMLDeserializer(metadata=metadata)
-        self.assertEqual(deserializer.deserialize(xml), as_dict)
-
-    def test_xml_empty(self):
-        xml = '<a></a>'
-        as_dict = {"body": {"a": {}}}
-        deserializer = wsgi.XMLDeserializer()
-        self.assertEqual(deserializer.deserialize(xml), as_dict)
-
-    def test_xml_valid_utf8(self):
-        xml = """ <a><name>\xe6\xa6\x82\xe5\xbf\xb5</name></a> """
-        deserializer = wsgi.XMLDeserializer()
-        as_dict = {'body': {u'a': {u'name': u'\u6982\u5ff5'}}}
-        self.assertEqual(deserializer.deserialize(xml), as_dict)
-
-    def test_xml_invalid_utf8(self):
-        """Send invalid utf-8 to XMLDeserializer."""
-        xml = """ <a><name>\xf0\x28\x8c\x28</name></a> """
-        deserializer = wsgi.XMLDeserializer()
-        self.assertRaises(exception.MalformedRequestBody,
-                         deserializer.deserialize, xml)
-
-
 class ResourceTest(test.NoDBTestCase):
+    header_name = 'X-OpenStack-Nova-API-Version'
 
     def get_req_id_header_name(self, request):
         header_name = 'x-openstack-request-id'
@@ -390,7 +298,7 @@ class ResourceTest(test.NoDBTestCase):
                     raise webob.exc.HTTPInternalServerError()
                 return 'success'
 
-        app = fakes.TestRouter(Controller())
+        app = fakes.TestRouterV21(Controller())
         req = webob.Request.blank('/tests')
         response = req.get_response(app)
         self.assertEqual(response.body, 'success')
@@ -408,9 +316,9 @@ class ResourceTest(test.NoDBTestCase):
                     raise webob.exc.HTTPInternalServerError()
                 return 'success'
 
-        app = fakes.TestRouter(Controller())
+        app = fakes.TestRouterV21(Controller())
         req = webob.Request.blank('/tests')
-        req.headers = {'X-OpenStack-Compute-API-Version': version}
+        req.headers = {self.header_name: version}
         response = req.get_response(app)
         self.assertEqual(response.body, 'success')
         self.assertEqual(response.status_int, 200)
@@ -422,9 +330,9 @@ class ResourceTest(test.NoDBTestCase):
             def index(self, req):
                 return 'success'
 
-        app = fakes.TestRouter(Controller())
+        app = fakes.TestRouterV21(Controller())
         req = webob.Request.blank('/tests')
-        req.headers = {'X-OpenStack-Compute-API-Version': invalid_version}
+        req.headers = {self.header_name: invalid_version}
         response = req.get_response(app)
         self.assertEqual(400, response.status_int)
 
@@ -477,10 +385,11 @@ class ResourceTest(test.NoDBTestCase):
         # the body is validated in the controller
         expected_body = {'body': None}
         response = req.get_response(app)
-        expected_unsupported_type_body = ('{"badRequest": '
-            '{"message": "The request body invalid", "code": 400}}')
+        expected_unsupported_type_body = {'badRequest':
+            {'message': 'The request body invalid', 'code': 400}}
         self.assertEqual(response.status_int, 400)
-        self.assertEqual(expected_unsupported_type_body, response.body)
+        self.assertEqual(expected_unsupported_type_body,
+                         jsonutils.loads(response.body))
 
     def test_resource_call_with_method_put(self):
         class Controller(object):
@@ -509,10 +418,11 @@ class ResourceTest(test.NoDBTestCase):
         req.content_type = None
         req.body = '{"body": {"key": "value"}}'
         response = req.get_response(app)
-        expected_unsupported_type_body = ('{"badRequest": '
-            '{"message": "Unsupported Content-Type", "code": 400}}')
+        expected_unsupported_type_body = {'badRequest':
+            {'message': 'Unsupported Content-Type', 'code': 400}}
         self.assertEqual(response.status_int, 400)
-        self.assertEqual(expected_unsupported_type_body, response.body)
+        self.assertEqual(expected_unsupported_type_body,
+                         jsonutils.loads(response.body))
 
     def test_resource_call_with_method_delete(self):
         class Controller(object):
@@ -576,36 +486,6 @@ class ResourceTest(test.NoDBTestCase):
                                                  '{"fooAction": true}')
         self.assertEqual(controller._action_foo, method)
 
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_get_method_action_xml(self):
-        class Controller(wsgi.Controller):
-            @wsgi.action('fooAction')
-            def _action_foo(self, req, id, body):
-                return body
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-        method, extensions = resource.get_method(None, 'action',
-                                                 'application/xml',
-                                                 '<fooAction>true</fooAction>')
-        self.assertEqual(controller._action_foo, method)
-
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_get_method_action_corrupt_xml(self):
-        class Controller(wsgi.Controller):
-            @wsgi.action('fooAction')
-            def _action_foo(self, req, id, body):
-                return body
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-        self.assertRaises(
-                exception.MalformedRequestBody,
-                resource.get_method,
-                None, 'action',
-                'application/xml',
-                utils.killer_xml_body())
-
     def test_get_method_action_bad_body(self):
         class Controller(wsgi.Controller):
             @wsgi.action('fooAction')
@@ -630,7 +510,7 @@ class ResourceTest(test.NoDBTestCase):
                           '{"barAction": true}')
 
     def test_get_method_action_method(self):
-        class Controller():
+        class Controller(object):
             def action(self, req, pants=None):
                 return pants
 
@@ -781,12 +661,7 @@ class ResourceTest(test.NoDBTestCase):
             def deserialize(self, body):
                 return 'json'
 
-        class XMLDeserializer(object):
-            def deserialize(self, body):
-                return 'xml'
-
         class Controller(object):
-            @wsgi.deserializers(xml=XMLDeserializer)
             def index(self, req, pants=None):
                 return pants
 
@@ -795,27 +670,6 @@ class ResourceTest(test.NoDBTestCase):
 
         obj = resource.deserialize(controller.index, 'application/json', 'foo')
         self.assertEqual(obj, 'json')
-
-    @test.skipXmlTest("Nova v2 XML support is disabled")
-    def test_deserialize_decorator(self):
-        class JSONDeserializer(object):
-            def deserialize(self, body):
-                return 'json'
-
-        class XMLDeserializer(object):
-            def deserialize(self, body):
-                return 'xml'
-
-        class Controller(object):
-            @wsgi.deserializers(xml=XMLDeserializer)
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller, json=JSONDeserializer)
-
-        obj = resource.deserialize(controller.index, 'application/xml', 'foo')
-        self.assertEqual(obj, 'xml')
 
     def test_register_actions(self):
         class Controller(object):
@@ -1087,9 +941,9 @@ class ResourceTest(test.NoDBTestCase):
             called.append(2)
 
         ext1 = extension1(None)
-        ext1.next()
+        next(ext1)
         ext2 = extension2(None)
-        ext2.next()
+        next(ext2)
 
         response = resource.post_process_extensions([ext2, ext1],
                                                     None, None, {})
@@ -1117,9 +971,9 @@ class ResourceTest(test.NoDBTestCase):
             yield 'foo'
 
         ext1 = extension1(None)
-        ext1.next()
+        next(ext1)
         ext2 = extension2(None)
-        ext2.next()
+        next(ext2)
 
         response = resource.post_process_extensions([ext2, ext1],
                                                     None, None, {})
@@ -1153,7 +1007,7 @@ class ResourceTest(test.NoDBTestCase):
         app = fakes.TestRouter(Controller())
         response = req.get_response(app)
 
-        for hdr, val in response.headers.iteritems():
+        for hdr, val in six.iteritems(response.headers):
             # All headers must be utf8
             self.assertIsInstance(hdr, str)
             self.assertIsInstance(val, str)
@@ -1261,17 +1115,12 @@ class ResponseObjectTest(test.NoDBTestCase):
             def serialize(self, obj):
                 return 'json'
 
-        class XMLSerializer(object):
-            def serialize(self, obj):
-                return 'xml'
-
         class AtomSerializer(object):
             def serialize(self, obj):
                 return 'atom'
 
         robj = wsgi.ResponseObject({}, code=202,
                                    json=JSONSerializer,
-                                   xml=XMLSerializer,
                                    atom=AtomSerializer)
         robj['X-header1'] = 'header1'
         robj['X-header2'] = 'header2'
@@ -1283,7 +1132,7 @@ class ResponseObjectTest(test.NoDBTestCase):
             response = robj.serialize(request, content_type)
 
             self.assertEqual(response.headers['Content-Type'], content_type)
-            for hdr, val in response.headers.iteritems():
+            for hdr, val in six.iteritems(response.headers):
                 # All headers must be utf8
                 self.assertIsInstance(hdr, str)
                 self.assertIsInstance(val, str)
